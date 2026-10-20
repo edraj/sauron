@@ -44,6 +44,7 @@ use crate::sketch::{Hll, LatencyHistogram};
 pub mod fold;
 pub mod person_days;
 pub mod read;
+pub mod release;
 
 pub use person_days::{add_person_days, PersonDayDelta, PersonKey};
 
@@ -136,7 +137,8 @@ pub async fn analyze_rollup_tables(conn: &mut AsyncPgConnection) -> diesel::Quer
         "ANALYZE event_user_environments, device_environments, person_days, \
                  screen_stats_daily, journey_nodes_daily, journey_links_daily, \
                  perf_agg_hourly, session_stats_daily, user_activity_daily, \
-                 event_top_daily, device_sessions_daily",
+                 event_top_daily, device_sessions_daily, person_releases, \
+                 user_activity_release_daily, session_stats_release_daily",
     )
     .execute(conn)
     .await

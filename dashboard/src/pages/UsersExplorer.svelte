@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { t, localeStore, intlTag } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
@@ -34,7 +35,18 @@
   import { RowCount } from '../lib/stores/row-count.svelte';
   import { listPersons } from '../lib/api/persons';
   import { getUserAnalytics } from '../lib/api/users';
-  import { errorMessage } from '../lib/api/client';
+  import { errorCode, errorMessage } from '../lib/api/client';
+  import {
+    RELEASE_MODES,
+    RELEASE_MODE_PARAM,
+    effectiveReleaseMode,
+    isReleaseRollupPending,
+    parseReleaseMode,
+    releaseModeParams,
+    writeReleaseModeParam,
+    type ReleaseMode,
+  } from '../lib/models/release-users';
+  import type { MessageKey } from '../lib/i18n';
   import {
     setOffsetPage,
     setOffsetSort,
@@ -96,6 +108,39 @@
   let timeFilter = $state<TimeFilterState>(
     fromParams(initial, TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
   );
+
+  /**
+   * "Used it" vs "Currently on it" — which people a picked release means for
+   * the list and its count (`models/release-users.ts`). Restored from the URL
+   * like the window above; an unknown value degrades to the default.
+   *
+   * Kept while no release is picked rather than reset, but not in force then:
+   * `effectiveMode` is `null`, the toggle is not rendered, the requests carry
+   * no `release_mode` and the view keys are the release-blind ones.
+   */
+  let releaseMode = $state<ReleaseMode>(parseReleaseMode(initial.get(RELEASE_MODE_PARAM)));
+  const effectiveMode = $derived(effectiveReleaseMode(releaseMode, sessionStore.currentRelease));
+  /**
+   * Whether the sketch-derived tiles (DAU/WAU/MAU, median session) carry the
+   * ≈ mark. The release-blind summary is sketch-served once the base rollups
+   * are ready; a release-scoped one ALWAYS is (`user_activity_release_daily`,
+   * `session_stats_release_daily` — there is no exact fallback), so a picked
+   * release marks them regardless of `rollupState`.
+   */
+  const sketchServed = $derived(rollupState.ready || sessionStore.currentRelease !== null);
+
+  const RELEASE_MODE_TEXT: Record<ReleaseMode, { label: MessageKey; title: MessageKey }> = {
+    used: { label: 'users.releaseMode.used', title: 'users.releaseMode.usedTitle' },
+    current: { label: 'users.releaseMode.current', title: 'users.releaseMode.currentTitle' },
+  };
+
+  function setReleaseMode(next: ReleaseMode) {
+    if (next === releaseMode) return;
+    releaseMode = next;
+    // A different set of people: row 51 of "used it" is not row 51 of
+    // "currently on it", same as for a changed window.
+    list = setOffsetPage(list, 0);
+  }
 
   // `last_seen` descending is the endpoint's own default, so this describes
   // the first request rather than changing it.
@@ -160,7 +205,7 @@
       // Older APIs 404 this — then the reload alone is the refresh.
       await refreshRollups(aid).catch(() => {});
       await Promise.all([
-        load(aid, query, sortParam(list.sort), list.offset, timeFilter, true),
+        load(aid, query, sortParam(list.sort), list.offset, timeFilter, effectiveMode, true),
         loadAnalytics(aid, range),
       ]);
     } finally {
@@ -174,21 +219,43 @@
   // button and the one in the top bar now mean the same thing.
   const refresher = pageRefresher(refresh);
 
+  /**
+   * The summary answered 503 `release_rollup_pending`: this app's per-release
+   * tables are still being backfilled. Rendered as an explanation, not as
+   * `analyticsError` — nothing is broken, and the numbers arrive on their own.
+   */
+  let analyticsPending = $state(false);
+  /**
+   * Only the newest summary request may write. A release (or environment, or
+   * window) switch fires a new one before the previous settles, and the slow
+   * all-release answer landing after the per-release one would put the wrong
+   * release's numbers under the switcher with nothing on screen to say so.
+   */
+  let analyticsGen = 0;
+
   async function loadAnalytics(appId: string, win: DateRangeValue) {
+    const gen = ++analyticsGen;
     analyticsError = null;
+    analyticsPending = false;
     try {
-      analytics = await getUserAnalytics(appId, win);
+      const next = await getUserAnalytics(appId, win);
+      if (gen !== analyticsGen) return;
+      analytics = next;
     } catch (err) {
-      analyticsError = errorMessage(err);
+      if (gen !== analyticsGen) return;
       analytics = null;
+      if (isReleaseRollupPending(errorCode(err))) analyticsPending = true;
+      else analyticsError = errorMessage(err);
     }
   }
 
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes: `…/users/summary` is release-scoped (the
+    // interceptor attaches both values), so every tile and the chart follow
+    // the switcher — but nothing would refetch without this.
+    sessionStore.scopeKeyWithRelease;
     const win = range;
     if (aid) void loadAnalytics(aid, win);
   });
@@ -204,9 +271,11 @@
     list = setOffsetPage(list, 0);
   }
 
-  // `scopeKey` must be in the key: it carries the selected environment, which the
-  // axios interceptor adds to the request but which appears in none of these
-  // arguments. Omit it and one environment's rows are served as another's.
+  // `scopeKeyWithRelease` must be in the key: it carries the selected
+  // environment and release, which the axios interceptor adds to the request
+  // but which appear in none of these arguments. Omit it and one environment's
+  // (or release's) rows are served as another's. `mode` is the release mode in
+  // force (`null` with no release picked), in the key for the same reason.
   //
   // `sort` is in the cache key for the same reason `q` and `off` are: without
   // it a header click finds the previous ordering already cached under the
@@ -221,6 +290,7 @@
     sort: string,
     off: number,
     tf: TimeFilterState,
+    mode: ReleaseMode | null,
     force = false,
   ) {
     // The window is in the key for the same reason `q`, `sort` and `off` are:
@@ -237,38 +307,96 @@
     // Predicate only — `sort`, `off` and `LIMIT` are deliberately absent, so
     // paging and reordering never refetch a number that cannot have changed.
     void rowCount.load(
-      viewKey('persons.count', appId, sessionStore.scopeKey, q, windowKey),
+      viewKey('persons.count', appId, sessionStore.scopeKeyWithRelease, q, windowKey, mode),
       () =>
         countPersons(appId, {
           search: q || undefined,
           window: toRecord(tf, DEFAULT_TIME_FIELD),
+          releaseMode: mode ?? undefined,
         }),
       force,
     );
     await view.load(
-      viewKey('persons.list', appId, sessionStore.scopeKey, q, sort, off, LIMIT, windowKey),
+      viewKey(
+        'persons.list',
+        appId,
+        sessionStore.scopeKeyWithRelease,
+        q,
+        sort,
+        off,
+        LIMIT,
+        windowKey,
+        mode,
+      ),
       () => listPersons(appId, {
         search: q || undefined,
         sort,
         limit: LIMIT,
         offset: off,
         ...toRecord(tf, DEFAULT_TIME_FIELD),
+        ...releaseModeParams(mode),
       }),
       force,
     );
   }
 
+  // A different environment or release is a different result set: page 3 of
+  // one release is not page 3 of the next (and may not exist), so go back to
+  // page one — the Events page's rule. Declared BEFORE the load effect below
+  // so that effect reads the reset offset and fetches once. `list` is read
+  // through `untrack`: a page move or sort change must not re-trigger this
+  // and undo itself.
+  let lastScope: string | null = null;
+  $effect(() => {
+    const scope = sessionStore.scopeKeyWithRelease;
+    if (lastScope !== null && scope !== lastScope) {
+      untrack(() => {
+        if (list.offset !== 0) list = setOffsetPage(list, 0);
+      });
+    }
+    lastScope = scope;
+  });
+
   $effect(() => {
     const aid = sessionStore.currentAppId;
-    // Touch scopeKey so the effect re-runs when the environment changes; the
-    // interceptor supplies the value, but nothing would refetch without this.
-    sessionStore.scopeKey;
+    // Touch scopeKeyWithRelease so the effect re-runs when the environment or
+    // the release changes; the interceptor supplies both values, but nothing
+    // would refetch without this.
+    sessionStore.scopeKeyWithRelease;
     const q = query;
     const sort = sortParam(list.sort);
     const off = list.offset;
     const tf = timeFilter;
-    if (aid) void load(aid, q, sort, off, tf);
+    const mode = effectiveMode;
+    if (aid) void load(aid, q, sort, off, tf, mode);
   });
+
+  /** The list answered 503 `release_rollup_pending` — see `analyticsPending`. */
+  const listPending = $derived(error !== null && isReleaseRollupPending(view.errorCode));
+  /**
+   * The Audience section is showing the full still-building explanation, or is
+   * about to (its summary is in flight — both reads share one readiness gate
+   * server-side). The people section then shows the title alone instead of
+   * repeating the paragraph and the button, and does not flash them while a
+   * "Check again" has the summary reloading.
+   */
+  const pendingExplainedAbove = $derived(
+    analyticsPending || (analytics === null && analyticsError === null),
+  );
+
+  /**
+   * "Check again" on the still-building state: repeat whichever of the two
+   * reads is waiting, past the fresh window. Not `refresh()` — that also kicks
+   * a rollup fold, which has nothing to do with the release backfill.
+   */
+  function checkAgain() {
+    const aid = sessionStore.currentAppId;
+    if (!aid) return;
+    if (analyticsPending) void loadAnalytics(aid, range);
+    if (listPending) {
+      void load(aid, query, sortParam(list.sort), list.offset, timeFilter, effectiveMode, true);
+    }
+  }
 
   // The URL mirrors the window so a filtered view survives a refresh and can be
   // shared. `replace`, not `push`: adjusting a filter is not a navigation, and
@@ -277,8 +405,11 @@
   // This writes the query string that `$querystring` feeds, so it must not be
   // read back into `timeFilter` — `initial` is read ONCE at setup, above,
   // rather than through a `$derived`, which is what keeps this from looping.
+  //
+  // The release mode rides along only while it is in force and not the default
+  // — see `writeReleaseModeParam`.
   $effect(() => {
-    const p = toParams(timeFilter, DEFAULT_TIME_FIELD);
+    const p = writeReleaseModeParam(toParams(timeFilter, DEFAULT_TIME_FIELD), effectiveMode);
     const qs = p.toString();
     void replace(qs ? `/users?${qs}` : '/users');
   });
@@ -345,17 +476,19 @@
         <!-- `stats.dau` has always been in the payload and in the `UserStats`
              model; the tile was simply never rendered, which is why this page
              shows a stickiness ratio whose numerator is invisible. -->
-        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), rollupState.ready)} sub={split('24h', analytics.stats.dau, analytics.stats.dau_identified)} />
-        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), rollupState.ready)} sub={split('7-day', analytics.stats.wau, analytics.stats.wau_identified)} />
-        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), rollupState.ready)} sub={split('30-day', analytics.stats.mau, analytics.stats.mau_identified)} />
+        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), sketchServed)} sub={split('24h', analytics.stats.dau, analytics.stats.dau_identified)} />
+        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), sketchServed)} sub={split('7-day', analytics.stats.wau, analytics.stats.wau_identified)} />
+        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), sketchServed)} sub={split('30-day', analytics.stats.mau, analytics.stats.mau_identified)} />
         <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
         <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
-        <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
+        <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), sketchServed)} />
       </StatTiles>
 
       <Card title={t('users.card.activePerDay')}>
         <UserActivityChart data={analytics.series} />
       </Card>
+    {:else if analyticsPending}
+      <Card>{@render releasePending(true)}</Card>
     {:else if analyticsError}
       <Card><p class="muted">{analyticsError}</p></Card>
     {:else}
@@ -392,6 +525,25 @@
       <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} />
     {/snippet}
     {#snippet timeWindow()}
+      <!-- Only while a release is picked: without one there is nothing for
+           "used it" or "currently on it" to refer to. Part of the predicate,
+           like the window beside it, so it sits in the same slot. -->
+      {#if sessionStore.currentRelease !== null}
+        <div class="release-mode" role="group" aria-label={t('users.releaseMode.label')}>
+          {#each RELEASE_MODES as m (m)}
+            <button
+              type="button"
+              class="mode"
+              class:active={releaseMode === m}
+              aria-pressed={releaseMode === m}
+              title={t(RELEASE_MODE_TEXT[m].title)}
+              onclick={() => setReleaseMode(m)}
+            >
+              {t(RELEASE_MODE_TEXT[m].label)}
+            </button>
+          {/each}
+        </div>
+      {/if}
       <!-- Governs the TABLE only. The Audience range picker above drives the
            tiles and chart, and the two are deliberately separate windows: this
            one can name a column and a bound the summary endpoints cannot
@@ -424,6 +576,10 @@
 
   {#if loading && rows.length === 0}
     <Skeleton rows={8} height="48px" label={t('users.loading.users')} />
+  {:else if listPending}
+    <!-- The full explanation once per page: when the Audience section above
+         carries it, this one is the title alone. -->
+    <Card>{@render releasePending(!pendingExplainedAbove)}</Card>
   {:else if error}
     <Card>
       <EmptyState title={t('users.error.load')} description={error} icon="triangle-alert">
@@ -432,13 +588,24 @@
             variant="secondary"
             onclick={() => {
               const aid = sessionStore.currentAppId;
-              if (aid) load(aid, query, sortParam(list.sort), list.offset, timeFilter);
+              if (aid) load(aid, query, sortParam(list.sort), list.offset, timeFilter, effectiveMode);
             }}
           >
             {t('common.retry')}
           </Button>
         {/snippet}
       </EmptyState>
+    </Card>
+  {:else if rows.length === 0 && !query && sessionStore.currentRelease !== null}
+    <!-- The release-blind copy below ("users appear once your SDK identifies
+         people") is false here: the app has users, none of them on this
+         release in this window. -->
+    <Card>
+      <EmptyState
+        title={t('users.empty.releaseTitle')}
+        description={t('users.empty.releaseBody')}
+        icon="package"
+      />
     </Card>
   {:else if rows.length === 0}
     <Card>
@@ -545,6 +712,27 @@
     />
   {/if}
 
+<!-- 503 `release_rollup_pending`: the picked release's numbers are still being
+     backfilled. Calm on purpose — nothing failed, and Retry-as-error wording
+     would invite a bug report for a job that is simply not finished. -->
+{#snippet releasePending(full: boolean)}
+  {#if full}
+    <EmptyState
+      title={t('users.releasePending.title')}
+      description={t('users.releasePending.body')}
+      icon="timer"
+    >
+      {#snippet action()}
+        <Button variant="secondary" onclick={checkAgain}>
+          {t('users.releasePending.checkAgain')}
+        </Button>
+      {/snippet}
+    </EmptyState>
+  {:else}
+    <EmptyState title={t('users.releasePending.title')} icon="timer" />
+  {/if}
+{/snippet}
+
 <style>
   .head {
     display: flex;
@@ -591,6 +779,39 @@
     font-size: 15px;
     font-weight: 640;
     margin: 0;
+  }
+  /* The `DateRange` pill well, so it reads as the same family as the window
+     control beside it and sits at `--control-h`: 3px inset + 28px pills +
+     1px border. There is no shared segmented-control component to reuse. */
+  .release-mode {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    min-height: var(--control-h);
+    padding: 3px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .mode {
+    height: 28px;
+    padding: 0 12px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    font-weight: 560;
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+    transition: color 0.13s ease, background 0.13s ease;
+  }
+  .mode:hover {
+    color: var(--text);
+  }
+  .mode.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow-sm);
   }
   .table {
     transition: opacity 0.12s ease;

@@ -1057,3 +1057,65 @@ async fn releases_endpoint_groups_by_release_and_narrows_by_env() {
     assert_eq!(unattributed.as_array().unwrap().len(), 3, "{unattributed}");
     srv.shutdown().await;
 }
+
+/// The release-scoped Users routes (migration 82) have no raw fallback: an
+/// app whose release tables are not backfilled yet answers a NAMED 503 the
+/// dashboard can turn into "still building", never a confident zero — and
+/// the release-blind call on the same app is untouched.
+#[tokio::test]
+async fn release_users_routes_answer_a_named_503_until_ready() {
+    let Some(mut srv) = TestServer::start().await else {
+        panic!("env unset")
+    };
+    let fx = srv.seed_fixture().await;
+    let mut conn = srv.conn().await;
+    // The app now predates the release epoch and has no marker: not ready.
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query("UPDATE release_rollup_epoch SET started_at = now() + interval '1 hour'"),
+        &mut conn,
+    )
+    .await
+    .expect("move epoch");
+    drop(conn);
+    for path in [
+        format!("/v1/apps/{}/users/summary?release=1.0.0", fx.app_id),
+        format!("/v1/apps/{}/persons?release=1.0.0", fx.app_id),
+        format!("/v1/apps/{}/counts/persons?release=none", fx.app_id),
+    ] {
+        let (status, body) = srv.get_status_and_body(&path, &fx.token).await;
+        assert_eq!(status, 503, "{path}: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            json["error"]["code"], "release_rollup_pending",
+            "{path}: {json}"
+        );
+    }
+    let (status, body) = srv
+        .get_status_and_body(&format!("/v1/apps/{}/users/summary", fx.app_id), &fx.token)
+        .await;
+    assert_eq!(
+        status, 200,
+        "release-blind summary must not be gated: {body}"
+    );
+    srv.shutdown().await;
+}
+
+/// `release_mode` is validated, and `current` is accepted.
+#[tokio::test]
+async fn release_mode_is_validated() {
+    let Some(mut srv) = TestServer::start().await else {
+        panic!("env unset")
+    };
+    let fx = srv.seed_fixture().await;
+    let base = format!("/v1/apps/{}/persons?release=1.0.0", fx.app_id);
+    let (status, body) = srv
+        .get_status_and_body(&format!("{base}&release_mode=current"), &fx.token)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = srv
+        .get_status_and_body(&format!("{base}&release_mode=latest"), &fx.token)
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("release_mode"), "{body}");
+    srv.shutdown().await;
+}

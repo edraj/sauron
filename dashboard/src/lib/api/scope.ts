@@ -271,10 +271,21 @@ export function shouldScopeUrl(url: string | undefined): boolean {
 
 // ---------------------------------------------------------------------------
 // Release scoping is OPT-IN, and narrower than environment scoping: only the
-// five searched list routes read `release`; the backend's `release_guard`
-// middleware answers 400 to it everywhere else. This list mirrors
+// routes below read `release`; the backend's `release_guard` middleware
+// answers 400 to it everywhere else. This list mirrors
 // `RELEASE_ACCEPTING_PATHS` in backend/bins/sauron-api/src/release_guard.rs
 // and `release-scope-parity.test.ts` fails if the two drift.
+//
+// Two families: the searched LISTS (issues, an issue's occurrences and their
+// stats, events, sessions, transactions), and the three reads behind the
+// Users page — its summary, the persons list and that list's count — which
+// answer from release-keyed rollups (`person_releases`,
+// `user_activity_release_daily`, `session_stats_release_daily`).
+//
+// Every pattern is anchored at both ends, so `/persons` does NOT match the
+// person detail family (`/persons/{distinct_id}`, `…/summary`, `…/timeline`):
+// one person is one person whatever the switcher says, and those routes would
+// 400 on the parameter.
 export const RELEASE_SCOPED_URL: readonly RegExp[] = [
   /^\/v1\/apps\/[^/]+\/issues(?:\?.*)?$/,
   /^\/v1\/apps\/[^/]+\/issues\/[^/]+\/events(?:\?.*)?$/,
@@ -282,6 +293,9 @@ export const RELEASE_SCOPED_URL: readonly RegExp[] = [
   /^\/v1\/apps\/[^/]+\/events\/list(?:\?.*)?$/,
   /^\/v1\/apps\/[^/]+\/sessions(?:\?.*)?$/,
   /^\/v1\/apps\/[^/]+\/transactions(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/users\/summary(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/persons(?:\?.*)?$/,
+  /^\/v1\/apps\/[^/]+\/counts\/persons(?:\?.*)?$/,
 ];
 
 export function shouldScopeRelease(url: string | undefined): boolean {
@@ -303,7 +317,7 @@ export function shouldScopeRelease(url: string | undefined): boolean {
  *    empty `?environment_id=` as a `400`, not "all" (that silent-widening
  *    bug was a Critical in an earlier review); sending nothing is the only
  *    correct way to ask for every environment.
- *  - `url` is not one of the five release-searched list routes -> no `release`.
+ *  - `url` is not one of the `RELEASE_SCOPED_URL` routes -> no `release`.
  *  - `release` is `null` ("all releases") — omitted for the same reason as
  *    `envId` above.
  */

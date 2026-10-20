@@ -919,7 +919,7 @@ async fn only_fully_contained_rollups_are_deleted() {
     db.cleanup().await;
 }
 
-/// Seed one person across all three of the tables `PurgeKind::Persons` covers.
+/// Seed one person across the tables `PurgeKind::Persons` covers.
 async fn seed_person(
     c: &mut sauron_db::PgConn,
     app: Uuid,
@@ -953,6 +953,20 @@ async fn seed_person(
     .execute(c)
     .await
     .expect("seed event_user_environments");
+    diesel::sql_query(
+        "INSERT INTO person_releases \
+           (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         VALUES ($1, $3, '1.0', $2, $4, $5, 7, 7, 7)",
+    )
+    .bind::<SqlUuid, _>(app)
+    .bind::<Text, _>(distinct)
+    .bind::<Nullable<SqlUuid>, _>(env)
+    .bind::<Timestamptz, _>(first)
+    .bind::<Timestamptz, _>(last)
+    .execute(c)
+    .await
+    .expect("seed person_releases");
     diesel::sql_query("INSERT INTO identities (app_id, alias_id, distinct_id) VALUES ($1, $2, $3)")
         .bind::<SqlUuid, _>(app)
         .bind::<Text, _>(format!("alias-{distinct}"))
@@ -1015,7 +1029,12 @@ async fn a_contained_person_takes_its_companion_tables_with_it() {
         .unwrap();
 
     assert_eq!(n, 1, "only the fully-contained person");
-    for table in ["event_users", "event_user_environments", "identities"] {
+    for table in [
+        "event_users",
+        "event_user_environments",
+        "identities",
+        "person_releases",
+    ] {
         assert_eq!(
             rows_for_person(&mut c, ids.app_id, table, "ghost").await,
             0,
@@ -1129,7 +1148,12 @@ async fn a_stolen_lease_stops_the_companion_deletes_too() {
         .unwrap();
 
     assert_eq!(n, 0, "no deletion is reported once the lease is gone");
-    for table in ["event_users", "event_user_environments", "identities"] {
+    for table in [
+        "event_users",
+        "event_user_environments",
+        "identities",
+        "person_releases",
+    ] {
         assert_eq!(
             rows_for_person(&mut c, ids.app_id, table, "ghost").await,
             1,
@@ -1314,6 +1338,137 @@ async fn recomputing_a_person_repairs_per_environment_counters() {
     db.cleanup().await;
 }
 
+/// The per-RELEASE counters (migration 82) are re-derived from the surviving
+/// raw rows too: a stale counter is corrected, and a release the person no
+/// longer has any row on loses its row.
+#[tokio::test]
+async fn recomputing_a_person_repairs_per_release_counters() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let ids = db.seed_two_envs().await;
+    let mut c = db.conn().await;
+
+    seed_analytics(
+        &mut c,
+        ids.app_id,
+        Some(ids.env_a),
+        Some("s1"),
+        None,
+        "rita",
+        at(20),
+    )
+    .await;
+    seed_analytics(
+        &mut c,
+        ids.app_id,
+        Some(ids.env_a),
+        Some("s2"),
+        None,
+        "rita",
+        at(21),
+    )
+    .await;
+    let issue = seed_issue(&mut c, ids.app_id, 1, 1).await;
+    seed_error_env(
+        &mut c,
+        ids.app_id,
+        Some(ids.env_a),
+        issue,
+        Some("s1"),
+        Some("rita"),
+        at(20),
+    )
+    .await;
+    // s1 (one event + the error) on 1.0, s2 on 2.0.
+    diesel::sql_query(
+        "UPDATE analytics_events SET release = CASE WHEN session_id = 's1' THEN '1.0' ELSE '2.0' END \
+          WHERE app_id = $1 AND distinct_id = 'rita'",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .execute(&mut c)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "UPDATE error_events SET release = '1.0' WHERE app_id = $1 AND distinct_id = 'rita'",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .execute(&mut c)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "INSERT INTO event_users (id, app_id, distinct_id, properties, first_seen, last_seen) \
+         VALUES (gen_random_uuid(), $1, 'rita', '{}', $2, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .bind::<Timestamptz, _>(at(20))
+    .execute(&mut c)
+    .await
+    .unwrap();
+    // Stale counters on 1.0, and a release nothing of hers survives on.
+    for rel in ["1.0", "3.0"] {
+        diesel::sql_query(
+            "INSERT INTO person_releases \
+               (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+                events_count, errors_count, sessions_count) \
+             VALUES ($1, $2, $3, 'rita', $4, $4, 99, 99, 99)",
+        )
+        .bind::<SqlUuid, _>(ids.app_id)
+        .bind::<Nullable<SqlUuid>, _>(Some(ids.env_a))
+        .bind::<Text, _>(rel)
+        .bind::<Timestamptz, _>(at(20))
+        .execute(&mut c)
+        .await
+        .unwrap();
+    }
+
+    let hot = purge::hot_counts_for_key(&mut c, ids.app_id, PurgeKind::Persons, "rita")
+        .await
+        .unwrap();
+    let counts = Counts::from_sources(
+        SourceCounts {
+            analytics: hot.analytics,
+            errors: hot.errors,
+            transactions: hot.transactions,
+        },
+        hot.first,
+        hot.last,
+    );
+    purge::apply_recomputed_rollup(&mut c, PurgeKind::Persons, ids.app_id, "rita", counts)
+        .await
+        .unwrap();
+
+    #[derive(diesel::QueryableByName)]
+    struct RelRow {
+        #[diesel(sql_type = Text)]
+        release: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        events_count: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        errors_count: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        sessions_count: i64,
+    }
+    let rows: Vec<RelRow> = diesel::sql_query(
+        "SELECT release, events_count, errors_count, sessions_count FROM person_releases \
+          WHERE app_id = $1 AND distinct_id = 'rita' ORDER BY release",
+    )
+    .bind::<SqlUuid, _>(ids.app_id)
+    .get_results(&mut c)
+    .await
+    .unwrap();
+    let got: Vec<(String, i64, i64, i64)> = rows
+        .into_iter()
+        .map(|r| (r.release, r.events_count, r.errors_count, r.sessions_count))
+        .collect();
+    assert_eq!(
+        got,
+        [("1.0".to_string(), 1, 1, 1), ("2.0".to_string(), 1, 0, 1)],
+        "1.0 repaired, 2.0 derived, 3.0 removed"
+    );
+    db.cleanup().await;
+}
+
 /// An environment where nothing of the person survives loses its counter row —
 /// the per-environment form of the rule that a rollup describing occurrences
 /// that no longer exist is worse than no row at all.
@@ -1422,7 +1577,12 @@ async fn a_person_with_nothing_surviving_loses_all_three_tables() {
             .unwrap();
 
     assert!(deleted, "reported as a delete, not a recompute");
-    for table in ["event_users", "event_user_environments", "identities"] {
+    for table in [
+        "event_users",
+        "event_user_environments",
+        "identities",
+        "person_releases",
+    ] {
         assert_eq!(
             rows_for_person(&mut c, ids.app_id, table, "ghost").await,
             0,

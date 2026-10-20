@@ -35,7 +35,7 @@ use crate::scope::{Range, ReadScope};
 use crate::sketch::{Hll, LatencyHistogram};
 
 /// Inclusive day bounds covering the range, whole-bucket semantics.
-fn day_bounds(range: &Range) -> (NaiveDate, NaiveDate) {
+pub(super) fn day_bounds(range: &Range) -> (NaiveDate, NaiveDate) {
     let lo = range.from.date_naive();
     let hi = range
         .to
@@ -50,11 +50,11 @@ fn far_future() -> DateTime<Utc> {
         .expect("valid")
 }
 
-fn day_bucket(day: NaiveDate) -> DateTime<Utc> {
+pub(super) fn day_bucket(day: NaiveDate) -> DateTime<Utc> {
     day.and_hms_opt(0, 0, 0).expect("valid").and_utc()
 }
 
-fn merged_hll(blobs: &[Option<Vec<u8>>]) -> Hll {
+pub(super) fn merged_hll(blobs: &[Option<Vec<u8>>]) -> Hll {
     let mut h = Hll::new();
     for b in blobs.iter().flatten() {
         if let Some(other) = Hll::from_bytes(b) {
@@ -64,7 +64,7 @@ fn merged_hll(blobs: &[Option<Vec<u8>>]) -> Hll {
     h
 }
 
-fn merged_hist(blobs: &[Vec<u8>]) -> LatencyHistogram {
+pub(super) fn merged_hist(blobs: &[Vec<u8>]) -> LatencyHistogram {
     let mut h = LatencyHistogram::new();
     for b in blobs {
         h.merge_counts(&LatencyHistogram::counts_from_bytes(b));
@@ -72,7 +72,7 @@ fn merged_hist(blobs: &[Vec<u8>]) -> LatencyHistogram {
     h
 }
 
-fn ratio(num: f64, den: i64) -> f64 {
+pub(super) fn ratio(num: f64, den: i64) -> f64 {
     if den > 0 {
         num / den as f64
     } else {
@@ -429,11 +429,11 @@ pub async fn perf_series(
 // ---------------------------------------------------------------------------
 
 #[derive(QueryableByName)]
-struct DayHllRow {
+pub(super) struct DayHllRow {
     #[diesel(sql_type = Date)]
-    day: NaiveDate,
+    pub(super) day: NaiveDate,
     #[diesel(sql_type = Array<Nullable<Bytea>>)]
-    hlls: Vec<Option<Vec<u8>>>,
+    pub(super) hlls: Vec<Option<Vec<u8>>>,
 }
 
 async fn activity_hlls(
@@ -443,10 +443,27 @@ async fn activity_hlls(
     hi: NaiveDate,
     column: &'static str,
 ) -> QueryResult<Vec<DayHllRow>> {
+    day_hlls(conn, "user_activity_daily", scope, None, lo, hi, column).await
+}
+
+/// One `column` sketch array per day of `table` over `[lo, hi]`, env-scoped,
+/// and narrowed to one release key when `release` is given — shared by
+/// `user_activity_daily` and its release twin (migration 82), which differ
+/// only in that one predicate.
+pub(super) async fn day_hlls(
+    conn: &mut AsyncPgConnection,
+    table: &'static str,
+    scope: &ReadScope,
+    release: Option<&str>,
+    lo: NaiveDate,
+    hi: NaiveDate,
+    column: &'static str,
+) -> QueryResult<Vec<DayHllRow>> {
     let env_sql = scope.env.sql_fragment(4);
+    let rel_sql = release_sql(&scope.env, release, 4);
     let q = format!(
-        "SELECT day, array_agg({column}) AS hlls FROM user_activity_daily \
-         WHERE app_id=$1 AND day>=$2 AND day<=$3{env_sql} GROUP BY day ORDER BY day"
+        "SELECT day, array_agg({column}) AS hlls FROM {table} \
+         WHERE app_id=$1 AND day>=$2 AND day<=$3{env_sql}{rel_sql} GROUP BY day ORDER BY day"
     );
     let mut stmt = diesel::sql_query(q)
         .into_boxed()
@@ -454,7 +471,27 @@ async fn activity_hlls(
         .bind::<Date, _>(lo)
         .bind::<Date, _>(hi);
     stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(r) = release {
+        stmt = stmt.bind::<Text, _>(r.to_string());
+    }
     stmt.get_results(conn).await
+}
+
+/// ` AND release = $n` for the release twins, bound right AFTER the env
+/// fragment whose own slot is `env_idx` (so `env_idx + 1` when the env
+/// consumes a bind), or `""` for the base tables.
+fn release_sql(env: &crate::scope::EnvFilter, release: Option<&str>, env_idx: usize) -> String {
+    match release {
+        None => String::new(),
+        Some(_) => {
+            let idx = if env.consumes_bind() {
+                env_idx + 1
+            } else {
+                env_idx
+            };
+            format!(" AND release = ${idx}")
+        }
+    }
 }
 
 #[derive(QueryableByName)]
@@ -573,6 +610,47 @@ async fn session_sums(
     stmt.get_result(conn).await
 }
 
+#[derive(QueryableByName)]
+pub(super) struct DurationSums {
+    #[diesel(sql_type = BigInt)]
+    pub(super) sessions: i64,
+    #[diesel(sql_type = Double)]
+    pub(super) dsum: f64,
+    #[diesel(sql_type = Array<Bytea>)]
+    pub(super) hists: Vec<Vec<u8>>,
+}
+
+/// Session count, duration sum and duration histograms over `table`'s
+/// started-day buckets — the two duration tiles' inputs, shared by
+/// `session_stats_daily` and its release twin (narrowed by `release`).
+pub(super) async fn duration_sums(
+    conn: &mut AsyncPgConnection,
+    table: &'static str,
+    scope: &ReadScope,
+    release: Option<&str>,
+    range: Range,
+) -> QueryResult<DurationSums> {
+    let (lo, hi) = day_bounds(&range);
+    let env_sql = scope.env.sql_fragment(4);
+    let rel_sql = release_sql(&scope.env, release, 4);
+    let q = format!(
+        "SELECT COALESCE(sum(sessions),0)::bigint AS sessions, \
+                COALESCE(sum(duration_ms_sum),0)::float8 AS dsum, \
+                COALESCE(array_agg(duration_hist), ARRAY[]::bytea[]) AS hists \
+         FROM {table} WHERE app_id=$1 AND day>=$2 AND day<=$3{env_sql}{rel_sql}"
+    );
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Date, _>(lo)
+        .bind::<Date, _>(hi);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(r) = release {
+        stmt = stmt.bind::<Text, _>(r.to_string());
+    }
+    stmt.get_result(conn).await
+}
+
 /// Rollup twin of `repo::user_stats`. The three `event_users` legs stay live
 /// (small table) — but their env-membership filter rides the person-env
 /// rollup once that marker is present (`event_user_membership_sql`): the raw
@@ -650,7 +728,7 @@ pub async fn user_stats(
     }
     let split = |known: bool, i: &Hll, all: i64| known.then(|| i.estimate().min(all));
 
-    let s = session_sums(conn, scope, range).await?;
+    let s = duration_sums(conn, "session_stats_daily", scope, None, range).await?;
     Ok(UserStats {
         total_users: legs.total_users,
         active_in_range: legs.active_in_range,

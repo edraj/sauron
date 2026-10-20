@@ -266,6 +266,21 @@ async fn rollup(
             sessions_delta,
         )
         .await;
+        // Its release twin (migration 82), same signal and same best-effort
+        // rule. `sessions_delta` lands on `job.release` — the release
+        // `bump_session` just inserted the session with.
+        let _ = repo::bump_person_release(
+            conn,
+            job.app_id,
+            did,
+            environment_id,
+            job.release.as_deref(),
+            at,
+            events_delta,
+            errors_delta,
+            sessions_delta,
+        )
+        .await;
     }
 
     // The device/environment rollup. Twin of the person/environment rollup

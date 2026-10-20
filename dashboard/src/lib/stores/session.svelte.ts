@@ -157,7 +157,7 @@ class SessionStore {
   ///
   /// Two segments — app and environment — because those are the dimensions
   /// EVERY telemetry read is narrowed by. The release is deliberately NOT here:
-  /// only five list routes accept `?release=` (`api/scope.ts`'s
+  /// only a handful of routes accept `?release=` (`api/scope.ts`'s
   /// `RELEASE_SCOPED_URL`), so folding it in made all 24 pages re-fetch on every
   /// release switch, and ~20 of them re-rendered a byte-identical rollup.
   /// Release-aware pages use `scopeKeyWithRelease` below instead.
@@ -165,10 +165,11 @@ class SessionStore {
     return `${this.currentAppId ?? ''}:${this.currentEnvId ?? 'all'}`;
   }
 
-  /// `scopeKey` plus the selected release, for the pages whose LIST requests the
-  /// axios interceptor actually attaches `release=` to — Issues (and its
-  /// occurrences table), Events, Sessions and Transactions. Everything else,
-  /// including the aggregate side widgets ON those same pages, stays on
+  /// `scopeKey` plus the selected release, for the pages whose requests the
+  /// axios interceptor actually attaches `release=` to — the LISTS on Issues
+  /// (and its occurrences table), Events, Sessions and Transactions, and every
+  /// read on Users (summary, persons list, count). Everything else,
+  /// including the aggregate side widgets on the four list pages, stays on
   /// `scopeKey`; `models/release-scope-key-parity.test.ts` enforces both
   /// directions off `RELEASE_AWARE`.
   ///

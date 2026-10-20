@@ -21,7 +21,7 @@ struct Command {
     summary: &'static str,
 }
 
-const COMMANDS: [Command; 5] = [
+const COMMANDS: [Command; 6] = [
     Command {
         name: "backfill-person-days",
         summary: "Retention cohorts for apps predating migration 74. \
@@ -55,6 +55,15 @@ const COMMANDS: [Command; 5] = [
                   partition by partition, from a partition list snapshotted \
                   per table — a partition dropped mid-run aborts the command \
                   (re-run to resume), so stop sauron-tier for the run.",
+    },
+    Command {
+        name: "backfill-release-users",
+        summary: "Release-scoped Users page (migration 82): per-release user \
+                  sketches and session buckets day by day (resumable), then \
+                  per-person release rows per app. REQUIRED for the release \
+                  switcher on /users: there is no fallback, unready apps \
+                  answer 503. Needs backfill-rollups done first. The ingest \
+                  service also runs it unattended (ROLLUP_AUTO_BACKFILL).",
     },
 ];
 
@@ -255,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Every backfill below is opt-in, and deliberately NOT part of the default
     // no-arg path — see `USAGE` for the reasoning, which is the same for all
-    // five: this is the oneshot every RPM daemon `Requires=`.
+    // six: this is the oneshot every RPM daemon `Requires=`.
     //
     // Skipping `backfill-person-envs`, `-device-envs` or `-rollups` is a
     // PERFORMANCE decision: those reads fall back to a pre-rollup query.
@@ -288,6 +297,23 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
         tracing::info!("rollup backfill complete");
+    }
+
+    if tasks.contains(&"backfill-release-users") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        let mut conn = sauron_db::conn(&pool).await?;
+        if sauron_db::rollups::backfill_pending(&mut conn).await? {
+            anyhow::bail!(
+                "backfill-release-users reads its day list off the dashboard rollups; \
+                 run `sauron-migrate backfill-rollups` first"
+            );
+        }
+        sauron_db::rollups::release::backfill_all(&mut conn, |day| {
+            tracing::info!(%day, "release users backfill: day complete");
+            true
+        })
+        .await?;
+        tracing::info!("release users backfill complete");
     }
 
     if tasks.contains(&"backfill-releases") {

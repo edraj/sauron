@@ -1554,6 +1554,8 @@ async fn sessions_count_counts_each_session_once_across_batches() {
                 touch_users: &[],
                 identified: &[],
                 person_envs: &[],
+                person_releases: &[],
+                session_start_releases: &Default::default(),
                 device_envs: &[],
             },
         )
@@ -1643,6 +1645,8 @@ async fn write_rows_merges_an_event_and_a_new_session_for_one_device() {
             touch_users: &[],
             identified: &[],
             person_envs: &[],
+            person_releases: &[],
+            session_start_releases: &Default::default(),
             device_envs: std::slice::from_ref(&device_env),
         },
     )

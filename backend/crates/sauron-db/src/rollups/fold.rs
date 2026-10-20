@@ -22,6 +22,7 @@ use diesel::QueryableByName;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
+use super::release::{self, ReleaseActivityDelta, ReleaseDayKey};
 use super::{
     add_event_top, add_journey_links, add_journey_nodes, add_perf_agg, add_person_days,
     add_screen_stats, add_user_activity, begin_locked, env_key, replace_session_days,
@@ -29,6 +30,7 @@ use super::{
     ScreenDelta, SessionDayRow, UserActivityDelta, CHUNK, OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS,
     SRC_SESSIONS, SRC_TRANSACTIONS,
 };
+use crate::batch::release_key;
 use crate::sketch::{Hll, LatencyHistogram};
 
 /// The synthetic screen-view event the mobile SDKs emit.
@@ -69,6 +71,10 @@ pub(crate) struct ARow {
     pub distinct_id: String,
     #[diesel(sql_type = Nullable<Text>)]
     pub session_id: Option<String>,
+    /// Folded into `user_activity_release_daily` (migration 82); NULL is
+    /// the Unknown release.
+    #[diesel(sql_type = Nullable<Text>)]
+    pub release: Option<String>,
 }
 
 #[derive(QueryableByName, Clone)]
@@ -85,6 +91,8 @@ pub(crate) struct ERow {
     pub screen: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     pub distinct_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    pub release: Option<String>,
 }
 
 #[derive(QueryableByName, Clone)]
@@ -137,6 +145,8 @@ pub(crate) struct AnalyticsDeltas {
     pub top: BTreeMap<(DayKey, String), i64>,
     pub activity: BTreeMap<DayKey, UserActivityDelta>,
     pub person_days: BTreeMap<PersonKey, PersonDayDelta>,
+    /// The release-keyed twin of `activity`'s three sketches (migration 82).
+    pub release_activity: BTreeMap<ReleaseDayKey, ReleaseActivityDelta>,
 }
 
 fn day_of(t: DateTime<Utc>) -> NaiveDate {
@@ -174,9 +184,16 @@ pub(crate) fn fold_analytics_rows(
         if !r.distinct_id.is_empty() {
             a.hll_all.insert(&r.distinct_id);
             a.hll_analytics.insert(&r.distinct_id);
-            if identified.contains(&(r.app_id, r.distinct_id.clone())) {
+            let is_identified = identified.contains(&(r.app_id, r.distinct_id.clone()));
+            if is_identified {
                 a.hll_identified.insert(&r.distinct_id);
             }
+            release::record(
+                &mut d.release_activity,
+                (key.0, key.1, release_key(r.release.as_deref()), key.2),
+                &r.distinct_id,
+                is_identified,
+            );
             // Same non-empty guard as the journey walk below, for the same
             // reason: '' is not a person, and admitting it would make one
             // shared pseudo-user whose retention curve is meaningless.
@@ -314,6 +331,7 @@ pub(crate) struct ErrorDeltas {
     pub screens: BTreeMap<(DayKey, String), ScreenDelta>,
     pub activity: BTreeMap<DayKey, UserActivityDelta>,
     pub person_days: BTreeMap<PersonKey, PersonDayDelta>,
+    pub release_activity: BTreeMap<ReleaseDayKey, ReleaseActivityDelta>,
 }
 
 pub(crate) fn fold_error_rows(rows: &[ERow], identified: &HashSet<(Uuid, String)>) -> ErrorDeltas {
@@ -325,9 +343,16 @@ pub(crate) fn fold_error_rows(rows: &[ERow], identified: &HashSet<(Uuid, String)
         let did = r.distinct_id.as_deref().filter(|s| !s.is_empty());
         if let Some(did) = did {
             a.hll_all.insert(did);
-            if identified.contains(&(r.app_id, did.to_string())) {
+            let is_identified = identified.contains(&(r.app_id, did.to_string()));
+            if is_identified {
                 a.hll_identified.insert(did);
             }
+            release::record(
+                &mut d.release_activity,
+                (key.0, key.1, release_key(r.release.as_deref()), key.2),
+                did,
+                is_identified,
+            );
             d.person_days
                 .entry((key, did.to_string()))
                 .or_default()
@@ -479,19 +504,19 @@ macro_rules! pull_source {
 pull_source!(
     pull_analytics,
     ARow,
-    "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id \
+    "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id, release \
      FROM analytics_events WHERE received_at > $1 AND received_at <= $2 AND occurred_at >= $3 \
      ORDER BY received_at, id LIMIT $4",
-    "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id \
+    "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id, release \
      FROM analytics_events WHERE received_at = $1"
 );
 pull_source!(
     pull_errors,
     ERow,
-    "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id \
+    "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id, release \
      FROM error_events WHERE received_at > $1 AND received_at <= $2 AND occurred_at >= $3 \
      ORDER BY received_at, id LIMIT $4",
-    "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id \
+    "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id, release \
      FROM error_events WHERE received_at = $1"
 );
 pull_source!(
@@ -725,6 +750,7 @@ pub async fn fold_analytics(
         add_journey_nodes(conn, &d.nodes).await?;
         add_journey_links(conn, &d.links).await?;
         add_user_activity(conn, &mut d.activity).await?;
+        release::add_release_activity(conn, &mut d.release_activity).await?;
         add_person_days(conn, &d.person_days).await?;
         add_screen_stats(conn, &mut d.screens).await?;
         save_session_state(conn, &sess).await?;
@@ -760,6 +786,7 @@ pub async fn fold_errors(
         .await?;
         let mut d = fold_error_rows(&rows, &identified);
         add_user_activity(conn, &mut d.activity).await?;
+        release::add_release_activity(conn, &mut d.release_activity).await?;
         add_person_days(conn, &d.person_days).await?;
         add_screen_stats(conn, &mut d.screens).await?;
         set_watermark(conn, SRC_ERRORS, new_wm).await?;
@@ -834,6 +861,8 @@ struct SessionRow {
     last_event_at: DateTime<Utc>,
     #[diesel(sql_type = BigInt)]
     unhandled: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    release: Option<String>,
 }
 
 fn fixed_bucket(ms: f64) -> usize {
@@ -949,7 +978,7 @@ pub async fn recompute_sessions(
         let out = async {
             let rows: Vec<SessionRow> = diesel::sql_query(
                 "SELECT app_id, environment_id, device_key, started_at, last_event_at, \
-                        unhandled_errors_count::bigint AS unhandled \
+                        unhandled_errors_count::bigint AS unhandled, release \
                  FROM sessions WHERE started_at >= $1 AND started_at < $2",
             )
             .bind::<Timestamptz, _>(lo)
@@ -964,6 +993,18 @@ pub async fn recompute_sessions(
             dirty.dedup();
             replace_session_days(conn, &dirty, &day_rows).await?;
             super::replace_device_session_days(conn, &dirty, &dev_rows).await?;
+            // The release twin (migration 82), REPLACEd over the same dirty
+            // (app, day)s from the same rows, borrowed rather than copied.
+            let rel_rows = release::sessions_to_release_days(rows.iter().map(|r| {
+                (
+                    r.app_id,
+                    r.environment_id,
+                    r.release.as_deref(),
+                    r.started_at,
+                    r.last_event_at,
+                )
+            }));
+            release::replace_session_release_days(conn, &dirty, &rel_rows).await?;
             Ok(dirty.len())
         }
         .await;
@@ -1175,6 +1216,7 @@ async fn fold_day_body(
                 "journey_nodes_daily",
                 "journey_links_daily",
                 "user_activity_daily",
+                "user_activity_release_daily",
                 "event_top_daily",
             ] {
                 diesel::sql_query(format!("DELETE FROM {tbl} WHERE day = $1"))
@@ -1198,7 +1240,7 @@ async fn fold_day_body(
             let lo = day_start + Duration::hours(h);
             let hi = lo + Duration::hours(1);
             let a: Vec<ARow> = diesel::sql_query(
-                "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id \
+                "SELECT app_id, environment_id, occurred_at, received_at, name, screen, distinct_id, session_id, release \
                  FROM analytics_events \
                  WHERE occurred_at >= $1 AND occurred_at < $2 AND received_at <= $3 \
                  ORDER BY occurred_at, id",
@@ -1213,7 +1255,7 @@ async fn fold_day_body(
             let d = fold_analytics_rows(&a, &identified, &mut sess, &mut jour, name_cap);
             merge_analytics(&mut acc, d);
             let e: Vec<ERow> = diesel::sql_query(
-                "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id \
+                "SELECT app_id, environment_id, occurred_at, received_at, screen, distinct_id, release \
                  FROM error_events \
                  WHERE occurred_at >= $1 AND occurred_at < $2 AND received_at <= $3",
             )
@@ -1246,8 +1288,10 @@ async fn fold_day_body(
         add_journey_nodes(conn, &acc.nodes).await?;
         add_journey_links(conn, &acc.links).await?;
         add_user_activity(conn, &mut acc.activity).await?;
+        release::add_release_activity(conn, &mut acc.release_activity).await?;
         add_screen_stats(conn, &mut acc.screens).await?;
         add_user_activity(conn, &mut err_acc.activity).await?;
+        release::add_release_activity(conn, &mut err_acc.release_activity).await?;
         add_screen_stats(conn, &mut err_acc.screens).await?;
         add_perf_agg(conn, &mut perf_acc).await?;
         if day >= Utc::now().date_naive() - Duration::days(2) {
@@ -1276,6 +1320,9 @@ fn merge_analytics(acc: &mut AnalyticsDeltas, d: AnalyticsDeltas) {
         e.hll_analytics.merge(&v.hll_analytics);
         e.hll_identified.merge(&v.hll_identified);
     }
+    for (k, v) in d.release_activity {
+        acc.release_activity.entry(k).or_default().merge(&v);
+    }
     for (k, v) in d.screens {
         let e = acc.screens.entry(k).or_default();
         e.views += v.views;
@@ -1292,6 +1339,9 @@ fn merge_errors(acc: &mut ErrorDeltas, d: ErrorDeltas) {
         e.errors += v.errors;
         e.hll_all.merge(&v.hll_all);
         e.hll_identified.merge(&v.hll_identified);
+    }
+    for (k, v) in d.release_activity {
+        acc.release_activity.entry(k).or_default().merge(&v);
     }
     for (k, v) in d.screens {
         let e = acc.screens.entry(k).or_default();
@@ -1754,6 +1804,7 @@ mod tests {
             screen: screen.map(|s| s.to_string()),
             distinct_id: distinct.to_string(),
             session_id: Some(session.to_string()),
+            release: None,
         }
     }
 
@@ -1769,6 +1820,7 @@ mod tests {
             received_at: at,
             screen: None,
             distinct_id: distinct.map(|s| s.to_string()),
+            release: None,
         }
     }
 
@@ -2144,6 +2196,7 @@ mod tests {
             started_at: ts("2026-08-25T23:50:00Z"),
             last_event_at: ts("2026-08-26T00:20:00Z"),
             unhandled: 1,
+            release: None,
         }];
         let days = session_rows_to_days(&rows);
         assert_eq!(days.len(), 1);

@@ -131,6 +131,13 @@ struct Acc {
     /// `issue_at`. The nil uuid stands in for `EnvFilter::Unattributed`,
     /// matching the table's `COALESCE` unique index.
     person_env_at: HashMap<(Uuid, String, Uuid), usize>,
+    /// The release-keyed twin of `person_envs` (migration 82), folded from the
+    /// same signals; keyed `(app, distinct_id, env-or-nil, release-or-'')`.
+    person_releases: Vec<db::PersonReleaseBump>,
+    person_release_at: HashMap<(Uuid, String, Uuid, String), usize>,
+    /// Release of each session's FIRST folded signal — see
+    /// `WriteSet::session_start_releases`.
+    session_start_releases: HashMap<(Uuid, String), Option<String>>,
     device_envs: Vec<db::DeviceEnvBump>,
     /// Index into `device_envs` by conflict key, for the same `ON CONFLICT DO
     /// UPDATE` dedupe reason as `person_env_at`: two rows sharing a key abort
@@ -274,6 +281,8 @@ impl Acc {
                     }
                 }
                 None => {
+                    self.session_start_releases
+                        .insert(key.clone(), job.release.clone());
                     self.session_at.insert(key, self.sessions.len());
                     self.sessions.push(db::SessionBump {
                         app_id: job.app_id,
@@ -376,6 +385,39 @@ impl Acc {
                         app_id: job.app_id,
                         distinct_id: did.to_string(),
                         environment_id,
+                        first_at: at,
+                        last_at: at,
+                        events_delta,
+                        errors_delta,
+                        sessions_delta: 0,
+                    });
+                }
+            }
+
+            // Its release twin: identical signal, one more key column.
+            let release = db::release_key(job.release.as_deref());
+            let key = (
+                job.app_id,
+                did.to_string(),
+                environment_id.unwrap_or_else(Uuid::nil),
+                release.clone(),
+            );
+            match self.person_release_at.get(&key) {
+                Some(&i) => {
+                    let b = &mut self.person_releases[i];
+                    b.first_at = b.first_at.min(at);
+                    b.last_at = b.last_at.max(at);
+                    b.events_delta += events_delta;
+                    b.errors_delta += errors_delta;
+                }
+                None => {
+                    self.person_release_at
+                        .insert(key, self.person_releases.len());
+                    self.person_releases.push(db::PersonReleaseBump {
+                        app_id: job.app_id,
+                        distinct_id: did.to_string(),
+                        environment_id,
+                        release,
                         first_at: at,
                         last_at: at,
                         events_delta,
@@ -656,6 +698,8 @@ pub async fn process_batch(
             touch_users: &acc.touch_users,
             identified,
             person_envs: &acc.person_envs,
+            person_releases: &acc.person_releases,
+            session_start_releases: &acc.session_start_releases,
             device_envs: &acc.device_envs,
         },
     )
@@ -1758,6 +1802,20 @@ mod equivalence_tests {
             "person/environment roll-ups diverge"
         );
 
+        // The release twin (migration 82) must land the same rows from both
+        // paths, under the job's release.
+        let seq_releases = person_release_aggs(&mut conn, a.app_id).await;
+        let bat_releases = person_release_aggs(&mut conn, b.app_id).await;
+        assert!(!seq_releases.is_empty(), "no person_releases rows written");
+        assert!(
+            seq_releases.iter().all(|r| r.release == "1.0.0"),
+            "person_releases keyed by the wrong release"
+        );
+        assert_eq!(
+            seq_releases, bat_releases,
+            "person/release roll-ups diverge"
+        );
+
         let seq_devices_env = device_env_aggs(&mut conn, a.app_id).await;
         let bat_devices_env = device_env_aggs(&mut conn, b.app_id).await;
         assert_eq!(
@@ -1910,6 +1968,109 @@ mod equivalence_tests {
         first_seen: DateTime<Utc>,
         #[diesel(sql_type = Timestamptz)]
         last_seen: DateTime<Utc>,
+    }
+
+    /// A NEW session whose first two signals in one batch carry different
+    /// releases — an update applied while the SDK queue was offline. The
+    /// per-item path inserts the session on the first job and credits ITS
+    /// release; the batch path must credit the same release, not the batch's
+    /// last one (which is what the session row itself stores, on both paths).
+    #[tokio::test]
+    async fn a_new_session_spanning_two_releases_is_credited_alike() {
+        let Some(db) = PipelineTestDb::setup().await else {
+            panic!("TEST_DATABASE_URL unset — this test must not silently skip");
+        };
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL unset — this test must not silently skip");
+        let redis = RedisStore::connect(&redis_url)
+            .await
+            .expect("connect redis");
+        let sym = crate::symbolize::SymbolizeCtx::new(
+            Arc::new(sauron_symbols::Symbolicator::new(1 << 20)),
+            sauron_redis::SymbolBlobCache::connect(None, 1 << 20).await,
+            100,
+            1 << 20,
+        );
+        let masks = MaskSet::from_rows(vec![]);
+        let t0 = Utc::now().trunc_subsecs(6);
+        let a = seed_app(&db, "seqrel").await;
+        let b = seed_app(&db, "batrel").await;
+        let jobs = |app: &App| {
+            let mut first = job(app, t0, event_item("open", "sess-rel", t0));
+            first.release = Some("1.0.0".to_string());
+            let later = t0 + Duration::seconds(5);
+            let mut second = job(app, later, event_item("tap", "sess-rel", later));
+            second.release = Some("1.1.0".to_string());
+            vec![first, second]
+        };
+
+        for j in jobs(&a) {
+            crate::process::process_job(db.pool(), &redis, &sym, &masks, j)
+                .await
+                .expect("per-item write");
+        }
+        let decoded: Vec<Decoded> = jobs(&b)
+            .into_iter()
+            .enumerate()
+            .map(|(i, job)| Decoded {
+                id: format!("0-{i}"),
+                job,
+                masks: Arc::new(MaskSet::from_rows(vec![])),
+                entry_tail: true,
+            })
+            .collect();
+        process_batch(db.pool(), &redis, &sym, &decoded)
+            .await
+            .expect("batched write");
+
+        let mut conn = db.conn().await;
+        let seq = person_release_aggs(&mut conn, a.app_id).await;
+        let bat = person_release_aggs(&mut conn, b.app_id).await;
+        let credits: Vec<(&str, i64)> = seq
+            .iter()
+            .map(|r| (r.release.as_str(), r.sessions_count))
+            .collect();
+        assert_eq!(
+            credits,
+            [("1.0.0", 1), ("1.1.0", 0)],
+            "the session belongs to the release it was created under"
+        );
+        assert_eq!(seq, bat, "per-item and batched release credits diverge");
+        db.cleanup().await;
+    }
+
+    #[derive(diesel::QueryableByName, Debug, PartialEq)]
+    struct PersonReleaseAgg {
+        #[diesel(sql_type = Text)]
+        release: String,
+        #[diesel(sql_type = Text)]
+        distinct_id: String,
+        #[diesel(sql_type = BigInt)]
+        events_count: i64,
+        #[diesel(sql_type = BigInt)]
+        errors_count: i64,
+        #[diesel(sql_type = BigInt)]
+        sessions_count: i64,
+        #[diesel(sql_type = Timestamptz)]
+        first_seen: DateTime<Utc>,
+        #[diesel(sql_type = Timestamptz)]
+        last_seen: DateTime<Utc>,
+    }
+
+    async fn person_release_aggs(
+        conn: &mut sauron_db::AsyncPgConnection,
+        app_id: Uuid,
+    ) -> Vec<PersonReleaseAgg> {
+        diesel::sql_query(
+            "SELECT release, distinct_id, events_count, errors_count, sessions_count, \
+                    first_seen, last_seen \
+             FROM person_releases WHERE app_id = $1 \
+             ORDER BY release, distinct_id, environment_id",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(app_id)
+        .get_results(conn)
+        .await
+        .expect("person/release aggs")
     }
 
     async fn person_env_aggs(

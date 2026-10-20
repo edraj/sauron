@@ -628,6 +628,110 @@ pub async fn bump_person_envs(
     .await
 }
 
+/// One (person, environment, release)'s folded contribution from a batch — the
+/// release-keyed twin of [`PersonEnvBump`], feeding `person_releases`
+/// (migration 82) and through it the release-scoped Users page.
+///
+/// Same producers, same signals, same insert-only `sessions_delta` rule as the
+/// environment twin; the only addition is the key column.
+#[derive(Debug, Clone)]
+pub struct PersonReleaseBump {
+    pub app_id: Uuid,
+    pub distinct_id: String,
+    pub environment_id: Option<Uuid>,
+    /// `''` is "Unknown release" — the telemetry tables' NULL. Stored as the
+    /// sentinel so the table's unique index stays a plain column list; see
+    /// migration 82's header.
+    pub release: String,
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub events_delta: i64,
+    pub errors_delta: i64,
+    pub sessions_delta: i64,
+}
+
+/// The `person_releases.release` key for a telemetry row's nullable release.
+pub fn release_key(release: Option<&str>) -> String {
+    release.unwrap_or_default().to_string()
+}
+
+/// Fold N person/environment/release bumps into `person_releases`, one
+/// statement. Same dedupe and lock-ordering rules as [`bump_person_envs`] —
+/// and the same two producers (`Acc`'s fold and `write_rows_once`' session
+/// crediting), which is why the crediting step merges by key.
+pub async fn bump_person_releases(
+    conn: &mut AsyncPgConnection,
+    rows: &[PersonReleaseBump],
+) -> QueryResult<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // Sorted by the conflict key's column order — see the module's ordering rule.
+    let nil = Uuid::nil();
+    let mut ix: Vec<usize> = (0..rows.len()).collect();
+    ix.sort_unstable_by(|&a, &b| {
+        (
+            rows[a].app_id,
+            &rows[a].release,
+            &rows[a].distinct_id,
+            rows[a].environment_id.unwrap_or(nil),
+        )
+            .cmp(&(
+                rows[b].app_id,
+                &rows[b].release,
+                &rows[b].distinct_id,
+                rows[b].environment_id.unwrap_or(nil),
+            ))
+    });
+    diesel::sql_query(
+        "INSERT INTO person_releases \
+           (app_id, environment_id, release, distinct_id, first_seen, last_seen, \
+            events_count, errors_count, sessions_count) \
+         SELECT app_id, environment_id, release, distinct_id, first_at, last_at, \
+                events_delta, errors_delta, sessions_delta \
+         FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::timestamptz[], \
+                     $6::timestamptz[], $7::bigint[], $8::bigint[], $9::bigint[]) \
+              AS t(app_id, environment_id, release, distinct_id, first_at, last_at, \
+                   events_delta, errors_delta, sessions_delta) \
+         ON CONFLICT (app_id, release, distinct_id, \
+                      COALESCE(environment_id, '00000000-0000-0000-0000-000000000000'::uuid)) \
+         DO UPDATE SET \
+            first_seen = LEAST(person_releases.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(person_releases.last_seen, EXCLUDED.last_seen), \
+            events_count = person_releases.events_count + EXCLUDED.events_count, \
+            errors_count = person_releases.errors_count + EXCLUDED.errors_count, \
+            sessions_count = person_releases.sessions_count + EXCLUDED.sessions_count, \
+            updated_at = now()",
+    )
+    .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].app_id).collect::<Vec<_>>())
+    .bind::<Array<Nullable<SqlUuid>>, _>(
+        ix.iter()
+            .map(|&i| rows[i].environment_id)
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].release.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Text>, _>(
+        ix.iter()
+            .map(|&i| rows[i].distinct_id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].first_at).collect::<Vec<_>>())
+    .bind::<Array<Timestamptz>, _>(ix.iter().map(|&i| rows[i].last_at).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].events_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].errors_delta).collect::<Vec<_>>())
+    .bind::<Array<BigInt>, _>(
+        ix.iter()
+            .map(|&i| rows[i].sessions_delta)
+            .collect::<Vec<_>>(),
+    )
+    .execute(conn)
+    .await
+}
+
 /// One device/environment pair's folded contribution from a batch.
 ///
 /// The device twin of [`PersonEnvBump`]. `sessions_delta` carries the same
@@ -965,6 +1069,16 @@ pub struct WriteSet<'a> {
     /// here and is credited inside the transaction from [`bump_sessions`]'
     /// inserted-key list — the caller cannot know which sessions are new.
     pub person_envs: &'a [PersonEnvBump],
+    /// Per-(person, environment, release) rollup deltas, credited exactly as
+    /// `person_envs` is — `sessions_delta` arrives ZERO.
+    pub person_releases: &'a [PersonReleaseBump],
+    /// `(app, session_id) -> release` of the FIRST signal the batch folded for
+    /// each session. A newly inserted session's `person_releases` credit goes
+    /// here, not to `SessionBump::release` (the batch's LAST non-null release,
+    /// which is what the row stores): the per-item path credits the release of
+    /// the job that inserted the session, and the two paths must agree. A
+    /// session missing from the map falls back to `SessionBump::release`.
+    pub session_start_releases: &'a HashMap<(Uuid, String), Option<String>>,
     /// Per-(device, environment) rollup deltas. `sessions_delta` arrives ZERO
     /// here and is credited inside the transaction from [`bump_sessions`]'
     /// inserted-key list, exactly as `person_envs` is — the caller cannot know
@@ -1081,6 +1195,77 @@ fn credit_sessions(set: &WriteSet<'_>, inserted: &HashSet<(Uuid, String)>) -> Ve
     rows
 }
 
+/// Add `sessions_count` credit to the batch's RELEASE rollup rows.
+///
+/// The release twin of [`credit_sessions`]: same inserted-key rule, same
+/// merge-by-key reason. A new session is credited to the release of its FIRST
+/// signal in the batch ([`WriteSet::session_start_releases`]) — what the
+/// per-item path credits. (`session_stats_release_daily` instead buckets by
+/// the session row's stored release, the latest one; they differ only for a
+/// session that spans an app update — see `rollups::release`.)
+fn credit_release_sessions(
+    set: &WriteSet<'_>,
+    inserted: &HashSet<(Uuid, String)>,
+) -> Vec<PersonReleaseBump> {
+    let mut rows: Vec<PersonReleaseBump> = set.person_releases.to_vec();
+    if inserted.is_empty() {
+        return rows;
+    }
+    let nil = Uuid::nil();
+    let mut at: HashMap<(Uuid, String, Uuid, String), usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                (
+                    p.app_id,
+                    p.distinct_id.clone(),
+                    p.environment_id.unwrap_or(nil),
+                    p.release.clone(),
+                ),
+                i,
+            )
+        })
+        .collect();
+    for s in set.sessions {
+        let Some(did) = s.distinct_id.as_deref().filter(|d| !d.is_empty()) else {
+            continue;
+        };
+        if !inserted.contains(&(s.app_id, s.session_id.clone())) {
+            continue;
+        }
+        let release = release_key(
+            set.session_start_releases
+                .get(&(s.app_id, s.session_id.clone()))
+                .map_or(s.release.as_deref(), |r| r.as_deref()),
+        );
+        let key = (
+            s.app_id,
+            did.to_string(),
+            s.environment_id.unwrap_or(nil),
+            release.clone(),
+        );
+        match at.get(&key) {
+            Some(&i) => rows[i].sessions_delta += 1,
+            None => {
+                at.insert(key, rows.len());
+                rows.push(PersonReleaseBump {
+                    app_id: s.app_id,
+                    distinct_id: did.to_string(),
+                    environment_id: s.environment_id,
+                    release,
+                    first_at: s.first_at,
+                    last_at: s.last_at,
+                    events_delta: 0,
+                    errors_delta: 0,
+                    sessions_delta: 1,
+                });
+            }
+        }
+    }
+    rows
+}
+
 /// Add `sessions_count` credit to the batch's DEVICE rollup rows.
 ///
 /// The device twin of [`credit_sessions`], and separate from it because the two
@@ -1165,6 +1350,7 @@ async fn write_rows_once(conn: &mut AsyncPgConnection, set: &WriteSet<'_>) -> Qu
         bump_devices(conn, set.devices).await?;
         let inserted: HashSet<(Uuid, String)> = inserted.into_iter().collect();
         bump_person_envs(conn, &credit_sessions(set, &inserted)).await?;
+        bump_person_releases(conn, &credit_release_sessions(set, &inserted)).await?;
         bump_device_envs(conn, &credit_device_sessions(set, &inserted)).await?;
         Ok(())
     }

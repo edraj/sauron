@@ -5,7 +5,7 @@ import fs from 'node:fs';
 // @ts-expect-error -- no @types/node in this project; the Node runtime that
 // executes vitest provides this builtin regardless.
 import path from 'node:path';
-import { computeScopeParams, shouldScopeUrl } from './scope';
+import { computeScopeParams, shouldScopeRelease, shouldScopeUrl } from './scope';
 
 describe('shouldScopeUrl', () => {
   it('scopes an ordinary telemetry read', () => {
@@ -405,6 +405,47 @@ describe('release scoping', () => {
     expect(computeScopeParams('/v1/apps/a/transactions', null, '1.4.0')).toEqual({ release: '1.4.0' });
     expect(computeScopeParams('/v1/apps/a/overview', null, '1.4.0')).toBeUndefined();
     expect(computeScopeParams('/v1/apps/a/issues/i1', null, '1.4.0')).toBeUndefined();
+  });
+
+  it('attaches release to the three Users page reads', () => {
+    expect(computeScopeParams('/v1/apps/a/users/summary', null, '1.4.0')).toEqual({
+      release: '1.4.0',
+    });
+    expect(
+      computeScopeParams('/v1/apps/a/users/summary?since_days=30', null, '1.4.0'),
+    ).toEqual({ release: '1.4.0' });
+    expect(computeScopeParams('/v1/apps/a/persons', null, '1.4.0')).toEqual({ release: '1.4.0' });
+    // `countPersons` builds its query into the URL itself, and with no
+    // predicate at all that leaves a bare trailing `?`.
+    expect(computeScopeParams('/v1/apps/a/counts/persons?', null, '1.4.0')).toEqual({
+      release: '1.4.0',
+    });
+    expect(
+      computeScopeParams('/v1/apps/a/counts/persons?search=bob&time_field=last_seen', null, 'none'),
+    ).toEqual({ release: 'none' });
+  });
+
+  /**
+   * The person DETAIL family shares the `/persons` prefix with the list and
+   * must not inherit its release scoping: one person is one person whatever
+   * the switcher says, and the backend's release guard 400s `release=` on
+   * every route outside its allowlist — so a prefix match here would break
+   * the profile page the moment a release is picked.
+   */
+  it('does not attach release to the person detail routes or sibling counts', () => {
+    for (const url of [
+      '/v1/apps/a/persons/bob',
+      '/v1/apps/a/persons/bob/summary',
+      '/v1/apps/a/persons/bob/timeline?limit=50',
+      '/v1/apps/a/persons/',
+      '/v1/apps/a/counts/screens?q=x',
+      '/v1/apps/a/counts/devices',
+      '/v1/apps/a/users/summary/extra',
+      '/v1/apps/a/users',
+    ]) {
+      expect(shouldScopeRelease(url), url).toBe(false);
+      expect(computeScopeParams(url, null, '1.4.0'), url).toBeUndefined();
+    }
   });
 
   it('combines env and release, and omits release when null', () => {

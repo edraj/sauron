@@ -1,6 +1,7 @@
 import { api } from './client';
 import { overFetched, type ListPage } from '../models/list-state';
 import type { AnalyticsEvent, ErrorEvent, PersonRow } from '../models';
+import type { ReleaseMode } from '../models/release-users';
 
 export interface ListPersonsParams {
   /** Rows to RENDER; the request asks for one more. See `listPersons`. */
@@ -30,6 +31,14 @@ export interface ListPersonsParams {
   from?: string;
   to?: string;
   since_days?: number;
+  /**
+   * Which people a picked release means — `used` (anyone with a signal on it,
+   * the server default) or `current` (only those whose latest signal is on
+   * it). See `models/release-users.ts`. Send it ONLY while a release is picked:
+   * `release` itself is attached by the axios interceptor, and the mode means
+   * nothing without it.
+   */
+  release_mode?: ReleaseMode;
 }
 
 /**

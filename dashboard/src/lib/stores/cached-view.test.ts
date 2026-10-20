@@ -497,6 +497,60 @@ describe('errorStatus', () => {
   });
 });
 
+describe('errorCode', () => {
+  /** The 503 the Users page must tell apart from an outage. */
+  const pending = {
+    status: 503,
+    code: 'release_rollup_pending',
+    message: 'release stats are still being backfilled',
+    isNetwork: false,
+  };
+
+  it('carries the server code alongside the status', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(pending));
+    expect(v.errorStatus).toBe(503);
+    // The status alone cannot separate "still backfilling" from "down".
+    expect(v.errorCode).toBe('release_rollup_pending');
+  });
+
+  it('is null for a plain Error, which carries no server code', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(new Error('boom')));
+    expect(v.errorCode).toBeNull();
+  });
+
+  it('clears with the other halves when a later load succeeds', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(pending));
+    await v.load('k', async () => ['a'], true);
+    expect(v.error).toBeNull();
+    expect(v.errorCode).toBeNull();
+  });
+
+  it('clears when the key moves on, before the new fetch settles', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(pending));
+    const d = deferred<string[]>();
+    const p = v.load('k2', () => d.promise);
+    // A stale code here would keep the "still building" state up over a
+    // different release's skeleton.
+    expect(v.errorCode).toBeNull();
+    d.resolve(['b']);
+    await p;
+  });
+
+  it('reset() and idle() clear it', async () => {
+    const v = new CachedView<string[]>();
+    await v.load('k', () => Promise.reject(pending));
+    v.reset();
+    expect(v.errorCode).toBeNull();
+    await v.load('k2', () => Promise.reject(pending));
+    v.idle();
+    expect(v.errorCode).toBeNull();
+  });
+});
+
 /**
  * `fetchedAt` is what lets a page say "as of 14:32" instead of implying the
  * numbers on screen are current. Without it the cache is silent about age, and

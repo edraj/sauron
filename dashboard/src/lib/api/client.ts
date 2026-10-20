@@ -95,8 +95,8 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 
 // ---------------------------------------------------------------------------
 // Request interceptor — attach `environment_id` from the session store to
-// every environment-scoped read, and `release` to the five release-searched
-// list routes (see `./scope.ts` for both allowlists and the wire-contract
+// every environment-scoped read, and `release` to the release-accepting
+// routes (see `./scope.ts` for both allowlists and the wire-contract
 // rule that a `null` value omits its parameter entirely rather than sending
 // it empty).
 //
@@ -294,5 +294,27 @@ export function errorMessage(value: unknown): string {
  */
 export function errorStatus(value: unknown): number | null {
   if (isNormalizedError(value)) return value.status || null;
+  return null;
+}
+
+/**
+ * The server's machine-readable error code behind a caught error (the `code` of
+ * the `{ error: { code, message } }` envelope), or `null` when the failure never
+ * produced one.
+ *
+ * The third companion, for failures a page must recognise by WHAT went wrong
+ * rather than by its status: a 503 `release_rollup_pending` is "this release's
+ * numbers are still being backfilled" and gets a calm explanation, while any
+ * other 503 is an outage and gets the error card. The status cannot tell them
+ * apart and the prose is not a contract.
+ *
+ * `null` for anything the server did not answer: `normalizeError`'s own
+ * fallbacks (`http_error` for a body with no envelope, axios's codes for a
+ * network drop, `error` for a thrown `Error`) are not server codes, but they
+ * are also never equal to one, so a caller comparing against a real code is
+ * unaffected — only a non-normalized value is mapped to `null` here.
+ */
+export function errorCode(value: unknown): string | null {
+  if (isNormalizedError(value)) return value.code || null;
   return null;
 }

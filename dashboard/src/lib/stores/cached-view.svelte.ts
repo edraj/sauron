@@ -1,4 +1,4 @@
-import { errorMessage, isNormalizedError } from '../api/client';
+import { errorCode as codeOf, errorMessage, isNormalizedError } from '../api/client';
 import { currentRoute } from './current-route';
 import { refreshRegistry } from './refresh-registry';
 import { DEFAULT_FRESH_MS, viewCache } from './view-cache';
@@ -58,6 +58,17 @@ export class CachedView<T> {
    * page that only ever renders `error` is unaffected.
    */
   errorStatus = $state<number | null>(null);
+  /**
+   * The server's error `code` behind `error`, or `null` when there is no error
+   * or the failure never reached the server.
+   *
+   * For failures that share a status with an outage but are not one: the Users
+   * page answers a 503 `release_rollup_pending` ("this release is still being
+   * backfilled") with an explanation rather than an error card, and a 503 alone
+   * cannot say which of the two it is. Set and cleared with the other two
+   * halves, through `#setError` / `#clearError` only.
+   */
+  errorCode = $state<string | null>(null);
 
   /**
    * `Date.now()` at the moment the payload ON SCREEN was captured, or `null`
@@ -92,8 +103,8 @@ export class CachedView<T> {
   }
 
   /**
-   * `error` and `errorStatus` are set and cleared only through these two, and
-   * that is the point: they are two halves of one fact, assigned at six separate
+   * `error`, `errorStatus` and `errorCode` are set and cleared only through
+   * these two, and that is the point: they are parts of one fact, assigned at six separate
    * sites. Left as bare field writes, the next site added would set the message
    * and forget the status, and the symptom would be a stale 403 from a previous
    * failure still driving the recovery UI of the current one.
@@ -104,11 +115,13 @@ export class CachedView<T> {
     // null so `errorStatus` means "the server answered with this" and nothing
     // else has to know 0 is a sentinel.
     this.errorStatus = isNormalizedError(err) && err.status > 0 ? err.status : null;
+    this.errorCode = codeOf(err);
   }
 
   #clearError(): void {
     this.error = null;
     this.errorStatus = null;
+    this.errorCode = null;
   }
 
   /**
