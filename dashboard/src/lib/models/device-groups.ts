@@ -9,6 +9,9 @@
  * device actually stores. Collapse the two and a device whose `os_version` is
  * `''` drills down into the NULL group instead of its own.
  */
+
+import { t } from '../i18n';
+
 export interface DeviceGroupKey {
   family: string | null;
   model: string | null;
@@ -66,5 +69,5 @@ export function groupLabel(k: DeviceGroupKey): string {
   const device = [k.family, k.model].filter(Boolean).join(' ').trim();
   const os = [k.os_name, k.os_version].filter(Boolean).join(' ').trim();
   const parts = [device, os].filter(Boolean);
-  return parts.length > 0 ? parts.join(' · ') : 'Unknown device';
+  return parts.length > 0 ? parts.join(' · ') : t('devices.unknownDevice');
 }

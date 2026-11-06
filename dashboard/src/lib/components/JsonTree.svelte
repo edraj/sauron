@@ -58,7 +58,8 @@
   }
 </script>
 
-<div class="jt" style="--depth:{depth}">
+<!-- `data-ltr`: JSON is machine text, an LTR island inside an Arabic page. -->
+<div class="jt" style="--depth:{depth}" data-ltr>
   {#if branch}
     <button class="j-row j-branch" onclick={() => (open = !open)} type="button">
       <span class="j-caret" class:open><Icon name="chevron-right" size={11} /></span>
@@ -83,7 +84,7 @@
 <style>
   .jt {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 1.7;
   }
   .j-row {

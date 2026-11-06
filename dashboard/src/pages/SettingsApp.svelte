@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
@@ -7,6 +8,10 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import StoreConnectionsCard from '../lib/components/settings/StoreConnectionsCard.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
@@ -32,7 +37,6 @@
 
   const app = $derived(view.data ?? null);
   const loading = $derived(view.loading);
-  const error = $derived(view.error);
   let togglingIngest = $state(false);
   let confirmDelete = $state(false);
   let deleting = $state(false);
@@ -91,7 +95,7 @@
     try {
       const updated = await updateApp(appId, { ingest_enabled: next });
       sessionStore.upsertApp(updated, false);
-      toastStore.success(next ? 'Ingest enabled.' : 'Ingest disabled.');
+      toastStore.success(next ? t('settings.toast.ingestEnabled') : t('settings.toast.ingestDisabled'));
       // `app` reads out of the cache now, so it can't be assigned — and hand-
       // writing the PATCH's response body into the read cache would be caching a
       // mutation. Force a re-read instead. The cached record stays on screen
@@ -119,7 +123,7 @@
       const id = app.id;
       await deleteApp(id);
       sessionStore.removeApp(id);
-      toastStore.success('App deleted.');
+      toastStore.success(t('settings.toast.appDeleted'));
       push('/admin/projects');
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -129,24 +133,41 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div class="head-actions">
+  <PageHeader title={t('settings.title')}>
+    {#snippet meta()}
+      {#if app}
+        <span class="app-badge"><Icon name={appTypeIcon(app.app_type)} size={14} /> {app.name}</span>
+        <span>· {appTypeLabel(app.app_type)}</span>
+      {/if}
+    {/snippet}
+    {#snippet freshness()}
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    {/snippet}
+  </PageHeader>
+
+  {#if view.error && view.data !== undefined}
+    <!-- A forced Refresh failed over the record we already had: it stays. -->
+    <div class="stale">
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     </div>
-    <h1 class="page-title">{t('settings.title')}</h1>
-    {#if app}
-      <p class="muted sub">
-        <span class="app-badge"><Icon name={appTypeIcon(app.app_type)} size={15} /> {app.name}</span>
-        · {appTypeLabel(app.app_type)}
-      </p>
-    {/if}
-  </div>
+  {/if}
 
   {#if loading}
     <Skeleton rows={6} />
-  {:else if error}
-    <Card><p class="err-msg">{error}</p></Card>
+  {:else if view.error && view.data === undefined}
+    <ErrorState
+      title={t('common.couldntLoad', { thing: t('settings.thing') })}
+      error={view}
+      onretry={refresher.run}
+    />
   {:else if !app}
     <EmptyState
       title={t('settings.noApp.title')}
@@ -161,9 +182,7 @@
     <div class="settings-stack">
       <Card title={t('settings.card.ingest')}>
           <p class="card-desc muted">
-            {app.ingest_enabled
-              ? 'This app is accepting events. Disable to stop ingesting without deleting the app.'
-              : 'Ingest is paused. Enable to resume accepting events.'}
+            {app.ingest_enabled ? t('settings.ingestOnBody') : t('settings.ingestOffBody')}
           </p>
         <Button
           variant={app.ingest_enabled ? 'secondary' : 'primary'}
@@ -171,7 +190,7 @@
           lockedReason={updateLock}
           onclick={toggleIngest}
         >
-          {app.ingest_enabled ? 'Disable ingest' : 'Enable ingest'}
+          {app.ingest_enabled ? t('settings.disableIngest') : t('settings.enableIngest')}
         </Button>
       </Card>
 
@@ -192,79 +211,49 @@
           <p class="card-desc muted">
             {t('settings.deleteWarning')}
           </p>
-          {#if confirmDelete}
-            <div class="confirm">
-              <span class="confirm-text">{t('common.delete')} <strong>{app.name}</strong> {t('prose.settings.confirmDelete')}</span>
-              <div class="confirm-actions">
-                <Button variant="danger" loading={deleting} lockedReason={deleteLock} onclick={doDelete}>{t('projects.confirmDelete')}</Button>
-                <Button variant="ghost" onclick={() => (confirmDelete = false)}>{t('common.cancel')}</Button>
-              </div>
-            </div>
-          {:else}
-            <Button
-              variant="danger"
-              lockedReason={deleteLock}
-              onclick={() => (confirmDelete = true)}
-            >
-              {t('settings.deleteApp')}
-            </Button>
-          {/if}
+          <Button
+            variant="danger"
+            lockedReason={deleteLock}
+            onclick={() => (confirmDelete = true)}
+          >
+            {t('settings.deleteApp')}
+          </Button>
       </Card>
     </div>
+
+    <ConfirmDialog
+      open={confirmDelete}
+      title={t('settings.confirmDeleteTitle')}
+      message={t('settings.confirmDeleteBody', { name: app.name })}
+      confirmLabel={t('settings.deleteApp')}
+      danger
+      loading={deleting}
+      onconfirm={doDelete}
+      oncancel={() => (confirmDelete = false)}
+    />
   {/if}
 </AdminShell>
 
 <style>
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    float: right;
-  }
-  .head {
-    margin-bottom: 20px;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 4px;
+  .stale {
+    margin-bottom: 16px;
   }
   .app-badge {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-weight: 600;
+    font-weight: var(--weight-medium);
     color: var(--text);
   }
   .settings-stack {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
     max-width: 760px;
   }
   .card-desc {
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin-bottom: 14px;
     line-height: 1.55;
-  }
-  .confirm {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 14px;
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-    border-radius: var(--radius);
-  }
-  .confirm-text {
-    font-size: 13px;
-    color: var(--text);
-  }
-  .confirm-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .err-msg {
-    color: var(--error);
-    font-size: 13.5px;
   }
 </style>

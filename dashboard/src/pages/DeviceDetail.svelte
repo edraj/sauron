@@ -9,9 +9,12 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import FactList from '../lib/components/FactList.svelte';
+  import Fact from '../lib/components/Fact.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import LatencyBadge from '../lib/components/LatencyBadge.svelte';
@@ -29,8 +32,7 @@
     getDeviceErrors,
     getDevicePerf,
   } from '../lib/api/devices';
-  import { relativeTime, formatTimestamp, formatDuration, durationBetween } from '../lib/utils/format';
-  import { timeFormatStore } from '../lib/stores/time-format.svelte';
+  import { formatDuration, durationBetween } from '../lib/utils/format';
   import {
     DEVICE_PERF_DEFAULT_SORT,
     DEVICE_SESSION_DEFAULT_SORT,
@@ -74,6 +76,12 @@
 
   const loading = $derived(view.loading);
   const error = $derived(view.error);
+  /**
+   * A 404 on the device row is a fact about this device, not a transport
+   * failure: it gets "not found" and the way back, never "Couldn't load" with a
+   * Retry that can only 404 again. Every other failure is a load error.
+   */
+  const notFound = $derived(!loading && !!error && view.errorStatus === 404);
   const revalidating = $derived(
     view.revalidating ||
       sessionsView.revalidating ||
@@ -170,43 +178,55 @@
   }
 
   function errorTitle(e: ErrorEvent): string {
-    const type = e.exception_type ?? 'Error';
+    const type = e.exception_type ?? t('timeline.kind.error');
     const val = e.exception_value ?? e.message ?? '';
     return val ? `${type}: ${val}` : type;
   }
 </script>
 
-  <button class="back" onclick={() => push('/devices')}>
-    <Icon name="arrow-left" size={14} />
-    {t('devices.title')}
-  </button>
+  <!-- The title and the key come from the URL until the row lands, so the
+       heading is on screen before any request returns. -->
+  <PageHeader
+    {title}
+    titleClass={title === deviceKey ? 'mono' : ''}
+    back={{ label: t('nav.devices'), href: '#/devices' }}
+  >
+    {#snippet meta()}
+      <span class="meta-id">
+        <span class="mono">{deviceKey}</span>
+        <CopyButton value={deviceKey} size="sm" />
+      </span>
+      {#if device}
+        <span>{t('explore.column.firstSeen')} <TimeValue value={device.first_seen} /></span>
+        <span>{t('explore.column.lastSeen')} <TimeValue value={device.last_seen} /></span>
+      {/if}
+    {/snippet}
+    {#snippet freshness()}
+      {#if device}<Freshness fetchedAt={view.fetchedAt} {revalidating} />{/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+  </PageHeader>
 
   <!-- The device ROW decides whether there is a page at all; every card below
        is a section of a page that exists, and waits and fails on its own. -->
-  {#if !loading && error}
-    <EmptyState title={t('device.notFound')} description={error} icon="triangle-alert">
+  {#if notFound}
+    <EmptyState title={t('device.notFound')} description={t('device.notFound.body')} icon="inbox">
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/devices')}>{t('device.backToList')}</Button>
       {/snippet}
     </EmptyState>
+  {:else if !loading && error}
+    <ErrorState
+      title={t('device.error.load')}
+      error={view}
+      onretry={() => sessionStore.currentAppId && load(sessionStore.currentAppId, deviceKey, true)}
+    />
   {:else}
-    <!-- The title and the key come from the URL until the row lands, so the
-         heading is on screen before any request returns. -->
-    <header class="detail-head">
-      <div class="refresh-slot">
-        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
-      </div>
-      <div class="head-main">
-        <h1 class="dev-title">{title}</h1>
-        <div class="key-row">
-          <span class="key mono">{deviceKey}</span>
-          <CopyButton value={deviceKey} size="sm" label={t('device.copyKey')} />
-        </div>
-      </div>
-    </header>
-
-    <!-- The first tile counts the sessions list; the other four read the row. -->
+    <!-- The first tile counts the sessions list; the other two read the row.
+         First and last seen sit in the header's meta line, where TimeValue can
+         toggle them like every other timestamp. -->
     <StatTiles min={150}>
       <StatTile
         label={t('explore.column.sessions')}
@@ -224,42 +244,14 @@
         tone={(device?.errors_count ?? 0) > 0 ? 'error' : 'neutral'}
         loading={!device}
       />
-      <StatTile
-        label={t('explore.column.firstSeen')}
-        loading={!device}
-        value={!device
-          ? ''
-          : timeFormatStore.mode === 'relative'
-            ? relativeTime(device.first_seen)
-            : formatTimestamp(device.first_seen)}
-        sub={!device
-          ? undefined
-          : timeFormatStore.mode === 'relative'
-            ? formatTimestamp(device.first_seen)
-            : relativeTime(device.first_seen)}
-      />
-      <StatTile
-        label={t('explore.column.lastSeen')}
-        loading={!device}
-        value={!device
-          ? ''
-          : timeFormatStore.mode === 'relative'
-            ? relativeTime(device.last_seen)
-            : formatTimestamp(device.last_seen)}
-        sub={!device
-          ? undefined
-          : timeFormatStore.mode === 'relative'
-            ? formatTimestamp(device.last_seen)
-            : relativeTime(device.last_seen)}
-      />
     </StatTiles>
 
-    <div class="grid">
+    <div class="detail-layout">
       <div class="col-main">
-        <Card title={t('device.card.sessions')} padding="none">
-          <ViewSection view={sessionsView} rows={5} padded>
+        <Card title={t('device.card.sessions')}>
+          <ViewSection view={sessionsView} rows={5}>
           {#if sortedSessions.length === 0}
-            <p class="empty-note muted">{t('device.empty.sessions')}</p>
+            <EmptyState size="section" title={t('device.empty.sessionsTitle')} />
           {:else}
             <DataTable>
               {#snippet head()}
@@ -270,7 +262,7 @@
                   <SortableTh key="started" sort={sessionSort} onsort={onSessionSort}>
                     {t('explore.column.started')}
                   </SortableTh>
-                  <SortableTh key="duration" sort={sessionSort} onsort={onSessionSort}>
+                  <SortableTh key="duration" class="num" sort={sessionSort} onsort={onSessionSort}>
                     {t('explore.column.duration')}
                   </SortableTh>
                   <SortableTh key="events" class="num" sort={sessionSort} onsort={onSessionSort}>
@@ -294,7 +286,7 @@
                     </a>
                   </td>
                   <td><TimeValue value={s.started_at} /></td>
-                  <td class="cell-muted">{formatDuration(sessionDuration(s))}</td>
+                  <td class="num">{formatDuration(sessionDuration(s))}</td>
                   <td class="num">{formatNumber(s.events_count)}</td>
                   <td class="num">
                     <span class:err={s.errors_count > 0}>{formatNumber(s.errors_count)}</span>
@@ -306,10 +298,10 @@
           </ViewSection>
         </Card>
 
-        <Card title={t('device.card.performance')} padding="none">
-          <ViewSection view={perfView} rows={5} padded>
+        <Card title={t('device.card.performance')}>
+          <ViewSection view={perfView} rows={5}>
           {#if sortedPerf.length === 0}
-            <p class="empty-note muted">{t('device.empty.performance')}</p>
+            <EmptyState size="section" title={t('device.empty.performanceTitle')} />
           {:else}
             <DataTable>
               {#snippet head()}
@@ -318,7 +310,7 @@
                     {t('common.name')}
                   </SortableTh>
                   <SortableTh key="op" columnDefault="asc" sort={perfSort} onsort={onPerfSort}>
-                    Op
+                    {t('device.column.op')}
                   </SortableTh>
                   <SortableTh key="p95" class="num" sort={perfSort} onsort={onPerfSort}>p95</SortableTh>
                   <SortableTh key="count" class="num" sort={perfSort} onsort={onPerfSort}>
@@ -345,36 +337,30 @@
           {#if !device}
             <Skeleton rows={7} />
           {:else}
-          <dl class="kv">
-            <div class="kv-row"><dt>{t('device.field.family')}</dt><dd>{device.family ?? '—'}</dd></div>
-            <div class="kv-row"><dt>{t('device.field.model')}</dt><dd>{device.model ?? '—'}</dd></div>
-            <div class="kv-row"><dt>OS</dt><dd>{device.os_name ?? '—'}</dd></div>
-            <div class="kv-row"><dt>{t('device.field.osVersion')}</dt><dd class="mono">{device.os_version ?? '—'}</dd></div>
-            <div class="kv-row"><dt>{t('device.field.arch')}</dt><dd class="mono">{device.arch ?? '—'}</dd></div>
-            <div class="kv-row"><dt>{t('device.field.browser')}</dt><dd>{device.browser ?? '—'}</dd></div>
-            <div class="kv-row">
-              <dt>{t('device.field.lastUser')}</dt>
-              <dd>
+            <FactList>
+              <Fact label={t('device.field.family')}>{device.family ?? '—'}</Fact>
+              <Fact label={t('device.field.model')}>{device.model ?? '—'}</Fact>
+              <Fact label={t('device.field.os')}>{device.os_name ?? '—'}</Fact>
+              <Fact label={t('device.field.osVersion')} mono>{device.os_version ?? '—'}</Fact>
+              <Fact label={t('device.field.arch')} mono>{device.arch ?? '—'}</Fact>
+              <Fact label={t('device.field.browser')}>{device.browser ?? '—'}</Fact>
+              <Fact label={t('device.field.lastUser')} mono>
                 {#if device.last_distinct_id}
-                  <a
-                    class="lnk mono"
-                    href={`#/persons/${encodeURIComponent(device.last_distinct_id)}`}
-                  >
+                  <a class="lnk" href={`#/persons/${encodeURIComponent(device.last_distinct_id)}`}>
                     {device.last_distinct_id}
                   </a>
                 {:else}
                   —
                 {/if}
-              </dd>
-            </div>
-          </dl>
+              </Fact>
+            </FactList>
           {/if}
         </Card>
 
         <Card title={t('device.card.crashes')}>
           <ViewSection view={errorsView} rows={4}>
           {#if (errorsView.data ?? []).length === 0}
-            <p class="empty-note muted">{t('device.empty.crashes')}</p>
+            <EmptyState size="section" title={t('device.empty.crashesTitle')} />
           {:else}
             <ul class="crashes">
               {#each errorsView.data ?? [] as e (e.id)}
@@ -397,67 +383,28 @@
   {/if}
 
 <style>
-  .refresh-slot {
-    float: right;
-    margin-inline-start: 12px;
-  }
-
-  .back {
+  .meta-id {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-    margin-bottom: 16px;
+    min-width: 0;
+    font-size: var(--text-2xs);
+    overflow-wrap: anywhere;
   }
-  .back:hover {
-    color: var(--text);
-  }
-  .detail-head {
-    margin-bottom: 20px;
-  }
-  .dev-title {
-    font-size: 22px;
-    font-weight: 660;
-    line-height: 1.3;
-    word-break: break-word;
-  }
-  .key-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 8px;
-    flex-wrap: wrap;
-  }
-  .key {
-    font-size: 12.5px;
-    color: var(--text-muted);
-    word-break: break-all;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 320px;
-    gap: 18px;
-    align-items: start;
-    margin-top: 20px;
+  /* The rail layout itself is the shared `.detail-layout` (app.css). */
+  .detail-layout {
+    margin-top: var(--page-gap);
   }
   .col-main {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
     min-width: 0;
   }
   .col-side {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-  }
-  .empty-note {
-    font-size: 13px;
-    padding: 18px;
+    gap: var(--page-gap);
   }
   .lnk {
     color: var(--text-muted);
@@ -473,36 +420,11 @@
   .perf-name {
     display: inline-block;
     max-width: 220px;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .err {
     color: var(--error);
-    font-weight: 600;
-  }
-  .kv {
-    display: flex;
-    flex-direction: column;
-    margin: 0;
-    gap: 11px;
-  }
-  .kv-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .kv-row dt {
-    font-size: 12px;
-    color: var(--text-faint);
-    flex-shrink: 0;
-  }
-  .kv-row dd {
-    margin: 0;
-    font-size: 12.5px;
-    color: var(--text);
-    text-align: end;
-    word-break: break-word;
-    min-width: 0;
+    font-weight: var(--weight-strong);
   }
   .crashes {
     list-style: none;
@@ -532,20 +454,14 @@
     gap: 8px;
   }
   .crash-time {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .crash-title {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  @media (max-width: 900px) {
-    .grid {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

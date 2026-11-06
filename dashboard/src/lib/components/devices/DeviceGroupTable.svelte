@@ -70,7 +70,7 @@
     -->
     <tr>
       <SortableTh key="family" columnDefault="asc" {sort} {onsort}>{t('sessions.column.device')}</SortableTh>
-      <SortableTh key="os_name" columnDefault="asc" {sort} {onsort}>OS</SortableTh>
+      <SortableTh key="os_name" columnDefault="asc" {sort} {onsort}>{t('devices.column.os')}</SortableTh>
       <SortableTh key="device_count" class="num" {sort} {onsort}>{t('devices.title')}</SortableTh>
       <SortableTh key="sessions_count" class="num" {sort} {onsort}>{t('explore.column.sessions')}</SortableTh>
       <SortableTh key="events_count" class="num" {sort} {onsort}>{t('explore.column.events')}</SortableTh>
@@ -103,11 +103,11 @@
 
 <style>
   .dev-name {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     color: var(--text);
   }
   .err {
     color: var(--error);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 </style>

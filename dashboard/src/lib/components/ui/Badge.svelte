@@ -19,23 +19,26 @@
 </span>
 
 <style>
+  /* A small, flat label: rectangle, soft tone fill, no border. Quiet enough to
+     sit in every table row without turning the column into a stripe. */
   .badge {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    border-radius: var(--radius-pill);
-    font-weight: 560;
+    gap: 5px;
+    border-radius: var(--radius-sm);
+    font-weight: var(--weight-medium);
     line-height: 1;
     white-space: nowrap;
-    border: 1px solid transparent;
   }
   .badge.md {
-    padding: 4px 10px;
-    font-size: 12px;
+    height: 20px;
+    padding: 0 7px;
+    font-size: var(--text-xs);
   }
   .badge.sm {
-    padding: 3px 8px;
-    font-size: 11px;
+    height: 18px;
+    padding: 0 6px;
+    font-size: var(--text-xs);
   }
   .dot {
     width: 6px;
@@ -45,38 +48,31 @@
   }
 
   .neutral {
-    background: var(--neutral-soft);
-    color: var(--neutral);
-    border-color: color-mix(in srgb, var(--neutral) 22%, transparent);
+    background: var(--surface-2);
+    color: var(--text-muted);
   }
   .primary {
     background: var(--primary-soft);
     color: var(--primary);
-    border-color: var(--primary-border);
   }
   .error {
     background: var(--error-soft);
     color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 30%, transparent);
   }
   .fatal {
     background: var(--fatal-soft);
     color: var(--fatal);
-    border-color: color-mix(in srgb, var(--fatal) 30%, transparent);
   }
   .warning {
     background: var(--warning-soft);
     color: var(--warning);
-    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
   }
   .success {
     background: var(--success-soft);
     color: var(--success);
-    border-color: color-mix(in srgb, var(--success) 30%, transparent);
   }
   .info {
     background: var(--info-soft);
     color: var(--info);
-    border-color: color-mix(in srgb, var(--info) 30%, transparent);
   }
 </style>

@@ -1,4 +1,5 @@
-import { WEEKDAYS } from '../constants/inspectorSchedules';
+import { t } from '../i18n';
+import { WEEKDAY_KEYS } from '../constants/inspectorSchedules';
 
 // The SERVER's `next_run_at` is authoritative. Everything here is DISPLAY
 // ONLY: the backend resolves DST with Postgres's `AT TIME ZONE`, and this
@@ -7,20 +8,30 @@ import { WEEKDAYS } from '../constants/inspectorSchedules';
 
 /** Bit N = day N, Sunday first, matching Postgres's EXTRACT(DOW). */
 export function weekdayMaskToArray(mask: number): boolean[] {
-  return WEEKDAYS.map((_, i) => ((mask >> i) & 1) === 1);
+  return WEEKDAY_KEYS.map((_, i) => ((mask >> i) & 1) === 1);
 }
 
 export function weekdayArrayToMask(days: boolean[]): number {
   return days.reduce((acc, on, i) => (on ? acc | (1 << i) : acc), 0);
 }
 
+/**
+ * "Every Tue, Thu at 03:00 (Europe/Paris)", in the active locale.
+ *
+ * Calls `t()`, so a caller in markup or `$derived` re-renders on a language
+ * switch. `time` and `tz` are wire values and pass through untranslated.
+ */
 export function describeSchedule(mask: number, time: string, tz: string): string {
-  if (mask === 0) return 'No scheduled runs';
-  if (mask === 127) return `Every day at ${time} (${tz})`;
+  if (mask === 0) return t('inspector.scheduleDesc.none');
+  if (mask === 127) return t('inspector.scheduleDesc.daily', { time, tz });
   const names = weekdayMaskToArray(mask)
-    .map((on, i) => (on ? WEEKDAYS[i] : null))
+    .map((on, i) => (on ? t(WEEKDAY_KEYS[i]) : null))
     .filter((n): n is string => n !== null);
-  return `Every ${names.join(', ')} at ${time} (${tz})`;
+  return t('inspector.scheduleDesc.days', {
+    days: names.join(t('inspector.scheduleDesc.sep')),
+    time,
+    tz,
+  });
 }
 
 /**

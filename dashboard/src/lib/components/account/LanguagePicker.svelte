@@ -41,6 +41,9 @@
 </div>
 
 <style>
+  /* Kept as its own markup rather than `SegmentedControl` only because each
+     option carries its own `lang` (so "العربية" is announced in Arabic); the
+     look is SegmentedControl's, token for token. */
   .lang {
     display: flex;
     flex-direction: column;
@@ -50,36 +53,39 @@
 
   .seg {
     display: inline-flex;
+    align-items: stretch;
+    height: var(--control-h);
     padding: 3px;
     gap: 2px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
   }
 
   .opt {
-    padding: 5px 14px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 12px;
     border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-weight: 550;
-    line-height: 1.4;
-    transition: background 0.12s ease, color 0.12s ease;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
 
   .opt:hover:not(.on) {
     color: var(--text);
-    background: var(--surface-3);
   }
 
   .opt.on {
-    background: var(--primary);
-    color: var(--primary-contrast);
+    background: var(--surface-3);
+    color: var(--text);
   }
 
   .hint {
-    font-size: 12px;
+    font-size: var(--text-xs);
     margin: 0;
   }
 </style>

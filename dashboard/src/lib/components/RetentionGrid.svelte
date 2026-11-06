@@ -100,7 +100,7 @@
 
   .retention-grid {
     border-collapse: collapse;
-    font-size: 0.8125rem;
+    font-size: var(--text-sm);
     white-space: nowrap;
   }
 
@@ -120,8 +120,8 @@
   }
 
   .retention-grid thead th {
-    color: var(--muted-fg);
-    font-weight: 500;
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
     text-align: end;
   }
 
@@ -129,17 +129,19 @@
     text-align: start !important;
     position: sticky;
     inset-inline-start: 0;
-    background: var(--card);
-    font-weight: 500;
+    /* The page colour: sections have no fill now, so a surface-coloured
+       sticky column read as a stripe down the grid. */
+    background: var(--bg);
+    font-weight: var(--weight-medium);
   }
 
   .size-col {
-    color: var(--muted-fg);
+    color: var(--text-muted);
   }
 
   .cell {
     font-variant-numeric: tabular-nums;
-    color: var(--fg);
+    color: var(--text);
   }
 
   .cell.clickable {
@@ -162,25 +164,26 @@
     opacity: 0.35;
   }
 
+  /* A 0% cell: the empty end of the ramp, a quiet fill rather than none. */
   .cell[data-step='0'] {
-    background: var(--muted);
+    background: var(--surface-2);
   }
   .cell[data-step='1'] {
-    background: color-mix(in srgb, var(--primary) 12%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 12%, transparent);
   }
   .cell[data-step='2'] {
-    background: color-mix(in srgb, var(--primary) 28%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 28%, transparent);
   }
   .cell[data-step='3'] {
-    background: color-mix(in srgb, var(--primary) 48%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 48%, transparent);
   }
   .cell[data-step='4'] {
-    background: color-mix(in srgb, var(--primary) 70%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 70%, transparent);
   }
 
   .legend {
     margin: 10px 0 0;
-    font-size: 0.75rem;
-    color: var(--muted-fg);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 </style>

@@ -9,12 +9,15 @@
     rowCulprit,
     rowKind,
     rowTitle,
+    type RowKind,
     type TimeMode,
   } from '../models/timeline-row';
   import { formatTime, formatMs, latencyTone } from '../utils/format';
   import LatencyBadge from './LatencyBadge.svelte';
   import LevelBadge from './LevelBadge.svelte';
   import Badge from './ui/Badge.svelte';
+  import EmptyState from './ui/EmptyState.svelte';
+  import InlineNotice from './ui/InlineNotice.svelte';
   import Icon, { type IconName } from './ui/Icon.svelte';
   import JsonTree from './JsonTree.svelte';
   import StacktraceView from './StacktraceView.svelte';
@@ -55,8 +58,30 @@
     startedAt = null,
     timeMode = 'session',
     onslice,
-    emptyLabel = 'No activity recorded in this session.',
+    emptyLabel,
   }: Props = $props();
+
+  const emptyText = $derived(emptyLabel ?? t('timeline.empty.session'));
+
+  /**
+   * The row's kind, as a sentence-case badge in the tone its rail node wears.
+   * Was an uppercase pill ("NAVIGATION") hand-styled per kind; the words now
+   * come from the catalog so an Arabic timeline is not labelled in English.
+   */
+  const KIND_TONE: Record<RowKind, 'warning' | 'info' | 'primary' | 'error'> = {
+    navigation: 'warning',
+    http: 'info',
+    transaction: 'info',
+    event: 'primary',
+    error: 'error',
+  };
+  const kindLabel = $derived<Record<RowKind, string>>({
+    navigation: t('timeline.kind.navigation'),
+    http: t('timeline.kind.http'),
+    transaction: t('timeline.kind.transaction'),
+    event: t('timeline.kind.event'),
+    error: t('timeline.kind.error'),
+  });
 
   let expanded = $state<Set<number>>(new Set());
 
@@ -162,6 +187,9 @@
   }
 </script>
 
+{#if items.length === 0}
+  <EmptyState size="section" title={emptyText} />
+{:else}
 <ol class="tl">
   {#each items as item, i (i)}
     <li class="tl-item">
@@ -171,7 +199,7 @@
       <div class="content">
         <button class="row" onclick={() => toggle(i)} type="button">
           <span class="time mono" title={formatTime(item.at)}>{formatTime(item.at)}</span>
-          <span class="kind kind-{rowKind(item)}">{rowKind(item)}</span>
+          <span class="kind"><Badge tone={KIND_TONE[rowKind(item)]} size="sm">{kindLabel[rowKind(item)]}</Badge></span>
           {#if item.kind === 'transaction'}
             {#if !isHttp(item) && item.transaction.op}
               <Badge tone="neutral" size="sm">{item.transaction.op}</Badge>
@@ -242,7 +270,7 @@
             {#if startedAt || timeMode === 'delta'}
               <span
                 class="elapsed faint mono"
-                title={timeMode === 'delta' ? 'Since the previous entry' : 'Since the session started'}
+                title={timeMode === 'delta' ? t('timeline.offset.sincePrevious') : t('timeline.offset.sinceSessionStart')}
               >{offsetLabel(i)}</span>
             {/if}
             <span class="caret" class:open={expanded.has(i)}><Icon name="chevron-right" size={13} /></span>
@@ -301,12 +329,9 @@
             -->
             {#if item.kind === 'transaction'}
               {#if item.transaction.extra?._truncated === true}
-                <p class="tl-truncated" role="status">
-                  <Icon name="info" size={13} />
-                  <span>
-                    {t('prose.timeline.truncated')}
-                  </span>
-                </p>
+                <div class="tl-truncated">
+                  <InlineNotice tone="info">{t('prose.timeline.truncated')}</InlineNotice>
+                </div>
               {/if}
               {#if item.transaction.tags && Object.keys(item.transaction.tags).length > 0}
                 <div class="tl-meta">
@@ -330,10 +355,9 @@
         {/if}
       </div>
     </li>
-  {:else}
-    <li class="tl-empty faint">{emptyLabel}</li>
   {/each}
 </ol>
+{/if}
 
 <IssueQuickView error={quickView} open={quickView !== null} onclose={() => (quickView = null)} />
 
@@ -371,7 +395,7 @@
     border-radius: 50%;
     display: grid;
     place-items: center;
-    font-size: 10px;
+    font-size: var(--text-xs);
     z-index: 1;
     border: 1px solid transparent;
     background: var(--surface-3);
@@ -421,52 +445,24 @@
     border-color: var(--border-strong);
   }
   .time {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     flex-shrink: 0;
     font-variant-numeric: tabular-nums;
   }
+  /* The kind badge keeps the rail node's tone: an HTTP row shares the
+     transaction tone on purpose (it IS a transaction, and its response-code
+     badge carries the colour that varies per row), and navigation has its own
+     so it never reads as an event or a transaction at a glance. */
   .kind {
-    font-size: 10px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    padding: 2px 6px;
-    border-radius: var(--radius-sm);
+    display: inline-flex;
     flex-shrink: 0;
-    background: var(--surface-3);
-    color: var(--text-muted);
-  }
-  .kind-error {
-    color: var(--error);
-    background: var(--error-soft);
-  }
-  .kind-transaction {
-    color: var(--info);
-    background: var(--info-soft);
-  }
-  /* Shares the transaction tone on purpose: an HTTP row IS a transaction, just
-     a named one, and the response-code badge beside it already carries the
-     colour that varies per row. */
-  .kind-http {
-    color: var(--info);
-    background: var(--info-soft);
-  }
-  .kind-event {
-    color: var(--primary);
-    background: var(--primary-soft);
-  }
-  /* Its own tone: --primary is taken by events and --info by transactions, and
-     a navigation row that borrows either reads as one of them at a glance. */
-  .kind-navigation {
-    color: var(--warning);
-    background: var(--warning-soft);
   }
   .title {
     flex: 1;
     min-width: 0;
-    font-size: 13px;
-    font-weight: 520;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
   }
   /* `flex: 0 1 auto` against the title's `flex: 1`: on a narrow row the crash
      site gives up width first. It is the supporting half of the pair, and a
@@ -477,7 +473,7 @@
     flex: 0 1 auto;
     min-width: 0;
     max-width: 40%;
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .trail {
@@ -487,7 +483,7 @@
     flex-shrink: 0;
   }
   .elapsed {
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
   .caret {
     display: inline-flex;
@@ -517,15 +513,7 @@
     margin-top: 6px;
   }
   .tl-truncated {
-    display: flex;
-    align-items: center;
-    gap: 8px;
     margin: 0 0 12px;
-    padding: 7px 10px;
-    border-radius: var(--radius);
-    background: var(--info-soft);
-    color: var(--info);
-    font-size: 12px;
   }
   /* `tl-`prefixed because `.stack` is a global utility in app.css. */
   .tl-stack {
@@ -549,8 +537,8 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    font-size: 12px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--primary);
   }
   /* `.issue-link` is a <button> since it opens the quick view instead of
@@ -565,11 +553,6 @@
   .screen-link:hover {
     text-decoration: underline;
   }
-  .tl-empty {
-    padding: 24px;
-    text-align: center;
-    font-size: 13px;
-  }
   .in-between-btn {
     /* A button does not inherit the surrounding font, so say so explicitly —
        without this the element changes appearance purely from being made
@@ -581,9 +564,8 @@
     background: var(--surface-2);
     border: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 10px;
-    font-weight: 560;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     padding: 2px 6px;
     border-radius: var(--radius-sm);
     cursor: pointer;
@@ -592,7 +574,7 @@
   /* The reason this became a button: keyboard users need to see where they
      are. `:focus-visible` keeps it off mouse clicks. */
   .in-between-btn:focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--primary);
     outline-offset: 1px;
   }
 

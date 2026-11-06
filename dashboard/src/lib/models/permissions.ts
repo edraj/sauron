@@ -1,4 +1,5 @@
 import type { Permission } from './index';
+import { t, type MessageKey } from '../i18n';
 
 /**
  * Every permission the backend recognises, mirroring perm::ALL in
@@ -104,3 +105,76 @@ export const PERMISSION_LABELS: Record<string, string> = {
   'pii:read': 'View PII scan findings, the mask audit trail, and reveal single values',
   'pii:manage': 'Configure scans and permanently mask values (irreversible)',
 };
+
+/**
+ * Catalog keys for the same labels, for surfaces that render them in the
+ * active language (the lock tooltip). `PERMISSION_LABELS` above stays English
+ * for its existing consumers. `permissions.test.ts` checks that every entry
+ * of `ALL_PERMISSIONS` has a key here and that its English matches
+ * `PERMISSION_LABELS` exactly, so the two cannot drift apart. (`Permission`
+ * admits any string, so the type alone cannot enforce completeness.)
+ */
+export const PERMISSION_LABEL_KEYS: Record<string, MessageKey> = {
+  'issue:read': 'access.perm.issueRead',
+  'issue:write': 'access.perm.issueWrite',
+  'event:read': 'access.perm.eventRead',
+  'funnel:write': 'access.perm.funnelWrite',
+  'artifact:write': 'access.perm.artifactWrite',
+  'source:read': 'access.perm.sourceRead',
+  'monitor:read': 'access.perm.monitorRead',
+  'monitor:write': 'access.perm.monitorWrite',
+  'app:read': 'access.perm.appRead',
+  'app:create': 'access.perm.appCreate',
+  'app:update': 'access.perm.appUpdate',
+  'app:delete': 'access.perm.appDelete',
+  'env:read': 'access.perm.envRead',
+  'env:create': 'access.perm.envCreate',
+  'env:update': 'access.perm.envUpdate',
+  'env:delete': 'access.perm.envDelete',
+  'env:rotate_key': 'access.perm.envRotateKey',
+  'project:read': 'access.perm.projectRead',
+  'project:create': 'access.perm.projectCreate',
+  'project:update': 'access.perm.projectUpdate',
+  'project:delete': 'access.perm.projectDelete',
+  'member:read': 'access.perm.memberRead',
+  'member:manage': 'access.perm.memberManage',
+  'member:credential': 'access.perm.memberCredential',
+  'role:manage': 'access.perm.roleManage',
+  'org:manage': 'access.perm.orgManage',
+  'alert:read': 'access.perm.alertRead',
+  'alert:write': 'access.perm.alertWrite',
+  'pii:read': 'access.perm.piiRead',
+  'pii:manage': 'access.perm.piiManage',
+};
+
+/**
+ * A permission's human label in the active language, or `undefined` for a
+ * permission this dashboard does not know yet. Call at render time.
+ */
+export function permissionLabel(perm: string): string | undefined {
+  const key: MessageKey | undefined = PERMISSION_LABEL_KEYS[perm];
+  return key ? t(key) : undefined;
+}
+
+const PERMISSION_GROUP_KEYS: Record<string, MessageKey> = {
+  'Issues & events': 'access.group.issuesEvents',
+  Analytics: 'access.group.analytics',
+  Symbolication: 'access.group.symbolication',
+  Uptime: 'access.group.uptime',
+  Apps: 'access.group.apps',
+  Environments: 'access.group.environments',
+  Projects: 'access.group.projects',
+  Alerting: 'access.group.alerting',
+  Privacy: 'access.group.privacy',
+  Organization: 'access.group.organization',
+};
+
+/**
+ * A permission group's heading in the active language. `group.label` stays
+ * the English id (the picker keys its open/closed state by it, and tests find
+ * groups by it); this is only what a person reads. Call at render time.
+ */
+export function permissionGroupLabel(group: PermissionGroup): string {
+  const key = PERMISSION_GROUP_KEYS[group.label];
+  return key ? t(key) : group.label;
+}

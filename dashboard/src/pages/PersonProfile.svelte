@@ -6,8 +6,11 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
+  import CopyButton from '../lib/components/ui/CopyButton.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
@@ -20,8 +23,7 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { getPersonSummary, getPersonTimeline, type PersonTimeline } from '../lib/api/persons';
-  import { relativeTime, formatTimestamp, initials } from '../lib/utils/format';
-  import { timeFormatStore } from '../lib/stores/time-format.svelte';
+  import { initials } from '../lib/utils/format';
   import {
     formatOffset,
     personJsonFilename,
@@ -76,6 +78,15 @@
       ? (view.error ?? timelineView.error)
       : null,
   );
+  /** Whichever view failed, handed to `ErrorState` for its human sentence. */
+  const failedView = $derived(view.error ? view : timelineView);
+  /**
+   * A 404 is a fact about this id, not a transport failure: "not found" and
+   * the way back, never "Couldn't load" with a Retry that can only 404 again.
+   * (A distinct id with no profile row is NOT this — the summary answers 200
+   * with `user: null`, and the page shows it as anonymous.)
+   */
+  const notFound = $derived(!!error && failedView.errorStatus === 404);
 
   type TimelineItem =
     | { kind: 'event'; at: number; data: AnalyticsEvent }
@@ -127,7 +138,7 @@
   });
 
   function errorTitle(e: ErrorEvent): string {
-    const type = e.exception_type ?? 'Error';
+    const type = e.exception_type ?? t('timeline.kind.error');
     const val = e.exception_value ?? e.message ?? '';
     return val ? `${type}: ${val}` : type;
   }
@@ -207,92 +218,70 @@
   }
 </script>
 
-  <button class="back" onclick={() => push('/events')}><Icon name="arrow-left" size={14} /> {t('person.backToEvents')}</button>
+  <!-- Rendered from the URL alone, before either request returns: the id is
+       the one thing this page knows for certain the moment it mounts. -->
+  <PageHeader
+    title={distinctId}
+    titleClass="mono"
+    back={{ label: t('nav.users'), href: '#/users' }}
+  >
+    {#snippet leading()}
+      <span class="avatar" aria-hidden="true">{initials(distinctId)}</span>
+    {/snippet}
+    {#snippet meta()}
+      <CopyButton value={distinctId} size="sm" />
+      {#if userLoading}
+        <span class="meta-skel"><Skeleton rows={1} height="13px" /></span>
+      {:else if user}
+        <span>{t('explore.column.firstSeen')} <TimeValue value={user.first_seen} /></span>
+        <span>{t('explore.column.lastSeen')} <TimeValue value={user.last_seen} /></span>
+      {:else if view.hasData}
+        <span>{t('person.anonymousNote')}</span>
+      {/if}
+    {/snippet}
+    {#snippet freshness()}
+      {#if view.hasData}<Freshness fetchedAt={view.fetchedAt} {revalidating} />{/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+  </PageHeader>
 
-  {#if error}
-    <EmptyState title={t('person.error.load')} description={error} icon="triangle-alert">
+  {#if notFound}
+    <EmptyState
+      title={t('person.notFound.title')}
+      description={t('person.notFound.body')}
+      icon="inbox"
+    >
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/events')}>{t('common.back')}</Button>
+        <Button variant="secondary" onclick={() => push('/users')}>{t('person.backToUsers')}</Button>
       {/snippet}
     </EmptyState>
+  {:else if error}
+    <ErrorState title={t('person.error.load')} error={failedView} onretry={refresher.run} />
   {:else}
-    <!-- Rendered from the URL alone, before either request returns: the id is
-         the one thing this page knows for certain the moment it mounts. -->
-    <header class="identity">
-      <div class="id-actions">
-        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
-      </div>
-      <span class="avatar">{initials(distinctId)}</span>
-      <div class="id-meta">
-        <h1 class="id-title mono">{distinctId}</h1>
-        <div class="id-sub">
-          {#if userLoading}
-            <Skeleton rows={1} height="13px" />
-          {:else if user}
-            <span class="muted">
-              {t('explore.column.firstSeen')} <TimeValue value={user.first_seen} /> {t('prose.person.lastSeen')}
-              <TimeValue value={user.last_seen} />
-            </span>
-          {:else}
-            <span class="muted">{t('person.anonymousNote')}</span>
-          {/if}
-        </div>
-      </div>
-    </header>
+    <!-- The three counts come off the timeline. First and last seen are the
+         profile's, and sit in the header's meta line. -->
+    <StatTiles min={140}>
+      <StatTile
+        label={t('explore.column.events')}
+        value={timelineView.hasData ? formatNumber(events.length) : '—'}
+        loading={timelineLoading}
+      />
+      <StatTile
+        label={t('explore.column.errors')}
+        value={timelineView.hasData ? formatNumber(errors.length) : '—'}
+        tone={errors.length > 0 ? 'error' : 'neutral'}
+        loading={timelineLoading}
+      />
+      <StatTile
+        label={t('explore.column.sessions')}
+        value={sessionCount > 0 ? formatNumber(sessionCount) : '—'}
+        loading={timelineLoading}
+      />
+    </StatTiles>
 
-    <!-- Two requests feed this row, so its tiles fill in two at a time: the
-         three counts come off the timeline, the two dates off the profile. -->
-    <div class="tiles">
-      <StatTiles min={140}>
-        <StatTile
-          label={t('explore.column.events')}
-          value={timelineView.hasData ? formatNumber(events.length) : '—'}
-          loading={timelineLoading}
-        />
-        <StatTile
-          label={t('explore.column.errors')}
-          value={timelineView.hasData ? formatNumber(errors.length) : '—'}
-          tone={errors.length > 0 ? 'error' : 'neutral'}
-          loading={timelineLoading}
-        />
-        <StatTile
-          label={t('explore.column.sessions')}
-          value={sessionCount > 0 ? formatNumber(sessionCount) : '—'}
-          loading={timelineLoading}
-        />
-        <StatTile
-          label={t('explore.column.firstSeen')}
-          loading={userLoading}
-          value={user
-            ? timeFormatStore.mode === 'relative'
-              ? relativeTime(user.first_seen)
-              : formatTimestamp(user.first_seen)
-            : '—'}
-          sub={user
-            ? timeFormatStore.mode === 'relative'
-              ? formatTimestamp(user.first_seen)
-              : relativeTime(user.first_seen)
-            : undefined}
-        />
-        <StatTile
-          label={t('explore.column.lastSeen')}
-          loading={userLoading}
-          value={user
-            ? timeFormatStore.mode === 'relative'
-              ? relativeTime(user.last_seen)
-              : formatTimestamp(user.last_seen)
-            : '—'}
-          sub={user
-            ? timeFormatStore.mode === 'relative'
-              ? formatTimestamp(user.last_seen)
-              : relativeTime(user.last_seen)
-            : undefined}
-        />
-      </StatTiles>
-    </div>
-
-    <div class="grid">
+    <div class="detail-layout">
       <div class="col-main">
         <Card title={t('person.card.timeline')}>
           {#snippet actions()}
@@ -310,18 +299,18 @@
                 variant="ghost"
                 size="sm"
                 title={timeMode === 'delta'
-                  ? 'Showing time since the previous entry — click to measure from the first entry shown'
-                  : 'Showing time since the first entry shown — click to measure from the previous entry'}
+                  ? t('person.timeMode.deltaTitle')
+                  : t('person.timeMode.firstTitle')}
                 onclick={() => (timeMode = timeMode === 'delta' ? 'start' : 'delta')}
               >
                 <Icon name="clock" size={14} />
-                {timeMode === 'delta' ? 'Since previous' : 'Since start'}
+                {timeMode === 'delta' ? t('timeline.mode.sincePrevious') : t('person.timeMode.sinceFirst')}
               </Button>
             {/if}
           {/snippet}
           <ViewSection view={timelineView} rows={8}>
           {#if timeline.length === 0}
-            <EmptyState title={t('person.empty.title')} description={t('person.empty.body')} icon="inbox" />
+            <EmptyState size="section" title={t('person.empty.title')} description={t('person.empty.body')} />
           {:else}
             <ol class="timeline">
               {#each timeline as item, i (item.kind + i)}
@@ -342,32 +331,39 @@
                           {errorTitle(item.data)}
                         </button>
                       {:else}
-                        <Badge tone="info" size="sm">event</Badge>
+                        <Badge tone="info" size="sm">{t('timeline.kind.event')}</Badge>
                         <span class="tl-title mono">{item.data.name}</span>
                       {/if}
                       {#if sid}
-                        <a class="tl-session mono" href={`#/sessions/${encodeURIComponent(sid)}`}>
-                          session <Icon name="arrow-up-right" size={14} />
+                        <a class="tl-session" href={`#/sessions/${encodeURIComponent(sid)}`}>
+                          <Badge tone="neutral" size="sm">
+                            {t('sessions.column.session')}
+                            <Icon name="arrow-up-right" size={12} />
+                          </Badge>
                         </a>
                       {/if}
                       <span class="tl-time"><TimeValue value={item.data.occurred_at} /></span>
                       <span
                         class="tl-offset mono"
                         title={timeMode === 'delta'
-                          ? 'Since the previous entry'
-                          : 'Since the first entry shown'}
+                          ? t('timeline.offset.sincePrevious')
+                          : t('person.offset.sinceFirst')}
                       >{offsetLabel(i)}</span>
                     </div>
                     {#if item.kind === 'event' && item.data.properties && Object.keys(item.data.properties).length > 0}
                       <div class="tl-props">
                         {#each Object.entries(item.data.properties) as [k, v] (k)}
-                          <span class="prop mono">{k}: {String(v)}</span>
+                          <Badge tone="neutral" size="sm">
+                            <span class="prop mono" title={`${k}: ${String(v)}`}>{k}: {String(v)}</span>
+                          </Badge>
                         {/each}
                       </div>
                     {/if}
-                    {#if item.kind === 'error'}
+                    {#if item.kind === 'error' && item.data.release}
                       <div class="tl-props">
-                        {#if item.data.release}<span class="prop mono">release: {item.data.release}</span>{/if}
+                        <Badge tone="neutral" size="sm">
+                          <span class="prop mono">{t('session.meta.release', { release: item.data.release })}</span>
+                        </Badge>
                       </div>
                     {/if}
                   </div>
@@ -379,6 +375,9 @@
         </Card>
       </div>
 
+      <!-- No Identity card: it repeated the distinct id the header already
+           shows (with its Copy button) and, for an anonymous profile, the note
+           the header's meta line already carries. -->
       <aside class="col-side">
         <Card title={t('users.column.traits')}>
           {#if userLoading}
@@ -386,88 +385,33 @@
           {:else if hasTraits}
             <JsonTree value={user?.properties} expandTo={2} />
           {:else}
-            <p class="muted empty-traits">{t('person.noTraits')}</p>
+            <EmptyState size="section" title={t('person.noTraits')} />
           {/if}
-        </Card>
-        <Card title={t('person.card.identity')}>
-          <div class="summary">
-            <div class="sm-row">
-              <span class="muted">{t('person.distinctId')}</span>
-              <span class="sm-val mono small">{distinctId}</span>
-            </div>
-            {#if view.hasData && !user}
-              <div class="sm-row">
-                <span class="muted">{t('person.title')}</span>
-                <span class="sm-val small">{t('person.anonymous')}</span>
-              </div>
-            {/if}
-          </div>
         </Card>
       </aside>
     </div>
   {/if}
 
 <style>
-  .id-actions {
-    order: 99;
-    margin-inline-start: auto;
-    align-self: center;
-  }
-
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-    margin-bottom: 16px;
-  }
-  .back:hover {
-    color: var(--text);
-  }
-  .center {
-    display: grid;
-    place-items: center;
-    padding: 80px;
-  }
-  .identity {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    margin-bottom: 22px;
-  }
   .avatar {
-    width: 54px;
-    height: 54px;
+    width: 44px;
+    height: 44px;
     border-radius: 50%;
     display: grid;
     place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 18px;
-    font-weight: 680;
+    background: var(--surface-3);
+    color: var(--text-muted);
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     flex-shrink: 0;
   }
-  .id-title {
-    font-size: 21px;
-    font-weight: 660;
-    word-break: break-all;
+  .meta-skel {
+    display: inline-block;
+    width: 220px;
   }
-  .id-sub {
-    margin-top: 4px;
-    font-size: 13px;
-  }
-  .tiles {
-    margin-bottom: 18px;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 300px;
-    gap: 18px;
-    align-items: start;
+  /* The rail layout itself is the shared `.detail-layout` (app.css). */
+  .detail-layout {
+    margin-top: var(--page-gap);
   }
   .col-main {
     min-width: 0;
@@ -475,7 +419,7 @@
   .col-side {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
   }
   .timeline {
     list-style: none;
@@ -501,7 +445,7 @@
     height: 10px;
     border-radius: 50%;
     z-index: 1;
-    box-shadow: 0 0 0 3px var(--surface);
+    box-shadow: 0 0 0 3px var(--bg);
   }
   .tl-dot.error {
     background: var(--error);
@@ -528,8 +472,8 @@
     flex-wrap: wrap;
   }
   .tl-title {
-    font-size: 13.5px;
-    font-weight: 560;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     color: var(--text);
   }
   .link-title {
@@ -545,23 +489,13 @@
   }
   .tl-session {
     display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    color: var(--text-muted);
     text-decoration: none;
-    padding: 1px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-pill);
-    background: var(--surface-2);
-    white-space: nowrap;
   }
-  .tl-session:hover {
-    color: var(--primary);
-    border-color: var(--primary-border);
+  .tl-session:hover :global(.badge) {
+    color: var(--text);
   }
   .tl-time {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     margin-inline-start: auto;
   }
@@ -569,54 +503,26 @@
      change; `min-width` keeps the timestamp beside it from shifting when a
      label swaps between "1.0s" and "30d 00h". */
   .tl-offset {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     min-width: 58px;
     text-align: end;
     font-variant-numeric: tabular-nums;
-  }
-  .empty-traits {
-    font-size: 13px;
-    padding: 2px 0;
   }
   .tl-props {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
     margin-top: 7px;
+    min-width: 0;
   }
+  /* A property value is arbitrary text inside a one-line badge: bounded, with
+     the whole pair on the `title`. */
   .prop {
-    font-size: 11px;
-    color: var(--text-muted);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    padding: 2px 8px;
-    border-radius: var(--radius-pill);
-  }
-  .summary {
-    display: flex;
-    flex-direction: column;
-    gap: 11px;
-  }
-  .sm-row {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    font-size: 13px;
-  }
-  .sm-val {
-    font-weight: 620;
-    font-variant-numeric: tabular-nums;
-  }
-  .sm-val.small {
-    font-size: 12px;
-    font-weight: 500;
-  }
-
-  @media (max-width: 900px) {
-    .grid {
-      grid-template-columns: 1fr;
-    }
+    display: inline-block;
+    max-width: 48ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

@@ -8,6 +8,9 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
@@ -63,7 +66,6 @@
   } from '../lib/models/time-filter';
   import {
     initials,
-    hueFromString,
     compactNumber,
     formatDuration,
     formatPercent,
@@ -80,10 +82,19 @@
    * `first_seen` one. The stat tiles above have always drawn that distinction
    * ("Active" vs "New") over a table that could not reproduce either.
    */
-  const TIME_FIELDS: TimeField[] = [
-    { key: 'last_seen', label: 'Last seen' },
-    { key: 'first_seen', label: 'First seen' },
+  const STATIC_TIME_FIELDS: TimeField[] = [
+    { key: 'last_seen', label: 'last_seen' },
+    { key: 'first_seen', label: 'first_seen' },
   ];
+  /**
+   * The same two fields with their labels, for the picker. Derived so the
+   * labels follow a language switch; `fromParams` below reads the static list
+   * once at init, where only the keys matter (see `SessionsList`).
+   */
+  const TIME_FIELDS: TimeField[] = $derived([
+    { key: 'last_seen', label: t('explore.column.lastSeen') },
+    { key: 'first_seen', label: t('explore.column.firstSeen') },
+  ]);
   const DEFAULT_TIME_FIELD = 'last_seen';
 
   /**
@@ -106,7 +117,7 @@
   // rather than 400ing — see `fromParams`.
   const initial = new URLSearchParams($querystring ?? '');
   let timeFilter = $state<TimeFilterState>(
-    fromParams(initial, TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
+    fromParams(initial, STATIC_TIME_FIELDS, DEFAULT_TIME_FIELD, DEFAULT_DAYS),
   );
 
   /**
@@ -133,6 +144,13 @@
     used: { label: 'users.releaseMode.used', title: 'users.releaseMode.usedTitle' },
     current: { label: 'users.releaseMode.current', title: 'users.releaseMode.currentTitle' },
   };
+  const releaseModeOptions = $derived(
+    RELEASE_MODES.map((m) => ({
+      value: m,
+      label: t(RELEASE_MODE_TEXT[m].label),
+      title: t(RELEASE_MODE_TEXT[m].title),
+    })),
+  );
 
   function setReleaseMode(next: ReleaseMode) {
     if (next === releaseMode) return;
@@ -187,11 +205,13 @@
 
   const rangeCaption = $derived(
     range.kind === 'last'
-      ? `last ${spanDays(range)}d`
+      ? t('explore.range.last', { n: spanDays(range) })
       : formatAbsolute(range, intlTag(localeStore.locale)),
   );
   let analytics = $state<UsersAnalytics | null>(null);
-  let analyticsError = $state<string | null>(null);
+  /** The analytics failure itself; its text is derived, so the two agree. */
+  let analyticsErrorRaw = $state<unknown>(null);
+  const analyticsError = $derived(analyticsErrorRaw === null ? null : errorMessage(analyticsErrorRaw));
 
   let refreshing = $state(false);
 
@@ -235,7 +255,7 @@
 
   async function loadAnalytics(appId: string, win: DateRangeValue) {
     const gen = ++analyticsGen;
-    analyticsError = null;
+    analyticsErrorRaw = null;
     analyticsPending = false;
     try {
       const next = await getUserAnalytics(appId, win);
@@ -245,7 +265,7 @@
       if (gen !== analyticsGen) return;
       analytics = null;
       if (isReleaseRollupPending(errorCode(err))) analyticsPending = true;
-      else analyticsError = errorMessage(err);
+      else analyticsErrorRaw = err;
     }
   }
 
@@ -436,133 +456,19 @@
     return rest.map((tag) => `${tag.key}: ${tag.value}`).join('\n');
   }
 
+
+  function retryAnalytics() {
+    const aid = sessionStore.currentAppId;
+    if (aid) void loadAnalytics(aid, range);
+  }
+
   function personPath(distinctId: string): string {
     return '/persons/' + encodeURIComponent(distinctId);
   }
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('users.title')}</h1>
-      <p class="muted sub">{t('users.subtitle')}</p>
-    </div>
-  </div>
-
-  <div class="analytics-head">
-    <div>
-      <h2 class="section-title">{t('users.audience')}</h2>
-      <p class="muted sub">
-        {t('users.thisAppOnly')} <a href="#/active-users">{t('users.combinedActive')}</a> {t('prose.users.combinedNoteTail')}
-      </p>
-    </div>
-    <DateRange
-      value={range}
-      onchange={(v) => {
-        range = v;
-        rangeStore.set(v);
-      }}
-    />
-  </div>
-
-  <!-- The spacing lives on this wrapper rather than on `StatTiles` / `Card`:
-       both are shared house components, and a margin given to them from a page
-       would follow them onto every other page that uses them. -->
-  <div class="audience">
-    {#if analytics}
-      <StatTiles min={150}>
-        <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} tone="primary" sub={split('all time', analytics.stats.total_users, analytics.stats.total_identified)} />
-        <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={split(rangeCaption, analytics.stats.active_in_range, analytics.stats.active_identified)} />
-        <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={split(rangeCaption, analytics.stats.new_in_range, analytics.stats.new_identified)} />
-        <!-- `stats.dau` has always been in the payload and in the `UserStats`
-             model; the tile was simply never rendered, which is why this page
-             shows a stickiness ratio whose numerator is invisible. -->
-        <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), sketchServed)} sub={split('24h', analytics.stats.dau, analytics.stats.dau_identified)} />
-        <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), sketchServed)} sub={split('7-day', analytics.stats.wau, analytics.stats.wau_identified)} />
-        <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), sketchServed)} sub={split('30-day', analytics.stats.mau, analytics.stats.mau_identified)} />
-        <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
-        <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
-        <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), sketchServed)} />
-      </StatTiles>
-
-      <Card title={t('users.card.activePerDay')}>
-        <UserActivityChart data={analytics.series} />
-      </Card>
-    {:else if analyticsPending}
-      <Card>{@render releasePending(true)}</Card>
-    {:else if analyticsError}
-      <Card><p class="muted">{analyticsError}</p></Card>
-    {:else}
-      <Skeleton rows={2} height="70px" label={t('users.loading.stats')} />
-      <Card>
-        <Skeleton rows={1} height="200px" label={t('users.loading.chart')} />
-      </Card>
-    {/if}
-  </div>
-
-  <!-- Gives the table the same section identity as Audience above it. Without a
-       heading the widened gap reads as a stray hole rather than a boundary, and
-       the table's own header row has to double as the section label. Sits
-       outside the branch below so it holds through the loading and empty
-       states instead of appearing only once rows land. -->
-  <div class="people-head">
-    <div>
-      <h2 class="section-title">{t('users.people')}</h2>
-      <!-- No longer "most recently seen first": that was true of the fixed
-           ordering this table used to have, and would now contradict the
-           header the user just clicked. -->
-      <p class="muted section-hint">{t('users.onePerDistinctId')}</p>
-    </div>
-  </div>
-
-  <!-- Every control that narrows the TABLE lives in this one row, directly
-       above it: search, window, refresh — the same `ListToolbar` every list
-       page renders, so the box is where Sessions and Devices put theirs. They
-       used to be split between the page header and here, which read as two
-       unrelated toolbars and left the search box describing a table two
-       sections further down. -->
-  <ListToolbar>
-    {#snippet searchBox()}
-      <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} />
-    {/snippet}
-    {#snippet timeWindow()}
-      <!-- Only while a release is picked: without one there is nothing for
-           "used it" or "currently on it" to refer to. Part of the predicate,
-           like the window beside it, so it sits in the same slot. -->
-      {#if sessionStore.currentRelease !== null}
-        <div class="release-mode" role="group" aria-label={t('users.releaseMode.label')}>
-          {#each RELEASE_MODES as m (m)}
-            <button
-              type="button"
-              class="mode"
-              class:active={releaseMode === m}
-              aria-pressed={releaseMode === m}
-              title={t(RELEASE_MODE_TEXT[m].title)}
-              onclick={() => setReleaseMode(m)}
-            >
-              {t(RELEASE_MODE_TEXT[m].label)}
-            </button>
-          {/each}
-        </div>
-      {/if}
-      <!-- Governs the TABLE only. The Audience range picker above drives the
-           tiles and chart, and the two are deliberately separate windows: this
-           one can name a column and a bound the summary endpoints cannot
-           express, so a shared control would have to either lie or caption its
-           way out on every card. -->
-      <TimeFilter
-        fields={TIME_FIELDS}
-        value={timeFilter}
-        onchange={(v) => {
-          timeFilter = v;
-          // A changed predicate invalidates the page position: row 51 of the old
-          // window is not row 51 of the new one, and keeping the offset would
-          // land the user in the middle of a result set they have not seen the
-          // start of — or past its end, on an empty page.
-          list = setOffsetPage(list, 0);
-        }}
-      />
-    {/snippet}
-    {#snippet actions()}
+  <PageHeader title={t('users.title')} subtitle={t('users.subtitle')}>
+    {#snippet freshness()}
       <RollupChip />
       <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
            watermark IS the data's age and this fetch-time chip would be a
@@ -570,147 +476,229 @@
       {#if !rollupState.ready}
         <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       {/if}
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
     {/snippet}
-  </ListToolbar>
+  </PageHeader>
 
-  {#if loading && rows.length === 0}
-    <Skeleton rows={8} height="48px" label={t('users.loading.users')} />
-  {:else if listPending}
-    <!-- The full explanation once per page: when the Audience section above
-         carries it, this one is the title alone. -->
-    <Card>{@render releasePending(!pendingExplainedAbove)}</Card>
-  {:else if error}
-    <Card>
-      <EmptyState title={t('users.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) load(aid, query, sortParam(list.sort), list.offset, timeFilter, effectiveMode);
-            }}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
-  {:else if rows.length === 0 && !query && sessionStore.currentRelease !== null}
-    <!-- The release-blind copy below ("users appear once your SDK identifies
-         people") is false here: the app has users, none of them on this
-         release in this window. -->
-    <Card>
-      <EmptyState
-        title={t('users.empty.releaseTitle')}
-        description={t('users.empty.releaseBody')}
-        icon="package"
+  <!-- Audience runs its OWN window (the DateRange in its head), separate from
+       the table's below: the summary endpoints cannot express the column and
+       bounds the table's filter can, so a shared control would have to either
+       lie or caption its way out on every card. -->
+  <Card title={t('users.audience')}>
+    {#snippet actions()}
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
       />
-    </Card>
-  {:else if rows.length === 0}
-    <Card>
-      <EmptyState
-        title={query ? 'No matching users' : 'No users yet'}
-        description={query
-          ? `Nothing matched “${query}”. Try a different distinct ID or trait.`
-          : 'Users appear once your SDK identifies people or sends events with a distinct ID.'}
-        icon="user"
-      />
-    </Card>
-  {:else}
-    <div class="table" class:loading>
-      <DataTable>
-        {#snippet head()}
-          <tr>
-            <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
-              {t('sessions.column.user')}
-            </SortableTh>
-            <!-- Traits stays a plain `<th>`: the cell is a fold of an
-                 arbitrary JSON object into one chip plus a "…", so there is no
-                 single column to order by and the endpoint offers none. -->
-            <th>{t('users.column.traits')}</th>
-            <SortableTh key="sessions_count" class="num" sort={list.sort} {onsort}>
-              {t('explore.column.sessions')}
-            </SortableTh>
-            <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
-              {t('explore.column.events')}
-            </SortableTh>
-            <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
-              {t('explore.column.errors')}
-            </SortableTh>
-            <SortableTh key="first_seen" sort={list.sort} {onsort}>{t('explore.column.firstSeen')}</SortableTh>
-            <SortableTh key="last_seen" sort={list.sort} {onsort}>{t('explore.column.lastSeen')}</SortableTh>
-          </tr>
-        {/snippet}
-        {#snippet children()}
-          {#each rows as row (row.distinct_id)}
-            {@const rowTraits = traits(row.properties)}
-            {@const path = personPath(row.distinct_id)}
-            <tr
-              class="clickable"
-              onclick={(e) => rowNav(e, path)}
-              onauxclick={(e) => rowNav(e, path)}
-            >
-              <td>
-                <a class="row-link user" href={rowHref(path)}>
-                  <span
-                    class="avatar"
-                    style="background: hsl({hueFromString(row.distinct_id)} 50% 45%)"
-                  >
-                    {initials(row.distinct_id)}
-                  </span>
-                  <span class="mono uid" title={row.distinct_id}>{row.distinct_id}</span>
-                </a>
-              </td>
-              <td>
-                {#if rowTraits.length > 0}
-                  <!-- One chip, then a "…" standing in for the rest: three
-                       chips wrapped onto two lines and set the row height off
-                       every other column. The hover title carries the folded
-                       values so nothing is lost. -->
-                  <span class="traits">
-                    <span class="trait">
-                      <span class="tkey">{rowTraits[0].key}</span>
-                      <span class="tval mono">{rowTraits[0].value}</span>
-                    </span>
-                    {#if rowTraits.length > 1}
-                      <span
-                        class="trait more"
-                        title={traitSummary(rowTraits.slice(1))}
-                        aria-label={`${rowTraits.length - 1} more trait${rowTraits.length > 2 ? 's' : ''}`}
-                      >…</span>
-                    {/if}
-                  </span>
-                {:else}
-                  <span class="faint">—</span>
-                {/if}
-              </td>
-              <td class="num">{formatNumber(row.sessions_count)}</td>
-              <td class="num">{formatNumber(row.events_count)}</td>
-              <td class="num">
-                <span class:err={row.errors_count > 0}>{formatNumber(row.errors_count)}</span>
-              </td>
-              <td class="when"><TimeValue value={row.first_seen} muted /></td>
-              <td class="when"><TimeValue value={row.last_seen} muted /></td>
-            </tr>
-          {/each}
-        {/snippet}
-      </DataTable>
+    {/snippet}
+    <p class="section-hint">
+      {t('users.thisAppOnly')} <a href="#/active-users">{t('users.combinedActive')}</a> {t('prose.users.combinedNoteTail')}
+    </p>
+
+    <div class="audience">
+      {#if analytics}
+        <StatTiles min={150}>
+          <StatTile label={t('users.stat.total')} value={compactNumber(analytics.stats.total_users)} sub={split(t('users.range.allTime'), analytics.stats.total_users, analytics.stats.total_identified)} />
+          <StatTile label={t('users.stat.active')} value={compactNumber(analytics.stats.active_in_range)} sub={split(rangeCaption, analytics.stats.active_in_range, analytics.stats.active_identified)} />
+          <StatTile label={t('users.stat.new')} value={compactNumber(analytics.stats.new_in_range)} sub={split(rangeCaption, analytics.stats.new_in_range, analytics.stats.new_identified)} />
+          <!-- `stats.dau` has always been in the payload and in the `UserStats`
+               model; the tile was simply never rendered, which is why this page
+               shows a stickiness ratio whose numerator is invisible. -->
+          <StatTile label="DAU" value={approx(compactNumber(analytics.stats.dau), sketchServed)} sub={split(t('users.range.day'), analytics.stats.dau, analytics.stats.dau_identified)} />
+          <StatTile label="WAU" value={approx(compactNumber(analytics.stats.wau), sketchServed)} sub={split(t('users.range.week'), analytics.stats.wau, analytics.stats.wau_identified)} />
+          <StatTile label="MAU" value={approx(compactNumber(analytics.stats.mau), sketchServed)} sub={split(t('users.range.month'), analytics.stats.mau, analytics.stats.mau_identified)} />
+          <StatTile label={t('users.stat.stickiness')} value={formatPercent(analytics.stickiness)} sub="DAU / MAU" />
+          <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
+          <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), sketchServed)} />
+        </StatTiles>
+
+        <Card title={t('users.card.activePerDay')}>
+          <UserActivityChart data={analytics.series} />
+        </Card>
+      {:else if analyticsPending}
+        {@render releasePending(true)}
+      {:else if analyticsError}
+        <ErrorState
+          size="section"
+          title={t('users.error.audience')}
+          error={analyticsErrorRaw}
+          onretry={retryAnalytics}
+        />
+      {:else}
+        <Skeleton rows={2} height="70px" label={t('users.loading.stats')} />
+        <Skeleton rows={1} height="200px" label={t('users.loading.chart')} />
+      {/if}
     </div>
+  </Card>
 
-    <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
-         inference from the row count: a final page of exactly `LIMIT` rows
-         used to offer a Next that led to an empty page. -->
-    <Pagination
-      offset={list.offset}
-      limit={LIMIT}
-      count={rows.length}
-      {hasNext}
-      total={rowCount.total}
-      totalIsCapped={rowCount.isCapped}
-      onchange={(o) => (list = setOffsetPage(list, o))}
-    />
-  {/if}
+  <!-- The People section. Its heading sits outside the branch below so it
+       holds through the loading and empty states instead of appearing only
+       once rows land. -->
+  <div class="people">
+    <Card title={t('users.people')}>
+      <!-- No longer "most recently seen first": that was true of the fixed
+           ordering this table used to have, and would now contradict the
+           header the user just clicked. -->
+      <p class="section-hint">{t('users.onePerDistinctId')}</p>
+
+      <!-- Every control that narrows the TABLE lives in this one row, directly
+           above it: search, release mode, window — the same `ListToolbar`
+           every list page renders, so the box is where Sessions and Devices
+           put theirs. -->
+      <ListToolbar>
+        {#snippet searchBox()}
+          <SearchInput bind:value={searchTerm} onsearch={onSearch} placeholder={t('users.search')} />
+        {/snippet}
+        {#snippet timeWindow()}
+          <!-- Only while a release is picked: without one there is nothing for
+               "used it" or "currently on it" to refer to. Part of the
+               predicate, like the window beside it, so it sits in the same
+               slot. -->
+          {#if sessionStore.currentRelease !== null}
+            <SegmentedControl
+              value={releaseMode}
+              options={releaseModeOptions}
+              ariaLabel={t('users.releaseMode.label')}
+              onchange={(v) => setReleaseMode(v as ReleaseMode)}
+            />
+          {/if}
+          <!-- Governs the TABLE only. The Audience range picker above drives
+               the tiles and chart; see the note on that section. -->
+          <TimeFilter
+            fields={TIME_FIELDS}
+            value={timeFilter}
+            onchange={(v) => {
+              timeFilter = v;
+              // A changed predicate invalidates the page position: row 51 of the old
+              // window is not row 51 of the new one, and keeping the offset would
+              // land the user in the middle of a result set they have not seen the
+              // start of — or past its end, on an empty page.
+              list = setOffsetPage(list, 0);
+            }}
+          />
+        {/snippet}
+      </ListToolbar>
+
+      {#if loading && rows.length === 0}
+        <Skeleton rows={8} height="48px" label={t('users.loading.users')} />
+      {:else if listPending}
+        <!-- The full explanation once per page: when the Audience section above
+             carries it, this one is the title alone. -->
+        {@render releasePending(!pendingExplainedAbove)}
+      {:else if error}
+        <ErrorState size="section" title={t('users.error.load')} error={view} onretry={() => { void rowCount.reload(); void view.reload(); }} />
+      {:else if rows.length === 0 && !query && sessionStore.currentRelease !== null}
+        <!-- The release-blind copy below is false here: the app has users,
+             none of them on this release in this window. -->
+        <EmptyState
+          size="section"
+          title={t('users.empty.releaseTitle')}
+          description={t('users.empty.releaseBody')}
+        />
+      {:else if rows.length === 0}
+        <EmptyState
+          size="section"
+          title={query ? t('users.empty.match') : t('users.empty.range')}
+          description={query ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
+        />
+      {:else}
+        <div class="table" class:loading>
+          <DataTable>
+            {#snippet head()}
+              <tr>
+                <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
+                  {t('sessions.column.user')}
+                </SortableTh>
+                <!-- Traits stays a plain `<th>`: the cell is a fold of an
+                     arbitrary JSON object into one chip plus a "…", so there is no
+                     single column to order by and the endpoint offers none. -->
+                <th>{t('users.column.traits')}</th>
+                <SortableTh key="sessions_count" class="num" sort={list.sort} {onsort}>
+                  {t('explore.column.sessions')}
+                </SortableTh>
+                <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
+                  {t('explore.column.events')}
+                </SortableTh>
+                <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
+                  {t('explore.column.errors')}
+                </SortableTh>
+                <SortableTh key="first_seen" sort={list.sort} {onsort}>{t('explore.column.firstSeen')}</SortableTh>
+                <SortableTh key="last_seen" sort={list.sort} {onsort}>{t('explore.column.lastSeen')}</SortableTh>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each rows as row (row.distinct_id)}
+                {@const rowTraits = traits(row.properties)}
+                {@const path = personPath(row.distinct_id)}
+                <tr
+                  class="clickable"
+                  onclick={(e) => rowNav(e, path)}
+                  onauxclick={(e) => rowNav(e, path)}
+                >
+                  <td>
+                    <a class="row-link user" href={rowHref(path)}>
+                      <span class="avatar" aria-hidden="true">{initials(row.distinct_id)}</span>
+                      <span class="mono uid" title={row.distinct_id}>{row.distinct_id}</span>
+                    </a>
+                  </td>
+                  <td>
+                    {#if rowTraits.length > 0}
+                      <!-- One chip, then a "…" standing in for the rest: three
+                           chips wrapped onto two lines and set the row height off
+                           every other column. The hover title carries the folded
+                           values so nothing is lost. -->
+                      <span class="traits">
+                        <span class="trait">
+                          <span class="tkey">{rowTraits[0].key}</span>
+                          <span class="tval mono">{rowTraits[0].value}</span>
+                        </span>
+                        {#if rowTraits.length > 1}
+                          <span
+                            class="trait more"
+                            title={traitSummary(rowTraits.slice(1))}
+                            aria-label={rowTraits.length > 2
+                              ? t('users.moreTraits.many', { n: rowTraits.length - 1 })
+                              : t('users.moreTraits.one')}
+                          >…</span>
+                        {/if}
+                      </span>
+                    {:else}
+                      <span class="faint">—</span>
+                    {/if}
+                  </td>
+                  <td class="num">{formatNumber(row.sessions_count)}</td>
+                  <td class="num">{formatNumber(row.events_count)}</td>
+                  <td class="num">
+                    <span class:err={row.errors_count > 0}>{formatNumber(row.errors_count)}</span>
+                  </td>
+                  <td><TimeValue value={row.first_seen} muted /></td>
+                  <td><TimeValue value={row.last_seen} muted /></td>
+                </tr>
+              {/each}
+            {/snippet}
+          </DataTable>
+        </div>
+
+        <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+             inference from the row count: a final page of exactly `LIMIT` rows
+             used to offer a Next that led to an empty page. -->
+        <Pagination
+          offset={list.offset}
+          limit={LIMIT}
+          count={rows.length}
+          {hasNext}
+          total={rowCount.total}
+          totalIsCapped={rowCount.isCapped}
+          onchange={(o) => (list = setOffsetPage(list, o))}
+        />
+      {/if}
+    </Card>
+  </div>
 
 <!-- 503 `release_rollup_pending`: the picked release's numbers are still being
      backfilled. Calm on purpose — nothing failed, and Retry-as-error wording
@@ -718,9 +706,9 @@
 {#snippet releasePending(full: boolean)}
   {#if full}
     <EmptyState
+      size="section"
       title={t('users.releasePending.title')}
       description={t('users.releasePending.body')}
-      icon="timer"
     >
       {#snippet action()}
         <Button variant="secondary" onclick={checkAgain}>
@@ -729,89 +717,27 @@
       {/snippet}
     </EmptyState>
   {:else}
-    <EmptyState title={t('users.releasePending.title')} icon="timer" />
+    <EmptyState size="section" title={t('users.releasePending.title')} />
   {/if}
 {/snippet}
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 28px;
-    flex-wrap: wrap;
+  /* Section rhythm: the header, then Audience, then People, one
+     `--page-gap` apart — the gap every page uses between sections. The
+     sections' own titles come from `Card`, so the two headings here match
+     every other section title in the app. */
+  .people {
+    margin-top: var(--page-gap);
   }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
+  .section-hint {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    margin: -6px 0 14px;
   }
-  /* Section rhythm. The page runs header -> Audience (tiles + chart) -> People
-     (table + pagination). Each section opens with a heading, so the gap ABOVE a
-     heading is what separates two sections and must stay clearly larger than
-     the gap below it (which only ties a heading to its own content). At the
-     previous 24/12 the two were close enough that "Audience" read as floating
-     between the blocks rather than belonging to the one under it. */
-  .analytics-head,
-  .people-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin: 40px 0 16px;
-  }
-  /* The People heading owns the space above the table, so this wrapper adds no
-     bottom margin of its own. That also retires the `.audience:empty` guard
-     that used to sit here: it existed to cancel a `margin-bottom` during the
-     first paint, before either the tiles or the error Card had landed, and
-     there is no longer a margin to cancel. */
   .audience {
     display: flex;
     flex-direction: column;
-    gap: 24px;
-  }
-  .section-hint {
-    font-size: 13px;
-    margin-top: 2px;
-  }
-  .section-title {
-    font-size: 15px;
-    font-weight: 640;
-    margin: 0;
-  }
-  /* The `DateRange` pill well, so it reads as the same family as the window
-     control beside it and sits at `--control-h`: 3px inset + 28px pills +
-     1px border. There is no shared segmented-control component to reuse. */
-  .release-mode {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    min-height: var(--control-h);
-    padding: 3px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .mode {
-    height: 28px;
-    padding: 0 12px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    border-radius: var(--radius-sm);
-    white-space: nowrap;
-    transition: color 0.13s ease, background 0.13s ease;
-  }
-  .mode:hover {
-    color: var(--text);
-  }
-  .mode.active {
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow-sm);
+    gap: var(--page-gap);
   }
   .table {
     transition: opacity 0.12s ease;
@@ -831,14 +757,17 @@
     border-radius: 50%;
     display: grid;
     place-items: center;
-    color: #fff;
-    font-size: 10.5px;
-    font-weight: 680;
+    /* The one avatar treatment, as on the person's profile, the Members table
+       and the top bar: a neutral disc. A hue per user made the same person
+       coloured here and grey one click later. */
+    background: var(--surface-3);
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     flex-shrink: 0;
-    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
   }
   .uid {
-    font-size: 12px;
+    font-size: var(--text-xs);
     max-width: 260px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -881,7 +810,7 @@
        saying more traits exist, so it has to clear AA (5.77:1 light, 6.69:1
        dark). */
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 1.1;
     cursor: help;
     /* Never the item that gives way when the row is tight — the whole point of
@@ -889,14 +818,14 @@
     flex: none;
   }
   .tkey {
-    font-size: 10px;
-    font-weight: 640;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     letter-spacing: 0.03em;
     text-transform: uppercase;
     color: var(--text-faint);
   }
   .tval {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -904,10 +833,7 @@
   }
   .err {
     color: var(--error);
-    font-weight: 620;
-  }
-  .when {
-    font-size: 12.5px;
+    font-weight: var(--weight-strong);
   }
 
   @media (max-width: 640px) {

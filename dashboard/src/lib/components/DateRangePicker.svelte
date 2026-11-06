@@ -16,6 +16,7 @@
 -->
 <script lang="ts">
   import Icon from './ui/Icon.svelte';
+  import Button from './ui/Button.svelte';
   import { t, localeStore, intlTag, isRtl } from '../i18n';
   import {
     MAX_RANGE_DAYS,
@@ -460,7 +461,9 @@
   {/if}
 
   {#if value.kind === 'absolute'}
-    <button type="button" class="save" onclick={saveCurrent}>{t('dateRange.saveThis')}</button>
+    <div class="save">
+      <Button variant="secondary" size="sm" fullWidth onclick={saveCurrent}>{t('dateRange.saveThis')}</Button>
+    </div>
   {/if}
 </div>
 
@@ -469,7 +472,7 @@
     position: fixed;
     z-index: 120;
     background: var(--surface);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     padding: 10px;
@@ -477,32 +480,36 @@
     max-height: min(560px, calc(100vh - 80px));
     overflow-y: auto;
   }
+  /* `SegmentedControl`'s track, stretched to the panel's width. */
   .modes {
     display: flex;
-    gap: 3px;
+    align-items: stretch;
+    height: var(--control-h);
+    gap: 2px;
     padding: 3px;
-    background: var(--surface-2);
-    border-radius: var(--radius-sm);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
     margin-bottom: 8px;
   }
   .mode {
     flex: 1;
-    padding: 5px 6px;
+    padding: 0 6px;
     border: none;
     background: transparent;
     color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     border-radius: var(--radius-sm);
     cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .mode:hover {
     color: var(--text);
   }
   .mode.active {
-    background: var(--surface);
+    background: var(--surface-3);
     color: var(--text);
-    box-shadow: var(--shadow-sm);
   }
   .head {
     display: flex;
@@ -514,23 +521,26 @@
   .nav {
     display: inline-flex;
     align-items: center;
-    padding: 4px;
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    border-radius: var(--radius-sm);
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    border-radius: var(--radius);
     color: var(--text-muted);
     cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .nav:hover {
     color: var(--text);
-    border-color: var(--border-strong);
+    background: var(--surface-2);
   }
   .month,
   .month-pick {
     flex: 1;
     text-align: center;
-    font-size: 13px;
-    font-weight: 620;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .month-pick {
@@ -550,8 +560,8 @@
   }
   .wd {
     text-align: center;
-    font-size: 10.5px;
-    font-weight: 620;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     color: var(--text-faint);
     padding: 3px 0;
   }
@@ -561,7 +571,7 @@
     background: transparent;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     cursor: pointer;
   }
@@ -583,11 +593,12 @@
   }
   .cell.today {
     border-color: var(--border-strong);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
+  /* The solid fill: white digits on dark-theme `--primary` are 3.26:1. */
   .cell.applied {
-    background: var(--primary);
-    color: var(--on-primary, #fff);
+    background: var(--primary-solid);
+    color: var(--primary-contrast);
   }
   .cell.pending {
     border-color: var(--primary);
@@ -596,13 +607,13 @@
   .hint,
   .warn {
     margin: 8px 0 0;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   .hint {
     color: var(--text-faint);
   }
   .warn {
-    color: var(--danger, #c00);
+    color: var(--error);
   }
   .saved {
     margin-top: 10px;
@@ -611,10 +622,8 @@
   }
   .saved-title {
     display: block;
-    font-size: 10.5px;
-    font-weight: 640;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-faint);
     margin-bottom: 4px;
   }
@@ -631,7 +640,7 @@
     background: transparent;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     cursor: pointer;
   }
   .saved-pick:hover {
@@ -648,22 +657,9 @@
     cursor: pointer;
   }
   .saved-x:hover {
-    color: var(--danger, #c00);
+    color: var(--error);
   }
   .save {
-    width: 100%;
     margin-top: 8px;
-    padding: 6px;
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 560;
-    cursor: pointer;
-  }
-  .save:hover {
-    color: var(--text);
-    border-color: var(--border-strong);
   }
 </style>

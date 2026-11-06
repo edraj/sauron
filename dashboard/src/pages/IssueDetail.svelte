@@ -1,14 +1,18 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
-  import { formatNumber } from '../lib/i18n';
+  import { t, tn, formatNumber } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { push } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import CopyButton from '../lib/components/ui/CopyButton.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import FactList from '../lib/components/FactList.svelte';
+  import Fact from '../lib/components/Fact.svelte';
   import LevelBadge from '../lib/components/LevelBadge.svelte';
   import StatusBadge from '../lib/components/StatusBadge.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -59,11 +63,6 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { toastStore } from '../lib/stores/toast.svelte';
-  import {
-    relativeTime,
-    formatDateTimeSeconds,
-    formatDateTimeZone,
-  } from '../lib/utils/format';
   import type {
     Issue,
     IssueEventStats,
@@ -102,13 +101,15 @@
   const revalidating = $derived(
     view.revalidating || seriesView.revalidating || latestView.revalidating,
   );
+  // The issue read failing. Mutations (resolve / ignore) report through a
+  // toast, never here, so a failed action cannot blank the page.
+  const error = $derived(view.error);
   /**
-   * The issue read failing, or a mutation (resolve / ignore / assign) failing.
-   * Separate lifetimes: an action's message must survive a background
-   * revalidate, and a load error must not be cleared by starting an action.
+   * A 404 on the record is a fact about this issue, not a transport failure:
+   * it gets its own "not found" state with the way back, not "Couldn't load
+   * issue" and a Retry that can only 404 again.
    */
-  let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
+  const notFound = $derived(!loading && !!error && view.errorStatus === 404);
   let updating = $state(false);
 
   const issueId = $derived(params?.id ?? '');
@@ -464,10 +465,6 @@
     void loadOccurrences(aid, id, occQuery.enc, occQuery.term, occQuery.since, next);
   }
 
-  function plural(n: number, word: string): string {
-    return `${formatNumber(n)} ${n === 1 ? word : `${word}s`}`;
-  }
-
   // The search box applies on submit only (button/Enter/clear); the effect
   // below watches `occApplied`, so this is the only thing that runs a query.
   function onOccSearch(q: string) {
@@ -531,6 +528,12 @@
     return () => clearTimeout(occTimer);
   });
 
+  const STATUS_TOAST = {
+    resolved: 'issue.toast.resolved',
+    ignored: 'issue.toast.ignored',
+    unresolved: 'issue.toast.unresolved',
+  } as const satisfies Record<IssueStatus, string>;
+
   async function setStatus(next: IssueStatus) {
     const aid = sessionStore.currentAppId;
     const current = issue;
@@ -550,7 +553,7 @@
       // same issue appears under every filter and scope combination.
       viewCache.invalidate('issues.list');
       viewCache.invalidate('issues.stats');
-      toastStore.success(`Issue marked ${next}.`);
+      toastStore.success(t(STATUS_TOAST[next]));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -561,18 +564,19 @@
   const latestEvent = $derived(latestView.data ?? null);
   const latestEventType = $derived(latestEvent?.exception_type ?? issue?.type ?? '');
 
-  // Tags for the rail summary. Same shaping as KeyValueList so the rail and the
-  // full-width Tags card can never disagree about what a value looks like.
-  const tagEntries = $derived(
-    latestEvent?.tags && typeof latestEvent.tags === 'object'
-      ? Object.entries(latestEvent.tags)
-      : [],
+  // Whether the rail's Tags card has anything to show.
+  const hasTags = $derived(
+    !!latestEvent?.tags &&
+      typeof latestEvent.tags === 'object' &&
+      Object.keys(latestEvent.tags).length > 0,
   );
-  function renderTag(value: unknown): string {
-    if (value === null || value === undefined) return '—';
-    if (typeof value === 'object') return JSON.stringify(value);
-    return String(value);
-  }
+
+  /**
+   * Whether the occurrence list is narrowed by a chip or a search — which picks
+   * the empty state's wording: "match these filters" when the reader narrowed
+   * it, "in this time range" when only the window did.
+   */
+  const occFiltered = $derived(occFilters.length > 0 || occApplied.trim() !== '');
 
   const eventMeta = $derived.by(() => {
     const ev = latestEvent;
@@ -615,7 +619,12 @@
 
   // Prefer a name a human recognises, falling back to the id the link points at.
   function userLabel(ev: ErrorEvent): string {
-    return ev.event_user?.email ?? ev.event_user?.username ?? ev.distinct_id ?? 'anonymous';
+    return (
+      ev.event_user?.email ??
+      ev.event_user?.username ??
+      ev.distinct_id ??
+      t('session.meta.anonymous')
+    );
   }
 
   function nested(ctx: Record<string, unknown> | null, group: string, key: string): string | null {
@@ -639,145 +648,221 @@
   }
 </script>
 
-  <button class="back" onclick={() => push('/issues')}>
-    <Icon name="arrow-left" size={14} />
-    {t('issue.backToList')}
-  </button>
+  <!-- The title is the id from the URL until the record lands, so the header
+       is on screen before any request returns. -->
+  <PageHeader
+    title={issue?.title ?? issueId}
+    titleClass={issue ? '' : 'mono'}
+    back={{ label: t('nav.issues'), href: '#/issues' }}
+  >
+    {#snippet badge()}
+      {#if issue}<StatusBadge status={issue.status} />{/if}
+    {/snippet}
+    {#snippet meta()}
+      {#if issue}
+        <span class="mono meta-type">{issue.type}</span>
+        {#if issue.culprit}<span class="mono meta-culprit">{issue.culprit}</span>{/if}
+        <span class="meta-id">
+          <span class="mono" title={t('issue.field.fingerprint')}>{issue.fingerprint}</span>
+          <CopyButton value={issue.fingerprint} size="sm" />
+        </span>
+      {/if}
+    {/snippet}
+    {#snippet freshness()}
+      {#if issue}<Freshness fetchedAt={view.fetchedAt} {revalidating} />{/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    {/snippet}
+    {#snippet actions()}
+      {#if issue}
+        {#if issue.status !== 'ignored'}
+          <Button
+            variant="secondary"
+            loading={updating}
+            lockedReason={writeLock}
+            onclick={() => setStatus('ignored')}
+          >
+            {t('issue.action.ignore')}
+          </Button>
+        {/if}
+        {#if issue.status !== 'unresolved'}
+          <Button
+            variant="ghost"
+            loading={updating}
+            lockedReason={writeLock}
+            onclick={() => setStatus('unresolved')}
+          >
+            {t('issue.action.unresolve')}
+          </Button>
+        {/if}
+      {/if}
+    {/snippet}
+    {#snippet primary()}
+      {#if issue && issue.status !== 'resolved'}
+        <Button
+          variant="primary"
+          loading={updating}
+          lockedReason={writeLock}
+          onclick={() => setStatus('resolved')}
+        >
+          {t('issue.action.resolve')}
+        </Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
 
   <!-- The RECORD decides whether there is a page at all: a 404 or a 403 on it
        is the whole answer, and rendering cards under it would put skeletons
        beneath an issue that does not exist. Everything else is a section of a
        page that does, so each one below waits — and fails — on its own. -->
-  {#if !loading && error}
-    <EmptyState title={t('issue.error.load')} description={error} icon="triangle-alert">
+  {#if notFound}
+    <EmptyState
+      title={t('issue.notFound.title')}
+      description={t('issue.notFound.body')}
+      icon="inbox"
+    >
       {#snippet action()}
-        <Button variant="secondary" onclick={() => push('/issues')}>{t('issue.backToList')}</Button>
+        <Button variant="secondary" onclick={() => push('/issues')}>{t('issue.backToExceptions')}</Button>
       {/snippet}
     </EmptyState>
+  {:else if !loading && error}
+    <ErrorState
+      title={t('issue.error.load')}
+      error={view}
+      onretry={() => sessionStore.currentAppId && load(sessionStore.currentAppId, issueId, true)}
+    />
   {:else}
-    {#if !issue}
-      <header class="detail-head">
-        <div class="head-main"><Skeleton rows={2} height="18px" /></div>
-      </header>
-    {:else}
-    <header class="detail-head">
-      <div class="head-main">
-        <div class="badges">
-          <span class="type-tag mono">{issue.type}</span>
-        </div>
-        <h1 class="issue-title">
-          {issue.title}
-          <Freshness fetchedAt={view.fetchedAt} {revalidating} />
-        </h1>
-        {#if issue.culprit}<p class="culprit mono">{issue.culprit}</p>{/if}
-      </div>
-        <div class="actions">
-          <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
-          {#if issue.status !== 'resolved'}
-            <Button
-              variant="primary"
-              loading={updating}
-              lockedReason={writeLock}
-              onclick={() => setStatus('resolved')}
-            >
-              {t('issue.action.resolve')}
-            </Button>
-          {/if}
-          {#if issue.status !== 'ignored'}
-            <Button
-              variant="secondary"
-              loading={updating}
-              lockedReason={writeLock}
-              onclick={() => setStatus('ignored')}
-            >
-              {t('issue.action.ignore')}
-            </Button>
-          {/if}
-          {#if issue.status !== 'unresolved'}
-            <Button
-              variant="subtle"
-              loading={updating}
-              lockedReason={writeLock}
-              onclick={() => setStatus('unresolved')}
-            >
-              {t('issue.action.unresolve')}
-            </Button>
-          {/if}
-        </div>
-    </header>
-    {/if}
-
     <div class="issue-body">
-      <div class="col-main">
-        <Card title={t('issue.card.eventsOverTime')}>
-          <ViewSection view={seriesView} rows={1} height="170px">
-            <TimeSeriesChart data={seriesView.data ?? []} height={170} color="var(--error)" />
-          </ViewSection>
-        </Card>
+      <!-- Full width: the series reads better wide than squeezed beside the
+           rail. -->
+      <Card title={t('issue.card.eventsOverTime')}>
+        <ViewSection view={seriesView} rows={1} height="170px">
+          <TimeSeriesChart data={seriesView.data ?? []} height={170} color="var(--error)" />
+        </ViewSection>
+      </Card>
 
-        <!-- Latest event, Contexts and Additional data are full-width and
-             collapsible: the payload trees run wide (long `extra` strings
-             wrapped to two lines in a half-width column) and a reader after
-             the occurrence table below should be able to fold them away. -->
-        {#if !latestView.hasData}
-          <!-- Still out, or failed: `ViewSection` draws whichever it is. Its
-               content slot is never reached on this branch. -->
-          <Card title={t('issue.card.latestEvent')} collapsible>
-            <ViewSection view={latestView} rows={8}>{null}</ViewSection>
-          </Card>
-        {:else if latestEvent}
-          <Card collapsible>
-            {#snippet header()}
-              <span class="event-head">
-                <span class="card-title-inline">{t('issue.card.latestEvent')}</span>
-                {#if !metaRedundant}
-                  <span class="event-meta mono">{eventMeta}</span>
-                {/if}
-              </span>
-            {/snippet}
-            <div class="event-body">
-              <div class="section">
-                <div class="section-head">
-                  <span class="section-label">{t('ui.section.stacktrace')}</span>
-                  <SymbolicationBadge
-                    status={latestEvent.symbolication_status}
-                    isDart={latestEvent.debug_meta?.raw_stacktrace != null}
-                  />
-                </div>
-                <StacktraceView
-                  frames={latestEvent.stacktrace ?? []}
-                  symbolicated={latestEvent.stacktrace_symbolicated}
-                  rawTrace={latestEvent.debug_meta?.raw_stacktrace}
+      <!-- The stack trace keeps the full width: frames and file paths run
+           long. Breadcrumbs and Context follow beside the Overview rail. -->
+      {#if !latestView.hasData}
+        <!-- Still out, or failed: `ViewSection` draws whichever it is. Its
+             content slot is never reached on this branch. -->
+        <Card title={t('issue.card.latestEvent')} collapsible>
+          <ViewSection view={latestView} rows={8}>{null}</ViewSection>
+        </Card>
+      {:else if latestEvent}
+        <Card title={t('issue.card.latestEvent')} collapsible>
+          <div class="event-body">
+            {#if !metaRedundant}
+              <p class="event-meta mono" title={eventMeta}>{eventMeta}</p>
+            {/if}
+            <div class="section">
+              <div class="section-head">
+                <span class="section-label">{t('ui.section.stacktrace')}</span>
+                <SymbolicationBadge
+                  status={latestEvent.symbolication_status}
+                  isDart={latestEvent.debug_meta?.raw_stacktrace != null}
                 />
               </div>
-              <div class="section">
-                <span class="section-label">{t('issue.card.breadcrumbs')}</span>
-                <BreadcrumbTrail breadcrumbs={latestEvent.breadcrumbs ?? []} />
-              </div>
-              <div class="section">
-                <span class="section-label">{t('ui.section.context')}</span>
-                <KeyValueList data={latestEvent.context} emptyLabel="No context" />
-              </div>
+              <StacktraceView
+                frames={latestEvent.stacktrace ?? []}
+                symbolicated={latestEvent.stacktrace_symbolicated}
+                rawTrace={latestEvent.debug_meta?.raw_stacktrace}
+              />
             </div>
-          </Card>
-        {:else}
-          <Card title={t('issue.card.latestEvent')} collapsible>
-            <p class="muted">{t('issue.empty.payload')}</p>
-          </Card>
-        {/if}
+          </div>
+        </Card>
+      {:else}
+        <Card title={t('issue.card.latestEvent')} collapsible>
+          <EmptyState size="section" title={t('issue.empty.payloadTitle')} />
+        </Card>
+      {/if}
 
-        {#if latestEvent}
-          <!-- No Tags card here. The rail already carries one, and two copies of
-               the same six rows on one screen made the reader check whether they
-               said different things. The rail's is the survivor because it sits
-               with the other identity facts (release, environment) instead of
-               below a fold of stack trace and payload; long values stay
-               readable there through `title` tooltips. -->
+      <!-- Breadcrumbs and Context beside the Overview rail: short rows that
+           read next to the identity facts, where the stack trace above needs
+           the whole width. Both cards render whatever the latest event's
+           state, so the rail never stands beside an empty column; its error
+           and retry stay on the Latest event card alone (`failed`). -->
+      {#snippet needsLatestEvent()}
+        <EmptyState size="section" title={t('issue.empty.needsLatestEvent')} />
+      {/snippet}
+      <div class="detail-layout">
+        <div class="col-main">
+          <Card title={t('issue.card.breadcrumbs')} collapsible>
+            <ViewSection view={latestView} rows={3} failed={needsLatestEvent}>
+              {#if latestEvent}
+                <BreadcrumbTrail breadcrumbs={latestEvent.breadcrumbs ?? []} />
+              {:else}
+                {@render needsLatestEvent()}
+              {/if}
+            </ViewSection>
+          </Card>
+          <Card title={t('ui.section.context')} collapsible>
+            <ViewSection view={latestView} rows={3} failed={needsLatestEvent}>
+              {#if latestEvent}
+                <KeyValueList data={latestEvent.context} emptyLabel={t('issue.empty.context')} />
+              {:else}
+                {@render needsLatestEvent()}
+              {/if}
+            </ViewSection>
+          </Card>
+        </div>
+
+        <aside class="rail">
+          <!-- Status sits in the header badge and the type and fingerprint in its
+               meta line, so they are not repeated here. -->
+          <Card title={t('issue.card.overview')}>
+            {#if !issue}
+              <Skeleton rows={7} />
+            {:else}
+              <FactList>
+                <Fact label={t('issues.column.level')}><LevelBadge level={issue.level} /></Fact>
+                <Fact label={t('explore.column.events')}>{formatNumber(issue.times_seen)}</Fact>
+                <Fact label={t('issue.field.usersAffected')}>{formatNumber(issue.users_seen)}</Fact>
+                <Fact label={t('explore.column.firstSeen')}><TimeValue value={issue.first_seen} /></Fact>
+                <Fact label={t('explore.column.lastSeen')}><TimeValue value={issue.last_seen} /></Fact>
+                {#if latestEvent?.release}
+                  <Fact label={t('issue.field.release')} mono>{latestEvent.release}</Fact>
+                {/if}
+                {#if latestEvent?.screen}
+                  <Fact label={t('screens.column.screen')}>
+                    <a class="screen-link mono" href={`#/screens/${encodeURIComponent(latestEvent.screen)}`}>
+                      <Icon name="layout-panel-top" size={13} />{latestEvent.screen}
+                    </a>
+                  </Fact>
+                {/if}
+                {#if latestEvent}
+                  <Fact label={t('issue.field.occurred')}><TimeValue value={latestEvent.occurred_at} /></Fact>
+                {/if}
+              </FactList>
+            {/if}
+          </Card>
+
+          <!-- The ONLY Tags card: tags are identity facts, so they sit with
+               release and environment in the rail rather than in a second,
+               full-width copy among the payload cards. (An "Affected user" card
+               used to follow this one; it was dropped because the Occurrences
+               list below already names the user on every row.) A raw tag map,
+               so it renders through `KeyValueList` like every other one. -->
+          {#if latestEvent && hasTags}
+            <Card title={t('ui.section.tags')}>
+              <KeyValueList data={latestEvent.tags} />
+            </Card>
+          {/if}
+        </aside>
+      </div>
+
+      {#if latestEvent}
+        <!-- Contexts and Additional data share a row: two payload trees side
+             by side, each collapsible on its own. No Tags card among them: two
+             copies of the same rows on one screen made the reader check
+             whether they said different things, so the rail's is the only one. -->
+        <div class="pair">
           <Card title={t('ui.section.contexts')} collapsible>
             {#if latestEvent.contexts && Object.keys(latestEvent.contexts).length > 0}
               <JsonTree value={latestEvent.contexts} name="contexts" expandTo={2} />
             {:else}
-              <span class="faint">{t('issue.empty.contexts')}</span>
+              <EmptyState size="section" title={t('issue.empty.contexts')} />
             {/if}
           </Card>
 
@@ -785,251 +870,175 @@
             {#if latestEvent.extra && Object.keys(latestEvent.extra).length > 0}
               <JsonTree value={latestEvent.extra} name="extra" expandTo={2} />
             {:else}
-              <span class="faint">{t('issue.empty.extra')}</span>
+              <EmptyState size="section" title={t('issue.empty.extra')} />
             {/if}
           </Card>
-        {/if}
+        </div>
+      {/if}
 
-        <Card title={t('issues.occurrences')}>
-          {#snippet actions()}
-            {#if occStats}
-              <span class="occ-stats" title={t('issue.acrossRange')}>
-                {plural(occStats.events, 'event')}
-                <span class="sep">·</span>
-                {plural(occStats.users, 'user')}
-                <span class="sep">·</span>
-                {plural(occStats.sessions, 'session')}
-              </span>
-            {/if}
-          {/snippet}
-          <!-- This list is occurrences, not issues — the resource decides
-               which dimensions the schema advertises. -->
-          <FilterBar
-            fields={OCCURRENCE_FIELDS}
-            bind:filters={occFilters}
-            bind:search={occSearch}
-            bind:range={occRange}
-            appId={sessionStore.currentAppId ?? undefined}
-            context="occurrences"
-            error={occSearchError}
-            onSearch={onOccSearch}
-          />
-          <!--
-            Both notices now come from the shared component, which Issues and
-            Events render too. The `payload_searched === false` line originated
-            here; the `clamped` one is new everywhere, and this page had the
-            same gap as the others — a narrowed window with nothing on screen
-            saying so.
-
-            `=== false` and not a truthiness test, still: `null` means no search
-            ran at all, and rendering the notice for it would claim a narrowing
-            on every unfiltered visit. `disclosuresFor` keeps that distinction.
-          -->
-          <SearchDisclosure
-            clamped={occClamped}
-            payloadSearched={occStats?.payload_searched ?? null}
-          />
-          {#if occLoading}
-            <Skeleton rows={6} />
-          {:else if occEmptyPastFirstPage}
-            <!--
-              Deliberately not the copy below. That one answers "does anything
-              match?" and the answer here is yes — the count in the card header
-              says so. What happened is that this page of the walk no longer
-              holds any of them, so "No occurrences match this filter" under a
-              header reading "12,431 events" would be the pager lying in prose.
-              No button: Prev is live in the pager directly underneath, which is
-              the way back.
-            -->
-            <p class="faint">
-              {t('issue.stale.body')}
-            </p>
-          {:else if occurrences.length === 0}
-            <p class="faint">{t('issue.empty.filtered')}</p>
-          {:else}
-            <DataTable class="occ-table">
-              {#snippet head()}
-                <tr>
-                  <SortableTh key="occurred_at" sort={occList.sort} onsort={onOccSort}>{t('events.column.time')}</SortableTh>
-                  <SortableTh key="distinct_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.user')}</SortableTh>
-                  <SortableTh key="session_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.session')}</SortableTh>
-                  <SortableTh key="device_key" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.device')}</SortableTh>
-                </tr>
-              {/snippet}
-              {#snippet children()}
-                {#each occurrences as ev (ev.id)}
-                  <tr>
-                    <td title={`${relativeTime(ev.occurred_at)} · ${formatDateTimeZone(ev.occurred_at)}`}>
-                      <span class="cell-time">{formatDateTimeSeconds(ev.occurred_at)}</span>
-                    </td>
-                    <td>
-                      {#if ev.distinct_id}
-                        <a
-                          class="link trunc"
-                          href={`#/persons/${encodeURIComponent(ev.distinct_id)}`}
-                          title={userLabel(ev)}
-                        >
-                          {userLabel(ev)}
-                        </a>
-                      {:else}
-                        <span class="faint">anonymous</span>
-                      {/if}
-                    </td>
-                    <td>
-                      {#if ev.session_id}
-                        <a
-                          class="link cell-mono trunc"
-                          href={`#/sessions/${encodeURIComponent(ev.session_id)}`}
-                          title={ev.session_id}
-                        >
-                          {ev.session_id}
-                        </a>
-                      {:else}
-                        <span class="faint">—</span>
-                      {/if}
-                    </td>
-                    <td>
-                      {#if ev.device_key}
-                        <a
-                          class="link trunc"
-                          href={`#/devices/${encodeURIComponent(ev.device_key)}`}
-                          title={deviceLabel(ev) ?? ev.device_key}
-                        >
-                          {deviceLabel(ev) ?? ev.device_key}
-                        </a>
-                      {:else if deviceLabel(ev)}
-                        <span class="trunc">{deviceLabel(ev)}</span>
-                      {:else}
-                        <span class="faint">—</span>
-                      {/if}
-                    </td>
-                  </tr>
-                {/each}
-              {/snippet}
-            </DataTable>
+      <Card title={t('issues.occurrences')}>
+        {#snippet actions()}
+          {#if occStats}
+            <span class="occ-stats" title={t('issue.acrossRange')}>
+              {tn('common.plural.event', occStats.events)}
+              <span class="sep">·</span>
+              {tn('common.plural.user', occStats.users)}
+              <span class="sep">·</span>
+              {tn('common.plural.session', occStats.sessions)}
+            </span>
           {/if}
+        {/snippet}
+        <!-- This list is occurrences, not issues — the resource decides
+             which dimensions the schema advertises. -->
+        <FilterBar
+          fields={OCCURRENCE_FIELDS}
+          bind:filters={occFilters}
+          bind:search={occSearch}
+          bind:range={occRange}
+          appId={sessionStore.currentAppId ?? undefined}
+          context="occurrences"
+          error={occSearchError}
+          onSearch={onOccSearch}
+        />
+        <!--
+          Both notices now come from the shared component, which Issues and
+          Events render too. The `payload_searched === false` line originated
+          here; the `clamped` one is new everywhere, and this page had the
+          same gap as the others — a narrowed window with nothing on screen
+          saying so.
 
+          `=== false` and not a truthiness test, still: `null` means no search
+          ran at all, and rendering the notice for it would claim a narrowing
+          on every unfiltered visit. `disclosuresFor` keeps that distinction.
+        -->
+        <SearchDisclosure
+          clamped={occClamped}
+          payloadSearched={occStats?.payload_searched ?? null}
+        />
+        {#if occLoading}
+          <Skeleton rows={6} />
+        {:else if occEmptyPastFirstPage}
           <!--
-            The caption counts `occStats.events`, NOT the envelope's `total`.
-            They describe the same set — `event_stats` runs the identical
-            predicate over the identical window as the list, and its `events` is
-            a `count(*)` of the very rows being paged — but the envelope's stops
-            at the server's 10,000 cap while this one is exact. That is why
-            `totalIsCapped` is a flat `false`: it states a fact about this
-            number, not a placeholder. Swapping in `occEnvelope.total` would
-            silently turn an exact count into a lower bound, and put a second,
-            disagreeing figure a few rows under the one in the card header.
-
-            `null` when the stats half of the `allSettled` pair failed — the
-            degradation that pair exists for — which is exactly the "no count to
-            state" the control renders as a bare page number.
+            Deliberately not the copy below. That one answers "does anything
+            match?" and the answer here is yes — the count in the card header
+            says so. What happened is that this page of the walk no longer
+            holds any of them, so "No occurrences match these filters" under a
+            header reading "12,431 events" would be the pager lying in prose.
+            No button: Prev is live in the pager directly underneath, which is
+            the way back.
           -->
-          {#if showOccPager}
-            <CursorPagination
-              total={occStats?.events ?? null}
-              totalIsCapped={false}
-              page={pageNumber(occList.page)}
-              limit={OCC_LIMIT}
-              canNext={occNextCursor !== null}
-              busy={occLoading}
-              noun="occurrence"
-              onjump={onOccJump}
+          <EmptyState
+            size="section"
+            title={t('list.stale.title')}
+            description={t('list.stale.issuesBody')}
+          />
+        {:else if occurrences.length === 0}
+          {#if occFiltered}
+            <EmptyState
+              size="section"
+              title={t('common.empty.match', { things: t('issue.things.occurrences') })}
+              description={t('common.empty.matchHint')}
+            />
+          {:else}
+            <EmptyState
+              size="section"
+              title={t('common.empty.range', { things: t('issue.things.occurrences') })}
+              description={t('common.empty.rangeHint')}
             />
           {/if}
-        </Card>
-      </div>
-
-      <aside class="rail">
-        <Card title={t('issue.card.overview')}>
-          {#if !issue}
-            <Skeleton rows={7} />
-          {:else}
-          <dl class="side-dl">
-            <div>
-              <dt>{t('common.status')}</dt>
-              <dd><StatusBadge status={issue.status} /></dd>
-            </div>
-            <div>
-              <dt>{t('issues.column.level')}</dt>
-              <dd><LevelBadge level={issue.level} /></dd>
-            </div>
-            <div><dt>{t('explore.column.events')}</dt><dd>{formatNumber(issue.times_seen)}</dd></div>
-            <div><dt>{t('issue.field.usersAffected')}</dt><dd>{formatNumber(issue.users_seen)}</dd></div>
-            <div>
-              <dt>{t('explore.column.firstSeen')}</dt>
-              <dd><TimeValue value={issue.first_seen} /></dd>
-            </div>
-            <div>
-              <dt>{t('explore.column.lastSeen')}</dt>
-              <dd><TimeValue value={issue.last_seen} /></dd>
-            </div>
-            <div><dt>{t('issue.field.type')}</dt><dd class="mono">{issue.type}</dd></div>
-            {#if latestEvent?.release}
-              <div><dt>{t('issue.field.release')}</dt><dd class="mono">{latestEvent.release}</dd></div>
-            {/if}
-            {#if latestEvent?.screen}
-              <div>
-                <dt>{t('screens.column.screen')}</dt>
-                <dd>
-                  <a class="screen-link mono" href={`#/screens/${encodeURIComponent(latestEvent.screen)}`}>
-                    <Icon name="layout-panel-top" size={13} />{latestEvent.screen}
-                  </a>
-                </dd>
-              </div>
-            {/if}
-            {#if latestEvent}
-              <div>
-                <dt>{t('issue.field.occurred')}</dt>
-                <dd><TimeValue value={latestEvent.occurred_at} /></dd>
-              </div>
-            {/if}
-            <div>
-              <dt>{t('issue.field.fingerprint')}</dt>
-              <dd class="mono fp" title={issue.fingerprint}>{issue.fingerprint.slice(0, 16)}…</dd>
-            </div>
-          </dl>
-          {/if}
-        </Card>
-
-        <!-- The ONLY Tags card. A second, full-width copy used to sit below the
-             stack trace; it was removed rather than this one because tags are
-             identity facts and belong beside release/environment, above the
-             fold. (An "Affected user" card used to follow this one; it was
-             dropped because the Occurrences list below already names the user
-             on every row.) Uses `.side-dl` rather than KeyValueList because
-             that component lays out for full width; a long value truncates with
-             its full text on the `title`. -->
-        {#if latestEvent && tagEntries.length > 0}
-          <Card title={t('ui.section.tags')}>
-            <dl class="side-dl">
-              {#each tagEntries as [key, value] (key)}
-                <div>
-                  <dt class="mono">{key}</dt>
-                  <dd class="mono tag-val" title={renderTag(value)}>{renderTag(value)}</dd>
-                </div>
+        {:else}
+          <DataTable class="occ-table">
+            {#snippet head()}
+              <tr>
+                <SortableTh key="occurred_at" sort={occList.sort} onsort={onOccSort}>{t('events.column.time')}</SortableTh>
+                <SortableTh key="distinct_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.user')}</SortableTh>
+                <SortableTh key="session_id" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.session')}</SortableTh>
+                <SortableTh key="device_key" columnDefault="asc" sort={occList.sort} onsort={onOccSort}>{t('sessions.column.device')}</SortableTh>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each occurrences as ev (ev.id)}
+                <tr>
+                  <td><TimeValue value={ev.occurred_at} /></td>
+                  <td>
+                    {#if ev.distinct_id}
+                      <a
+                        class="link trunc"
+                        href={`#/persons/${encodeURIComponent(ev.distinct_id)}`}
+                        title={userLabel(ev)}
+                      >
+                        {userLabel(ev)}
+                      </a>
+                    {:else}
+                      <span class="faint">{t('session.meta.anonymous')}</span>
+                    {/if}
+                  </td>
+                  <td>
+                    {#if ev.session_id}
+                      <a
+                        class="link cell-mono trunc"
+                        href={`#/sessions/${encodeURIComponent(ev.session_id)}`}
+                        title={ev.session_id}
+                      >
+                        {ev.session_id}
+                      </a>
+                    {:else}
+                      <span class="faint">—</span>
+                    {/if}
+                  </td>
+                  <td>
+                    {#if ev.device_key}
+                      <a
+                        class="link trunc"
+                        href={`#/devices/${encodeURIComponent(ev.device_key)}`}
+                        title={deviceLabel(ev) ?? ev.device_key}
+                      >
+                        {deviceLabel(ev) ?? ev.device_key}
+                      </a>
+                    {:else if deviceLabel(ev)}
+                      <span class="trunc">{deviceLabel(ev)}</span>
+                    {:else}
+                      <span class="faint">—</span>
+                    {/if}
+                  </td>
+                </tr>
               {/each}
-            </dl>
-          </Card>
+            {/snippet}
+          </DataTable>
         {/if}
-      </aside>
+
+        <!--
+          The caption counts `occStats.events`, NOT the envelope's `total`.
+          They describe the same set — `event_stats` runs the identical
+          predicate over the identical window as the list, and its `events` is
+          a `count(*)` of the very rows being paged — but the envelope's stops
+          at the server's 10,000 cap while this one is exact. That is why
+          `totalIsCapped` is a flat `false`: it states a fact about this
+          number, not a placeholder. Swapping in `occEnvelope.total` would
+          silently turn an exact count into a lower bound, and put a second,
+          disagreeing figure a few rows under the one in the card header.
+
+          `null` when the stats half of the `allSettled` pair failed — the
+          degradation that pair exists for — which is exactly the "no count to
+          state" the control renders as a bare page number.
+        -->
+        {#if showOccPager}
+          <CursorPagination
+            total={occStats?.events ?? null}
+            totalIsCapped={false}
+            page={pageNumber(occList.page)}
+            limit={OCC_LIMIT}
+            canNext={occNextCursor !== null}
+            busy={occLoading}
+            noun="occurrence"
+            onjump={onOccJump}
+          />
+        {/if}
+      </Card>
     </div>
   {/if}
 
 <style>
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-    margin-bottom: 16px;
-  }
-  .back:hover {
-    color: var(--text);
-  }
   /* `.scope-note` lived here for the `payload_searched` line, which now comes
      from `SearchDisclosure` along with the clamp notice — the styling moved
      with it. The reasoning it carried is still true and still applies there:
@@ -1037,75 +1046,46 @@
      is itself swapping in from a spinner, so there is no steady state to
      protect, and holding two blank lines under every issue's filter bar for a
      state most members never hit costs more than the reflow it prevents. */
-  .detail-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 20px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
+  .meta-type,
+  .meta-culprit {
+    font-size: var(--text-2xs);
+    overflow-wrap: anywhere;
   }
-  .badges {
-    display: flex;
+  .meta-id {
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    margin-bottom: 10px;
-    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+    font-size: var(--text-2xs);
+    overflow-wrap: anywhere;
   }
-  .type-tag {
-    font-size: 12px;
-    color: var(--text-muted);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    padding: 3px 9px;
-    border-radius: var(--radius-pill);
-  }
-  .issue-title {
-    font-size: 22px;
-    font-weight: 660;
-    line-height: 1.3;
-    word-break: break-word;
-  }
-  .culprit {
-    color: var(--text-muted);
-    font-size: 13px;
-    margin-top: 6px;
-  }
-  .actions {
-    display: flex;
-    gap: 8px;
-    flex-shrink: 0;
-  }
+  /* The rail row is the shared `.detail-layout` (app.css). */
   .issue-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--page-gap);
+    min-width: 0;
+  }
+  .pair {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 300px;
-    gap: 22px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--page-gap);
     align-items: start;
   }
   .col-main {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
     min-width: 0;
   }
-  /* Contexts + Additional data sit side by side under the latest-event card. */
   .rail {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-  }
-  .event-head {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-  }
-  .card-title-inline {
-    font-size: 14.5px;
-    font-weight: 620;
+    gap: var(--page-gap);
   }
   .event-meta {
-    font-size: 12px;
+    margin: 0;
+    font-size: var(--text-xs);
     color: var(--error);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1130,51 +1110,11 @@
   }
   /* `.sym-badge` moved to lib/components/SymbolicationBadge.svelte, which the
      session timeline shares. */
-  .side-dl {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    margin: 0;
-  }
-  .side-dl > div {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .side-dl dt {
-    font-size: 12px;
-    color: var(--text-faint);
-  }
-  .side-dl dd {
-    margin: 0;
-    font-size: 12.5px;
-    color: var(--text);
-    text-align: end;
-    word-break: break-word;
-  }
-  /* Tag values are arbitrary strings in a 300px column. Clamped to two lines
-     with the full value on the `title`, so one long value cannot push the rest
-     of the rail off screen. The hover text is now the ONLY way to read a
-     clamped value in full — the full-width card that used to show them
-     untruncated was a duplicate and is gone. */
-  .tag-val {
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    min-width: 0;
-  }
-  .fp {
-    font-size: 11.5px;
-  }
   .screen-link {
     display: inline-flex;
     align-items: center;
     gap: 5px;
     color: var(--primary);
-    font-size: 12px;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1183,16 +1123,15 @@
   .screen-link:hover {
     text-decoration: underline;
   }
+  /* Same breakpoint as `.detail-layout`. */
   @media (max-width: 900px) {
-    .issue-body {
-      grid-template-columns: 1fr;
+    .pair {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
-  .faint { color: var(--text-muted); font-size: 12.5px; }
-
   .occ-stats {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -1200,12 +1139,6 @@
   .occ-stats .sep {
     opacity: 0.5;
     margin: 0 2px;
-  }
-  /* Tabular figures so the stamps form a straight column, and no wrapping —
-     a date-time broken across two lines is unreadable at a glance. */
-  .cell-time {
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
   }
 
   :global(.occ-table) {

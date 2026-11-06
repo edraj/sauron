@@ -1,12 +1,15 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { formatNumber, t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
-  import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import RowActionsMenu from '../lib/components/ui/RowActionsMenu.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
@@ -43,7 +46,6 @@
   const roles = $derived(view.data?.roles ?? []);
   const members = $derived(view.data?.members ?? []);
   const loading = $derived(view.loading);
-  const error = $derived(view.error);
 
   // Role editor dialog (create + edit + read-only view of system presets).
   // Exactly one of `editingRole` / `copyFromRole` is set at a time — `open*`
@@ -203,7 +205,7 @@
   }
 
   async function onRoleSaved(saved: Role) {
-    toastStore.success(`Role "${saved.name}" saved.`);
+    toastStore.success(t('roles.toast.saved', { name: saved.name }));
     await reload();
   }
 
@@ -215,9 +217,11 @@
   async function onRoleDeleted(role: Role, revokedGrants: number) {
     await reload();
     toastStore.success(
-      revokedGrants > 0
-        ? `Deleted "${role.name}" and revoked ${revokedGrants} grant${revokedGrants === 1 ? '' : 's'}.`
-        : `Deleted "${role.name}".`,
+      revokedGrants === 0
+        ? t('roles.toast.deleted', { name: role.name })
+        : revokedGrants === 1
+          ? t('roles.toast.deletedRevokedOne', { name: role.name })
+          : t('roles.toast.deletedRevokedMany', { name: role.name, n: formatNumber(revokedGrants) }),
     );
   }
 
@@ -228,26 +232,45 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('roles.title')}</h1>
-      <p class="muted sub">
-        Permission sets that can be granted to members of {sessionStore.currentOrg?.name ?? 'this org'}.
-      </p>
-    </div>
-    <div class="head-actions">
+  <PageHeader
+    title={t('roles.title')}
+    subtitle={t('roles.subtitle', {
+      org: sessionStore.currentOrg?.name ?? t('members.thisOrganization'),
+    })}
+  >
+    {#snippet freshness()}
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    {/snippet}
+    {#snippet primary()}
       <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
         {t('roles.new')}
       </Button>
+    {/snippet}
+  </PageHeader>
+
+  {#if view.error && view.data !== undefined}
+    <!-- A forced Refresh failed over the catalogue we already had: it stays. -->
+    <div class="stale">
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     </div>
-  </div>
+  {/if}
 
   {#if loading}
     <Skeleton rows={6} />
-  {:else if error}
-    <Card><p class="err-msg">{error}</p></Card>
+  {:else if view.error && view.data === undefined}
+    <ErrorState
+      title={t('common.couldntLoad', { thing: t('roles.thing') })}
+      error={view}
+      onretry={refresher.run}
+    />
   {:else if roles.length === 0}
     <EmptyState
       title={t('roles.empty.title')}
@@ -255,7 +278,8 @@
       icon="shield-check"
     >
       {#snippet action()}
-        <Button variant="primary" lockedReason={roleManageLock} onclick={openNewRole}>
+        <!-- `secondary`: the header already holds this view's one primary. -->
+        <Button variant="secondary" lockedReason={roleManageLock} onclick={openNewRole}>
           {t('roles.new')}
         </Button>
       {/snippet}
@@ -284,16 +308,16 @@
             <td>
               <div class="name-cell">
                 <span class="name">{role.name}</span>
-                {#if role.is_system}<Badge tone="neutral" size="sm">system</Badge>{/if}
+                {#if role.is_system}<Badge tone="neutral" size="sm">{t('roles.system')}</Badge>{/if}
               </div>
             </td>
             <td class="wrap">
               {#if role.description}<span class="cell-muted">{role.description}</span>{:else}<span class="faint">—</span>{/if}
             </td>
-            <td class="num">{role.permissions.length}</td>
-            <td class="num">{roleMemberCounts[role.id] ?? 0}</td>
+            <td class="num">{formatNumber(role.permissions.length)}</td>
+            <td class="num">{formatNumber(roleMemberCounts[role.id] ?? 0)}</td>
             <td class="col-act">
-              <RowActionsMenu label={`Actions for ${role.name}`}>
+              <RowActionsMenu label={t('roles.actionsFor', { name: role.name })}>
                 {#snippet children(close)}
                   <!-- A system role opens read-only for anyone, so it is never
                        locked; only editing a custom role needs `role:manage`. -->
@@ -309,7 +333,7 @@
                   >
                     {#if rowLock}<span class="ram-lock" aria-hidden="true"
                         ><Icon name="lock" size={12} /></span
-                      >{/if}{role.is_system ? 'View' : 'Edit'}
+                      >{/if}{role.is_system ? t('common.view') : t('common.edit')}
                   </button>
                   <!-- Offered on system presets too — copying Developer or
                        Owner into an editable starting point is the primary
@@ -326,7 +350,7 @@
                   >
                     {#if copyLock}<span class="ram-lock" aria-hidden="true"
                         ><Icon name="lock" size={12} /></span
-                      >{/if}Copy
+                      >{/if}{t('common.copy')}
                   </button>
                   {#if !role.is_system}
                     <!-- System presets get no Delete item at all — the server
@@ -344,7 +368,7 @@
                     >
                       {#if deleteLock}<span class="ram-lock" aria-hidden="true"
                           ><Icon name="lock" size={12} /></span
-                        >{/if}Delete
+                        >{/if}{t('common.delete')}
                     </button>
                   {/if}
                 {/snippet}
@@ -378,26 +402,8 @@
 </AdminShell>
 
 <style>
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .err-msg {
-    color: var(--error);
-    font-size: 13.5px;
+  .stale {
+    margin-bottom: 16px;
   }
   .name-cell {
     display: inline-flex;
@@ -405,7 +411,7 @@
     gap: 9px;
   }
   .name {
-    font-weight: 600;
+    font-weight: var(--weight-medium);
   }
   .col-act {
     text-align: end;

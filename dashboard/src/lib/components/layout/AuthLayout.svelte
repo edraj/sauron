@@ -5,17 +5,19 @@
   interface Props {
     title: string;
     subtitle?: string;
+    /** `sm` (400px) for sign-in forms; `md` (560px) for onboarding. */
+    width?: 'sm' | 'md';
     children: Snippet;
     footer?: Snippet;
   }
 
-  let { title, subtitle, children, footer }: Props = $props();
+  let { title, subtitle, width = 'sm', children, footer }: Props = $props();
 </script>
 
 <div class="auth-wrap">
-  <div class="auth-card">
+  <div class="auth-card {width}">
     <div class="brand">
-      <EyeMark size={40} />
+      <EyeMark size={32} />
       <span class="name">Sauron</span>
     </div>
     <div class="heading">
@@ -45,42 +47,47 @@
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-lg);
-    padding: 30px 30px 34px;
-    animation: fade-in 0.3s ease;
+    padding: 32px;
+    animation: fade-in 0.16s ease;
+  }
+  .auth-card.md {
+    max-width: 560px;
   }
   .brand {
     display: flex;
     align-items: center;
     gap: 10px;
-    margin-bottom: 26px;
+    margin-bottom: 24px;
   }
   .name {
-    font-size: 18px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
   }
   .heading {
     margin-bottom: 22px;
   }
   h1 {
-    font-size: 21px;
-    font-weight: 680;
+    font-size: var(--text-lg);
+    font-weight: var(--weight-strong);
   }
   .sub {
     color: var(--text-muted);
     margin-top: 5px;
-    font-size: 13.5px;
+    font-size: var(--text-sm);
   }
   .auth-foot {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
   }
-  :global(.auth-foot a) {
+  /* One link style for every auth screen: in the footer and inside the card
+     (a "back to sign in" in a panel used to render as plain inherited text). */
+  :global(.auth-foot a),
+  .auth-card :global(a:not(.btn)) {
     color: var(--primary);
-    font-weight: 560;
+    font-weight: var(--weight-medium);
   }
-  :global(.auth-foot a:hover) {
+  :global(.auth-foot a:hover),
+  .auth-card :global(a:not(.btn):hover) {
     text-decoration: underline;
   }
 </style>

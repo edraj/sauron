@@ -13,7 +13,7 @@
   const layout = $derived(lifecycleLayout(bars));
 
   const SERIES = [
-    { key: 'new' as const, label: 'retention.lifecycle.new', color: 'var(--primary)' },
+    { key: 'new' as const, label: 'retention.lifecycle.new', color: 'var(--chart-1)' },
     { key: 'returning' as const, label: 'retention.lifecycle.returning', color: 'var(--success)' },
     {
       key: 'resurrected' as const,
@@ -88,7 +88,7 @@
       })),
       {
         label: t('retention.lifecycle.dormant'),
-        color: 'var(--danger)',
+        color: 'var(--error)',
         value: -b.dormant,
       },
     ];
@@ -225,8 +225,8 @@
   .yaxis {
     position: relative;
     flex: 0 0 var(--yaxis-width);
-    font-size: 0.6875rem;
-    color: var(--muted-fg);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .tick {
@@ -239,7 +239,7 @@
   }
 
   .tick.neg {
-    color: var(--danger);
+    color: var(--error);
     opacity: 0.8;
   }
 
@@ -253,7 +253,7 @@
     position: absolute;
     inset-inline: 0;
     height: 1px;
-    background: var(--border);
+    background: var(--chart-grid);
     opacity: 0.5;
   }
 
@@ -303,7 +303,7 @@
   }
 
   .seg[data-series='dormant'] {
-    background: var(--danger);
+    background: var(--error);
     opacity: 0.55;
   }
 
@@ -329,7 +329,7 @@
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow);
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text);
     white-space: nowrap;
     opacity: 0;
@@ -388,8 +388,8 @@
     flex: 1 1 0;
     min-width: 24px;
     text-align: center;
-    font-size: 0.6875rem;
-    color: var(--muted-fg);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
     white-space: nowrap;
     overflow: visible;
   }
@@ -401,8 +401,8 @@
     margin: 10px 0 0;
     padding: 0;
     list-style: none;
-    font-size: 0.75rem;
-    color: var(--muted-fg);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .legend li {
@@ -419,7 +419,7 @@
   }
 
   .dormant-swatch {
-    background: var(--danger);
+    background: var(--error);
     opacity: 0.55;
   }
 </style>

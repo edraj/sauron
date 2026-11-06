@@ -65,7 +65,7 @@
     -->
     <tr>
       <th>{t('sessions.column.device')}</th>
-      <th>OS</th>
+      <th>{t('devices.column.os')}</th>
       <SortableTh key="browser" columnDefault="asc" {sort} {onsort}>{t('devices.column.browserArch')}</SortableTh>
       <SortableTh key="distinct_id" columnDefault="asc" {sort} {onsort}>{t('device.field.lastUser')}</SortableTh>
       <SortableTh key="sessions_count" class="num" {sort} {onsort}>{t('explore.column.sessions')}</SortableTh>
@@ -115,7 +115,7 @@
 
 <style>
   .dev-name {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     color: var(--text);
   }
   .key {
@@ -127,7 +127,7 @@
     display: inline-block;
     max-width: 200px;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .lnk:hover {
     color: var(--primary);
@@ -135,6 +135,6 @@
   }
   .err {
     color: var(--error);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 </style>

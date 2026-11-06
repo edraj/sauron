@@ -1,7 +1,8 @@
 // Pure decision logic for the PII inspector. No Svelte, no DOM — vitest is
 // node-only in this repo, so anything that needs a test lives here.
 
-import type { InspectorTrackedKey } from './index';
+import type { InspectorMaskAction, InspectorScan, InspectorTrackedKey } from './index';
+import { labelFor, t, type MessageKey } from '../i18n';
 
 export interface MaskTargetView {
   table: string;
@@ -14,9 +15,10 @@ export interface UnreachableRow {
   headline?: boolean;
   /** Rendered in bold before confirm is enabled. */
   readFirst?: boolean;
-  what: string;
-  why: string;
-  bounded: string;
+  /** Catalog keys, translated at render time with `t()`. */
+  whatKey: MessageKey;
+  whyKey: MessageKey;
+  boundedKey: MessageKey;
 }
 
 /**
@@ -27,83 +29,92 @@ export interface UnreachableRow {
  * product must never claim a mask is permanent: in twelve named places the
  * promise does not hold — eleven where the bytes survive, and one where the
  * mask silently takes something else away with it.
+ *
+ * The text lives in the catalog (`inspector.unreachable.*`) so the Arabic UI
+ * renders it too; each row carries keys, never pre-translated strings, so a
+ * language switch re-renders it.
  */
 export const UNREACHABLE_COPY: UnreachableRow[] = [
   {
     headline: true,
-    what: 'Masking rewrites rows in hot Postgres only.',
-    why: 'Everything below still holds the original bytes, or is outside this product’s reach.',
-    bounded: 'Read the rows below before confirming.',
+    whatKey: 'inspector.unreachable.headline.what',
+    whyKey: 'inspector.unreachable.headline.why',
+    boundedKey: 'inspector.unreachable.headline.bounded',
   },
   {
-    what: 'Cold Parquet',
-    why: 'The partition was exported before the mask ran. Parquet is immutable and, after the drop, the only copy.',
-    bounded: 'Nothing. Permanent.',
+    whatKey: 'inspector.unreachable.coldParquet.what',
+    whyKey: 'inspector.unreachable.coldParquet.why',
+    boundedKey: 'inspector.unreachable.coldParquet.bounded',
   },
   {
-    what: 'Postgres rows older than TIER_HOT_DAYS',
-    why: 'The retro-mask deliberately stops at the hot boundary.',
-    bounded: 'The tier drop, which destroys the row entirely.',
+    whatKey: 'inspector.unreachable.beyondHot.what',
+    whyKey: 'inspector.unreachable.beyondHot.why',
+    boundedKey: 'inspector.unreachable.beyondHot.bounded',
   },
   {
-    what: 'The Redis ingest stream',
-    why: 'sauron:ingest:stream holds the full serialized job.',
-    bounded: 'XADD … MAXLEN ~ 1000000.',
+    whatKey: 'inspector.unreachable.ingestStream.what',
+    whyKey: 'inspector.unreachable.ingestStream.why',
+    boundedKey: 'inspector.unreachable.ingestStream.bounded',
   },
   {
-    what: 'Failed ingest',
     // Every clause of the previous text became false once the bounded DLQ, its
     // reaper, and the ingest_failures table landed. A privacy page that reports
     // a closed hazard as open is worse than one that omits it: it spends the
     // reader's attention on a problem that no longer exists.
-    why: 'Events that fail to persist are retained as masked copies — in ingest_failures, and in sauron:ingest:dlq when even that write fails.',
-    bounded: 'INGEST_FAILURE_RETENTION_DAYS (30d) and INGEST_DLQ_RETENTION_HOURS (7d).',
+    whatKey: 'inspector.unreachable.failedIngest.what',
+    whyKey: 'inspector.unreachable.failedIngest.why',
+    boundedKey: 'inspector.unreachable.failedIngest.bounded',
   },
   {
-    what: 'Per-person breadcrumbs in Redis',
-    why: 'Up to 100 batches are buffered per person before an error arrives.',
-    bounded: 'A 1800 s TTL.',
+    whatKey: 'inspector.unreachable.breadcrumbs.what',
+    whyKey: 'inspector.unreachable.breadcrumbs.why',
+    boundedKey: 'inspector.unreachable.breadcrumbs.bounded',
   },
   {
-    what: 'alert_events.title / .body',
-    why: 'They embed the issue title verbatim.',
-    bounded: 'ALERT_EVENT_RETENTION_DAYS (90).',
+    whatKey: 'inspector.unreachable.alertEvents.what',
+    whyKey: 'inspector.unreachable.alertEvents.why',
+    boundedKey: 'inspector.unreachable.alertEvents.bounded',
   },
   {
-    what: 'Already-delivered alerts',
-    why: 'Email, Slack, Discord, Matrix, Telegram and webhook messages are gone from our control the moment they send.',
-    bounded: 'Nothing.',
+    whatKey: 'inspector.unreachable.deliveredAlerts.what',
+    whyKey: 'inspector.unreachable.deliveredAlerts.why',
+    boundedKey: 'inspector.unreachable.deliveredAlerts.bounded',
   },
   {
-    what: 'event_users.properties',
-    why: 'The identify() write merges with ||, which never removes keys. An at-rest mask is undone by the next identify().',
-    bounded: 'Forward enforcement only, and only for keys in the mask set.',
+    whatKey: 'inspector.unreachable.eventUsers.what',
+    whyKey: 'inspector.unreachable.eventUsers.why',
+    boundedKey: 'inspector.unreachable.eventUsers.bounded',
   },
   {
-    what: 'devices.*',
-    why: 'Every column is COALESCE(EXCLUDED.x, devices.x) — a non-null incoming value always wins, and there is no wire field to enforce on.',
-    bounded: 'Not offered: devices is not maskable at all.',
+    whatKey: 'inspector.unreachable.devices.what',
+    whyKey: 'inspector.unreachable.devices.why',
+    boundedKey: 'inspector.unreachable.devices.bounded',
   },
   {
-    what: 'Symbolicated source lines',
-    why: 'Frames carry context_line / pre_context / post_context — verbatim customer source. Masking a JSON path never touches them.',
-    bounded: 'Redacted from responses only, for callers without source:read.',
+    whatKey: 'inspector.unreachable.sourceLines.what',
+    whyKey: 'inspector.unreachable.sourceLines.why',
+    boundedKey: 'inspector.unreachable.sourceLines.bounded',
   },
   {
-    what: 'Backups, WAL, replicas',
-    why: 'Out of the product’s reach entirely.',
-    bounded: 'Operator policy.',
+    whatKey: 'inspector.unreachable.backups.what',
+    whyKey: 'inspector.unreachable.backups.why',
+    boundedKey: 'inspector.unreachable.backups.bounded',
   },
   {
     readFirst: true,
-    what: 'The active-users report stops identifying anyone new through that key',
-    why: 'The enforcer runs before the active-users pipeline stamps identified_at, so masking a key an app sends as context.user.id means the equality test never passes again. Nobody already stamped is un-identified, but everyone first seen afterwards arrives as a guest and never merges across apps, so the identified share decays with no discontinuity to notice.',
-    bounded: 'Nothing. The bytes are gone, so it cannot be recomputed later.',
+    whatKey: 'inspector.unreachable.activeUsers.what',
+    whyKey: 'inspector.unreachable.activeUsers.why',
+    boundedKey: 'inspector.unreachable.activeUsers.bounded',
   },
 ];
 
-export function describeTarget(t: MaskTargetView): string {
-  return `${t.table}.${t.column} → ${t.path === '' ? 'the whole value' : t.path}`;
+/**
+ * "error_events.extra → customer.email". Table, column and path are wire
+ * values; only the empty-path phrase is translated, so call this from markup.
+ */
+export function describeTarget(target: MaskTargetView): string {
+  const path = target.path === '' ? t('inspector.describeTarget.wholeValue') : target.path;
+  return `${target.table}.${target.column} → ${path}`;
 }
 
 /**
@@ -229,6 +240,9 @@ export function defaultEnvEnrollmentId(
  * it scans nothing and finishes `succeeded` with `coverage='full'` and zero
  * findings — a confident false negative, which is the worst thing a privacy
  * scan can emit.
+ *
+ * Returns translated text: call it inside `$derived` or markup so the reason
+ * follows a language switch.
  */
 export function createPolicyBlockedReason(
   targetId: string | null,
@@ -237,9 +251,9 @@ export function createPolicyBlockedReason(
 ): string | null {
   // Names the field's own visible label ("Target"), not an internal concept —
   // a reason that points at a control the user cannot find is not a reason.
-  if (!targetId) return 'Choose the target this policy covers.';
+  if (!targetId) return t('inspector.blocked.noTarget');
   if (keys.length === 0 && detectors.length === 0) {
-    return 'Add at least one tracked key or enable one detector — a policy with neither scans nothing and reports no findings, which reads as "clean".';
+    return t('inspector.blocked.noMatchers');
   }
   return null;
 }
@@ -295,4 +309,46 @@ export function inspectorTabRoute(tab: InspectorTab, qs: string | null | undefin
   }
   const query = params.toString();
   return query ? `/admin/privacy?${query}` : '/admin/privacy';
+}
+
+// --- human words for API values ---------------------------------------------
+// Every status below reaches the screen in a badge; the raw lowercase API value
+// ("succeeded", "app_env") is the server's vocabulary, not the reader's. A value
+// the server adds before these tables learn it prints as sent.
+
+const SCAN_STATUS_KEYS: Record<InspectorScan['status'], MessageKey> = {
+  queued: 'inspector.scanStatus.queued',
+  running: 'inspector.scanStatus.running',
+  succeeded: 'inspector.scanStatus.succeeded',
+  failed: 'inspector.scanStatus.failed',
+  cancelled: 'inspector.scanStatus.cancelled',
+};
+
+const MASK_STATUS_KEYS: Record<InspectorMaskAction['status'], MessageKey> = {
+  preview: 'inspector.maskStatus.preview',
+  previewed: 'inspector.maskStatus.previewed',
+  pending: 'inspector.maskStatus.pending',
+  running: 'inspector.maskStatus.running',
+  cancelling: 'inspector.maskStatus.cancelling',
+  done: 'inspector.maskStatus.done',
+  failed: 'inspector.maskStatus.failed',
+  cancelled: 'inspector.maskStatus.cancelled',
+};
+
+const TARGET_TYPE_KEYS: Record<string, MessageKey> = {
+  project: 'inspector.targetType.project',
+  app: 'inspector.targetType.app',
+  app_env: 'inspector.targetType.appEnv',
+};
+
+export function scanStatusLabel(s: InspectorScan['status']): string {
+  return labelFor(SCAN_STATUS_KEYS, s);
+}
+
+export function maskStatusLabel(s: InspectorMaskAction['status']): string {
+  return labelFor(MASK_STATUS_KEYS, s);
+}
+
+export function targetTypeLabel(tt: string): string {
+  return labelFor(TARGET_TYPE_KEYS, tt);
 }

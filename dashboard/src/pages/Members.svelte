@@ -1,11 +1,16 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { formatNumber, t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import CreateMemberDialog from '../lib/components/members/CreateMemberDialog.svelte';
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
@@ -69,10 +74,8 @@
   // target it can't see, so it waits rather than seeding a wrong tree.
   let appsLoaded = $state(false);
   const loading = $derived(view.loading);
-  // Mutations report through the same banner as the load, and a `$derived`
-  // cannot be assigned to — so they keep their own state and this is the fold.
-  let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
+  const roleOptions = $derived(roles.map((r) => ({ value: r.id, label: r.name })));
+  const orgName = $derived(sessionStore.currentOrg?.name ?? t('members.thisOrganization'));
 
   // Environments per app, keyed by app id — the fourth scope level. Unlike
   // projects and apps this is NOT loaded eagerly: an org can have hundreds of
@@ -205,7 +208,6 @@
   });
 
   async function load(orgId: string, force = false) {
-    actionError = null;
     await view.load(
       viewKey('members.roster', orgId),
       async () => {
@@ -309,12 +311,26 @@
       grantEmail = '';
       grantSelection = { ...EMPTY_SELECTION, projects: [], apps: [], envs: [] };
       await load(org, true);
-      toastStore.success('Access granted.');
+      toastStore.success(t('members.toast.granted'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
       granting = false;
     }
+  }
+
+  // Removing a scope revokes access immediately, so the chip's "×" asks first —
+  // like every other irreversible action on this page.
+  let pendingRemoval = $state<{ id: string; member: string; scope: string } | null>(null);
+
+  function askRemoveGrant(id: string, context: { member: string; scope: string }) {
+    pendingRemoval = { id, ...context };
+  }
+
+  async function confirmRemoveGrant() {
+    const target = pendingRemoval;
+    pendingRemoval = null;
+    if (target) await removeGrant(target.id);
   }
 
   async function removeGrant(id: string) {
@@ -327,7 +343,7 @@
       // next read or — if written through the proxy — corrupt the cached roster
       // for every later visit.
       await reload();
-      toastStore.success('Access removed.');
+      toastStore.success(t('members.toast.removed'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -343,8 +359,8 @@
       await setMemberActive(org.id, member.user_id, !member.is_active);
       toastStore.success(
         member.is_active
-          ? `${member.email} can no longer sign in.`
-          : `${member.email} can sign in again.`,
+          ? t('members.toast.deactivated', { email: member.email })
+          : t('members.toast.reactivated', { email: member.email }),
       );
       await load(org.id, true);
     } catch (err) {
@@ -381,8 +397,8 @@
       await resetMemberPassword(org.id, target.member.user_id, target.action);
       toastStore.success(
         target.action === 'reset'
-          ? `${target.member.email} has been emailed a link to set a new password.`
-          : `${target.member.email} can sign in with their existing password again.`,
+          ? t('members.toast.resetSent', { email: target.member.email })
+          : t('members.toast.resetCancelled', { email: target.member.email }),
       );
       resetTarget = null;
       await load(org.id, true);
@@ -414,11 +430,11 @@
         // the address being moved away from, which is the opposite of what
         // happens.
         toastStore.success(
-          `Nothing has changed yet. ${newEmail} must open the emailed link to confirm, and ${target.member.email} has been told a change was requested so they can stop it.`,
+          t('members.toast.emailRequested', { to: newEmail, from: target.member.email }),
         );
       } else {
         await cancelMemberEmailChange(org.id, target.member.user_id);
-        toastStore.success(`The pending email change for ${target.member.email} was withdrawn.`);
+        toastStore.success(t('members.toast.emailWithdrawn', { email: target.member.email }));
       }
       emailTarget = null;
       await load(org.id, true);
@@ -445,7 +461,9 @@
     try {
       const n = await revokeMemberSessions(org.id, member.user_id);
       toastStore.success(
-        `${member.email} was signed out of ${n === 1 ? '1 device' : `${n} devices`}.`,
+        n === 1
+          ? t('members.toast.signedOutOne', { email: member.email })
+          : t('members.toast.signedOutMany', { email: member.email, n: formatNumber(n) }),
       );
     } catch (err) {
       // The backend's 403/404/409s carry the actionable text (outranks you,
@@ -459,36 +477,50 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('members.title')}</h1>
-      <p class="muted sub">People with access to {sessionStore.currentOrg?.name ?? 'this org'}.</p>
-    </div>
-    <div class="head-actions">
+  <PageHeader title={t('members.title')} subtitle={t('members.subtitle', { org: orgName })}>
+    {#snippet freshness()}
       <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
-    </div>
-  </div>
+    {/snippet}
+    {#snippet primary()}
+      <Button variant="primary" lockedReason={manageLock} onclick={() => (createOpen = true)}>
+        {t('members.new')}
+      </Button>
+    {/snippet}
+  </PageHeader>
 
   <!-- The `member:read` gate is the hoisted AppShell's now (App.svelte): it
        resolves /admin/members through PAGE_ACCESS and renders PermissionDenied
        instead of this page, so the bespoke "No access" card that used to live
        here would be unreachable. -->
+  {#if view.error && view.data !== undefined}
+    <!-- A forced Refresh failed over the roster we already had: it stays. -->
+    <div class="stale">
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
+    </div>
+  {/if}
+
   {#if loading}
     <Skeleton rows={6} />
-  {:else if error}
-    <Card><p class="err-msg">{error}</p></Card>
+  {:else if view.error && view.data === undefined}
+    <ErrorState
+      title={t('common.couldntLoad', { thing: t('members.thing') })}
+      error={view}
+      onretry={refresher.run}
+    />
   {:else}
     <div class="stack">
       <Card>
         {#snippet header()}
-          <h3 class="card-title-inline">{t('members.grantAccess')}</h3>
+          <h3 class="grant-title">{t('members.grantAccess')}</h3>
           <p class="muted grant-sub">{t('members.existingAccount')}</p>
-        {/snippet}
-        {#snippet actions()}
-          <Button variant="primary" lockedReason={manageLock} onclick={() => (createOpen = true)}>
-            {t('members.create')}
-          </Button>
         {/snippet}
         <form class="grant-form" onsubmit={submitGrant}>
           <div class="gf-row">
@@ -496,19 +528,18 @@
               <Input label={t('common.email')} type="email" bind:value={grantEmail} placeholder={t('members.placeholder.email')} required />
             </div>
             <div class="gf-field">
-              <span class="lbl">{t('members.column.role')}</span>
-              <select class="sel" bind:value={grantRoleId} aria-label={t('members.column.role')}>
-                {#each roles as role (role.id)}
-                  <option value={role.id}>{role.name}</option>
-                {/each}
-              </select>
+              <Select
+                label={t('members.column.role')}
+                bind:value={grantRoleId}
+                options={roleOptions}
+              />
             </div>
           </div>
           <div class="gf-field">
             <span class="lbl">{t('members.column.scope')}</span>
             <ScopeTree
               orgId={sessionStore.currentOrg?.id ?? ''}
-              orgName={sessionStore.currentOrg?.name ?? 'this org'}
+              orgName={orgName}
               projects={sessionStore.projects}
               {appsByProject}
               {envsByApp}
@@ -520,9 +551,11 @@
             />
           </div>
           <div class="gf-actions">
+            <!-- `secondary`: "New member" in the header is this view's one
+                 primary action. -->
             <Button
               type="submit"
-              variant="primary"
+              variant="secondary"
               loading={granting}
               disabled={!canGrant}
               lockedReason={manageLock}
@@ -550,7 +583,7 @@
       {credentialLock}
       onresetpassword={(m, a) => (resetTarget = { member: m, action: a })}
       onemailchange={(m, a) => (emailTarget = { member: m, action: a })}
-      onremovegrant={removeGrant}
+      onremovegrant={askRemoveGrant}
     />
     </div>
   {/if}
@@ -584,7 +617,7 @@
       ready={appsLoaded}
       onclose={() => (editingMemberId = null)}
       onchanged={() => load(sessionStore.currentOrg!.id)}
-      onsaved={() => toastStore.success('Access updated.')}
+      onsaved={() => toastStore.success(t('members.toast.updated'))}
     />
   {/if}
 
@@ -592,7 +625,7 @@
     <ConfirmDialog
       open
       title={t('members.confirmDeactivate')}
-      message={`${deactivateTarget.email} will be signed out of every device and won't be able to sign in until reactivated. Their access grants are kept.`}
+      message={t('members.confirmDeactivateBody', { email: deactivateTarget.email })}
       confirmLabel={t('members.deactivate')}
       danger
       onconfirm={confirmDeactivate}
@@ -620,11 +653,23 @@
     />
   {/if}
 
+  {#if pendingRemoval}
+    <ConfirmDialog
+      open
+      title={t('members.removeScope.title', { scope: pendingRemoval.scope })}
+      message={t('members.removeScope.body', { member: pendingRemoval.member, scope: pendingRemoval.scope })}
+      confirmLabel={t('members.removeScope.confirm')}
+      danger
+      onconfirm={() => void confirmRemoveGrant()}
+      oncancel={() => (pendingRemoval = null)}
+    />
+  {/if}
+
   {#if pendingRevoke}
     <ConfirmDialog
       open
       title={t('members.signOutAll')}
-      message={`${pendingRevoke.name || pendingRevoke.email} will be signed out on every device and will have to log in again. Their account stays active.`}
+      message={t('members.confirmSignOutBody', { name: pendingRevoke.name || pendingRevoke.email })}
       confirmLabel={t('auth.signOut')}
       danger
       onconfirm={() => void confirmRevokeSessions()}
@@ -634,21 +679,8 @@
 </AdminShell>
 
 <style>
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
+  .stale {
+    margin-bottom: 16px;
   }
   /* Owns the vertical rhythm for the page's cards. Previously each card carried
      its own margin-bottom via :global(), which silently skipped the members
@@ -656,10 +688,10 @@
      below it. */
   .stack {
     display: grid;
-    gap: 16px;
+    gap: var(--page-gap);
   }
   .grant-sub {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin-top: 3px;
     max-width: 46ch;
   }
@@ -686,30 +718,12 @@
     flex: 1;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
   }
-  .sel {
-    padding: 10px 13px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text);
-    font-size: 13.5px;
-    outline: none;
-    height: 40px;
-  }
-  .sel option {
-    background: var(--surface);
-    color: var(--text);
-  }
-  .card-title-inline {
-    font-size: 14.5px;
-    font-weight: 620;
-  }
-  .err-msg {
-    color: var(--error);
-    font-size: 13.5px;
+  .grant-title {
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
   }
 </style>

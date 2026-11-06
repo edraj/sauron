@@ -5,7 +5,9 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -32,6 +34,7 @@
   import { rollupState } from '../lib/stores/rollups.svelte';
 
   const DEPTHS = [2, 3, 4, 5, 6, 7, 8];
+  const depthOptions = DEPTHS.map((d) => ({ value: String(d), label: String(d) }));
 
   // Seeded from the SHARED selection, falling back to this page's own 30
   // days until the user has chosen one — see `stores/range.svelte.ts` for
@@ -155,14 +158,30 @@
   const refresher = pageRefresher(refresh);
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('journeys.title')}</h1>
-      <p class="muted sub">{t('journeys.subtitle')}</p>
-    </div>
-    <div class="controls">
+  <PageHeader title={t('journeys.title')} subtitle={t('journeys.subtitle')}>
+    {#snippet freshness()}
+      <RollupChip />
+      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
+           watermark IS the data's age and this fetch-time chip would be a
+           second "Updated" beside it with a different time. -->
+      {#if !rollupState.ready}
+        <Freshness fetchedAt={journeyView.fetchedAt} revalidating={journeyView.revalidating} />
+      {/if}
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+  </PageHeader>
+
+  <div class="page">
+    <div class="filters">
       <div class="control">
-        <span class="ctrl-label">{t('journeys.range')}</span>
+        <span class="section-label">{t('journeys.range')}</span>
         <DateRange
           value={range}
           onchange={(v) => {
@@ -172,91 +191,67 @@
         />
       </div>
       <div class="control">
-        <span class="ctrl-label">{t('journeys.depth')}</span>
-        <div class="depths" role="tablist" aria-label={t('journeys.depthLabel')}>
-          {#each DEPTHS as d (d)}
-            <button
-              class="depth"
-              class:active={depth === d}
-              onclick={() => (depth = d)}
-              type="button"
-              role="tab"
-              aria-selected={depth === d}
-            >
-              {d}
-            </button>
-          {/each}
-        </div>
+        <span class="section-label">{t('journeys.depth')}</span>
+        <SegmentedControl
+          value={String(depth)}
+          options={depthOptions}
+          ariaLabel={t('journeys.depthLabel')}
+          onchange={(v) => (depth = Number(v))}
+        />
       </div>
-      <!--
-        Spins for a background revalidate too, not just an explicit click: that
-        spinner IS the "showing cached data, fetching fresh" hint, and without it
-        the instant paint is indistinguishable from live data.
-      -->
-      <RollupChip />
-      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
-           watermark IS the data's age and this fetch-time chip would be a
-           second "Updated" beside it with a different time. -->
-      {#if !rollupState.ready}
-        <Freshness fetchedAt={journeyView.fetchedAt} revalidating={journeyView.revalidating} />
-      {/if}
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
     </div>
-  </div>
 
   {#if error && !journey}
-    <Card>
-      <EmptyState title={t('journeys.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('journeys.error.load')} error={journeyView} onretry={retry} />
   {:else if loading && !journey}
-    <Card>
-      <Skeleton rows={6} />
-    </Card>
+    <Skeleton rows={6} />
   {:else if journey && journey.nodes.length === 0}
-    <Card>
-      <EmptyState
-        title={t('journeys.empty.title')}
-        description={t('journeys.empty.body')}
-        icon="compass"
-      />
-    </Card>
+    <EmptyState
+      title={t('common.empty.range', { things: t('journeys.noun') })}
+      description={t('common.empty.rangeHint')}
+      icon="compass"
+    />
   {:else if journey}
-    <div class="journey-card">
-      <!--
-        `revalidating`, not `loading`. This sits inside the `journey` branch, and
-        `loading` now means "nothing to show at all" — which can never be true
-        while `journey` is non-null, so keeping `loading` here would leave the
-        indicator permanently dead. `revalidating` is exactly the case it was
-        written for: a graph on screen with a refresh in flight behind it.
-      -->
-      {#if revalidating}
-        <div class="reloading"><Spinner size={16} /><span class="faint">{t('funnels.updating')}</span></div>
-      {/if}
-      <Card title={t('journeys.card.userJourneys')}>
-        <SankeyChart {journey} height={480} />
-        <p class="caption muted">
-          {t('journeys.explainer')}
-        </p>
-      </Card>
-    </div>
+    <Card title={t('journeys.card.userJourneys')}>
+      {#snippet actions()}
+        <!--
+          `revalidating`, not `loading`. This sits inside the `journey` branch, and
+          `loading` now means "nothing to show at all" — which can never be true
+          while `journey` is non-null, so keeping `loading` here would leave the
+          indicator permanently dead. `revalidating` is exactly the case it was
+          written for: a graph on screen with a refresh in flight behind it.
+        -->
+        {#if revalidating}
+          <span class="reloading"><Spinner size={14} /><span class="faint">{t('funnels.updating')}</span></span>
+        {/if}
+      {/snippet}
+      <SankeyChart {journey} height={480} />
+      <p class="caption muted">
+        {t('journeys.explainer')}
+      </p>
+    </Card>
 
     <div class="grid">
       <Card title={t('journeys.card.entryPoints')}>
         {#if entryPoints.length === 0}
-          <p class="faint empty-inline">{t('journeys.empty.entries')}</p>
+          <EmptyState
+            size="section"
+            title={t('common.empty.range', { things: t('journeys.noun.entries') })}
+            description={t('common.empty.rangeHint')}
+          />
         {:else}
           <p class="hint muted">{t('journeys.entryExplainer')}</p>
-          <BarList items={entryPoints} valueLabel="users" />
+          <BarList items={entryPoints} valueLabel={t('journeys.valueLabel')} />
         {/if}
       </Card>
 
-      <Card title={t('journeys.card.transitions')} padding="none">
+      <Card title={t('journeys.card.transitions')}>
         {#if sortedTransitions.length === 0}
-          <p class="faint empty-inline pad">{t('journeys.empty.transitions')}</p>
+          <EmptyState
+            size="section"
+            title={t('common.empty.range', { things: t('journeys.noun.transitions') })}
+            description={t('common.empty.rangeHint')}
+          />
         {:else}
           <DataTable>
             {#snippet head()}
@@ -267,7 +262,7 @@
                 <!-- The arrow glyph. Nothing to order by. -->
                 <th></th>
                 <SortableTh key="to" columnDefault="asc" sort={transitionSort} onsort={onTransitionSort}>
-                  To
+                  {t('journeys.to')}
                 </SortableTh>
                 <SortableTh key="users" class="num" sort={transitionSort} onsort={onTransitionSort}>
                   {t('users.title')}
@@ -284,7 +279,7 @@
                 <tr>
                   <td>
                     <span class="mono">{tr.from_event}</span>
-                    <span class="faint step-tag">step {tr.from_step + 1}</span>
+                    <span class="faint step-tag">{t('journeys.stepN', { n: tr.from_step + 1 })}</span>
                   </td>
                   <td class="arrow faint">→</td>
                   <td><span class="mono">{tr.to_event}</span></td>
@@ -297,21 +292,15 @@
       </Card>
     </div>
   {/if}
+  </div>
 
 <style>
-  .head {
+  .page {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: var(--page-gap);
   }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .controls {
+  .filters {
     display: flex;
     align-items: flex-end;
     gap: 16px;
@@ -320,57 +309,16 @@
   .control {
     display: flex;
     flex-direction: column;
-    gap: 5px;
-  }
-  .ctrl-label {
-    font-size: 10.5px;
-    font-weight: 620;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-  }
-  .depths {
-    display: inline-flex;
-    gap: 4px;
-    padding: 4px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .depth {
-    min-width: 30px;
-    padding: 6px 9px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    border-radius: var(--radius-sm);
-    font-variant-numeric: tabular-nums;
-  }
-  .depth:hover {
-    color: var(--text);
-  }
-  .depth.active {
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow-sm);
-  }
-  .journey-card {
-    position: relative;
-    margin-bottom: 18px;
+    gap: 6px;
   }
   .reloading {
-    position: absolute;
-    top: 14px;
-    inset-inline-end: 18px;
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    gap: 7px;
-    font-size: 12px;
+    gap: 6px;
+    font-size: var(--text-xs);
   }
   .caption {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin-top: 14px;
     max-width: 640px;
     line-height: 1.5;
@@ -378,26 +326,20 @@
   .grid {
     display: grid;
     grid-template-columns: 1fr 1.4fr;
-    gap: 18px;
+    gap: var(--page-gap) 28px;
     align-items: start;
   }
   .hint {
-    font-size: 12px;
+    font-size: var(--text-xs);
     margin-bottom: 12px;
-  }
-  .empty-inline {
-    font-size: 13px;
-  }
-  .empty-inline.pad {
-    padding: 18px;
   }
   .step-tag {
     margin-inline-start: 8px;
-    font-size: 11px;
+    font-size: var(--text-xs);
   }
   .arrow {
     text-align: center;
-    font-size: 14px;
+    font-size: var(--text-sm);
   }
 
   @media (max-width: 900px) {

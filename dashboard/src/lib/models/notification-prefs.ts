@@ -12,6 +12,7 @@ import type {
   SubscriptionKind,
 } from './index';
 import type { ScopeSelection } from './scope-tree';
+import { t } from '../i18n';
 
 /** These duplicate the backend clamps exactly; a mismatch is drift, not style. */
 export const COND_DEFAULTS = {
@@ -40,18 +41,18 @@ export type ScopeResult =
  */
 export function selectionToSubscriptionScope(sel: ScopeSelection): ScopeResult {
   if (sel.org) {
-    return { ok: false, reason: 'Pick one project or one app.' };
+    return { ok: false, reason: t('notif.problem.pickOne') };
   }
   if (sel.envs.length > 0) {
     // ScopeTree's env rows are `AppEnvironment.id` — ENROLLMENT ids — while a
     // subscription stores CATALOGUE ids in a separate chip row. Rejecting
     // rather than ignoring is what makes a regression that re-enables the env
     // level fail loudly instead of storing the wrong id space.
-    return { ok: false, reason: 'Pick one project or one app.' };
+    return { ok: false, reason: t('notif.problem.pickOne') };
   }
   const picked = sel.projects.length + sel.apps.length;
   if (picked !== 1) {
-    return { ok: false, reason: 'Pick one project or one app.' };
+    return { ok: false, reason: t('notif.problem.pickOne') };
   }
   if (sel.projects.length === 1) {
     return { ok: true, scope_type: 'project', scope_id: sel.projects[0] };
@@ -102,11 +103,13 @@ export function clampConditions(
   };
 }
 
+/** The subscription's target as a phrase. Translated on each call — call from markup. */
 export function describeSubscription(s: NotificationSubscription): string {
-  const noun = s.scope_type === 'project' ? 'Project' : 'App';
+  const project = s.scope_type === 'project';
   // `scope_id` has no foreign key, so the target can be gone. Say so instead of
   // rendering a bare uuid nobody can act on.
-  return s.scope_name ? `${noun} “${s.scope_name}”` : `${noun} (deleted)`;
+  if (!s.scope_name) return t(project ? 'notif.scope.projectDeleted' : 'notif.scope.appDeleted');
+  return t(project ? 'notif.scope.project' : 'notif.scope.app', { name: s.scope_name });
 }
 
 function hhmm(minuteOfDay: number): string {
@@ -125,7 +128,7 @@ export function quietHoursLabel(
   end: number | null,
   tz: string,
 ): string {
-  if (start === null || end === null) return 'Always on';
+  if (start === null || end === null) return t('notif.quiet.alwaysOn');
   return `${hhmm(start)} – ${hhmm(end)} (${tz})`;
 }
 
@@ -141,21 +144,25 @@ export interface SubscriptionDraft {
   quietTz: string;
 }
 
-/** Every reason the save button is disabled, in the order they are shown. */
+/**
+ * Every reason the save button is disabled, in the order they are shown.
+ * Translated on each call; `SubscriptionDialog` reads it through a `$derived`,
+ * so the list follows a language switch.
+ */
 export function validateSubscription(input: SubscriptionDraft): string[] {
   const reasons: string[] = [];
   const scope = selectionToSubscriptionScope(input.selection);
   if (!scope.ok) {
     reasons.push(scope.reason);
   } else if (!kindScopeTypes(input.kind).includes(scope.scope_type)) {
-    reasons.push('Uptime subscriptions are project-scoped.');
+    reasons.push(t('notif.problem.uptimeProject'));
   }
   if ((input.quietStartMin === null) !== (input.quietEndMin === null)) {
-    reasons.push('Set both a quiet-hours start and end, or neither.');
+    reasons.push(t('notif.problem.quietPair'));
   }
   for (const v of [input.quietStartMin, input.quietEndMin]) {
     if (v !== null && (v < 0 || v > 1439)) {
-      reasons.push('Quiet hours must be times of day.');
+      reasons.push(t('notif.problem.quietRange'));
       break;
     }
   }
@@ -164,10 +171,10 @@ export function validateSubscription(input: SubscriptionDraft): string[] {
     input.throttleSeconds < 0 ||
     input.throttleSeconds > MAX_THROTTLE_SECONDS
   ) {
-    reasons.push(`Throttle must be between 0 and ${MAX_THROTTLE_SECONDS} seconds.`);
+    reasons.push(t('notif.problem.throttle', { max: MAX_THROTTLE_SECONDS }));
   }
   if (!input.quietTz.trim()) {
-    reasons.push('Pick a timezone for quiet hours.');
+    reasons.push(t('notif.problem.timezone'));
   }
   return reasons;
 }

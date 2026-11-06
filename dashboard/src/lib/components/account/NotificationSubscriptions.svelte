@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { t } from '../../i18n';
+  import { formatNumber, labelFor, t, type MessageKey } from '../../i18n';
+  import { errorMessage } from '../../api/client';
   import Card from '../ui/Card.svelte';
   import Button from '../ui/Button.svelte';
   import Badge from '../ui/Badge.svelte';
   import Skeleton from '../ui/Skeleton.svelte';
   import EmptyState from '../ui/EmptyState.svelte';
+  import ErrorState from '../ui/ErrorState.svelte';
   import ConfirmDialog from '../ui/ConfirmDialog.svelte';
   import DataTable from '../DataTable.svelte';
   import SortableTh from '../SortableTh.svelte';
@@ -27,29 +29,41 @@
   import { pageSlice } from '../../models/paginate';
   import { sortRows } from '../../models/sort-rows';
   import type { SortDir } from '../../models/sort';
-  import type { NotificationSubscription, SubscriptionKind } from '../../models';
+  import type {
+    NotificationSubscription,
+    SubscriptionDelivery,
+    SubscriptionKind,
+  } from '../../models';
   import { sessionStore } from '../../stores/session.svelte';
   import { toastStore } from '../../stores/toast.svelte';
 
-  const KIND_LABELS: Record<string, string> = {
-    uptime: 'Uptime',
-    error_spike: 'Error rate increasing',
-    error_new_issue: 'New issue',
-    error_regression: 'Issue regressed',
+  const KIND_LABELS: Record<string, MessageKey> = {
+    uptime: 'notif.kind.uptime',
+    error_spike: 'notif.kind.errorSpike',
+    error_new_issue: 'notif.kind.newIssue',
+    error_regression: 'notif.kind.regression',
   };
 
   // Named once so the "Notify about" column can be SORTED by exactly the text
   // it renders; handing the accessor a lookup that disagreed with the cell is
   // the "orders by one value, displays another" bug.
-  const kindLabel = (k: SubscriptionKind): string => KIND_LABELS[k] ?? k;
+  const kindLabel = (k: SubscriptionKind): string => labelFor(KIND_LABELS, k);
+
+  const DELIVERY_LABELS: Record<SubscriptionDelivery, MessageKey> = {
+    immediate: 'notif.dialog.asItHappens',
+    hourly: 'notif.dialog.hourly',
+    daily: 'notif.dialog.daily',
+  };
+  const deliveryLabel = (d: SubscriptionDelivery): string => labelFor(DELIVERY_LABELS, d);
 
   /** Rows per page. The list arrives whole, so this is a rendering budget only. */
   const PAGE = 25;
 
   let subs = $state<NotificationSubscription[]>([]);
   let loading = $state(true);
-  // Reads set a local error; mutations toast. Both conventions in one file.
-  let loadError = $state('');
+  // Reads set a local error (the caught error itself, so ErrorState can say
+  // what kind of failure it was); mutations toast.
+  let loadError = $state<unknown>(null);
   let projects = $state<{ id: string; name: string }[]>([]);
   let appsByProject = $state<Record<string, { id: string; name: string }[]>>({});
   let catalogueEnvsByProject = $state<Record<string, { id: string; name: string }[]>>({});
@@ -62,7 +76,7 @@
   // lives on `sessionStore`, which is where every other page reads it from
   // (`pages/Members.svelte:385`).
   const orgId = $derived(sessionStore.currentOrg?.id ?? '');
-  const orgName = $derived(sessionStore.currentOrg?.name ?? 'Organization');
+  const orgName = $derived(sessionStore.currentOrg?.name ?? t('members.thisOrganization'));
 
   // `/v1/me/notification-subscriptions` returns every subscription in one
   // response, so the sort and the pager both run here, over the SAME array:
@@ -88,7 +102,7 @@
 
   async function load() {
     loading = true;
-    loadError = '';
+    loadError = null;
     try {
       subs = await listSubscriptions();
       projects = (await listProjects(orgId)).map((p) => ({ id: p.id, name: p.name }));
@@ -110,7 +124,7 @@
       );
       appsByProject = Object.fromEntries(perProject);
     } catch (e) {
-      loadError = e instanceof Error ? e.message : 'Could not load subscriptions';
+      loadError = e;
     } finally {
       loading = false;
     }
@@ -156,10 +170,10 @@
     busyId = s.id;
     try {
       await updateSubscription(s.id, { enabled: !s.enabled });
-      toastStore.success(s.enabled ? 'Subscription disabled' : 'Subscription enabled');
+      toastStore.success(s.enabled ? t('notif.toast.disabled') : t('notif.toast.enabled'));
       await load();
     } catch (e) {
-      toastStore.error(e instanceof Error ? e.message : 'Could not update the subscription');
+      toastStore.error(errorMessage(e, t('notif.toast.updateFailed')));
     } finally {
       busyId = '';
     }
@@ -171,11 +185,11 @@
     busyId = s.id;
     try {
       await deleteSubscription(s.id);
-      toastStore.success('Subscription deleted');
+      toastStore.success(t('notif.toast.deleted'));
       confirming = null;
       await load();
     } catch (e) {
-      toastStore.error(e instanceof Error ? e.message : 'Could not delete the subscription');
+      toastStore.error(errorMessage(e, t('notif.toast.deleteFailed')));
     } finally {
       busyId = '';
     }
@@ -201,9 +215,15 @@
   {#if loading}
     <Skeleton rows={4} />
   {:else if loadError}
-    <p class="err">{loadError}</p>
+    <ErrorState
+      size="section"
+      title={t('common.couldntLoad', { thing: t('notif.thing') })}
+      error={loadError}
+      onretry={() => void load()}
+    />
   {:else if subs.length === 0}
     <EmptyState
+      size="section"
       icon="bell"
       title={t('notif.empty.title')}
       description={t('notif.empty.body')}
@@ -235,17 +255,21 @@
           <tr>
             <td>{describeSubscription(s)}</td>
             <td>{kindLabel(s.kind)}</td>
-            <td>{s.environment_ids.length === 0 ? 'All' : s.environment_ids.length}</td>
             <td>
-              {s.effective_delivery}
+              {s.environment_ids.length === 0
+                ? t('common.all')
+                : formatNumber(s.environment_ids.length)}
+            </td>
+            <td>
+              {deliveryLabel(s.effective_delivery)}
               {#if s.effective_delivery !== s.delivery}
-                <Badge tone="warning" size="sm">capped</Badge>
+                <Badge tone="warning" size="sm">{t('notif.capped')}</Badge>
               {/if}
             </td>
             <td>{quietHoursLabel(s.quiet_start_min, s.quiet_end_min, s.quiet_tz)}</td>
             <td>
               {#if s.enabled}
-                <Badge tone="success" size="sm">On</Badge>
+                <Badge tone="success" size="sm">{t('notif.state.on')}</Badge>
               {:else if s.disabled_reason === 'access_revoked'}
                 <!-- Explain rather than look broken: the subscription is off
                      because the owner lost access to its scope, and re-granting
@@ -265,7 +289,7 @@
                 }}
               >{t('common.edit')}</Button>
               <Button size="sm" disabled={busyId === s.id} onclick={() => toggle(s)}>
-                {s.enabled ? 'Disable' : 'Enable'}
+                {s.enabled ? t('alerts.disable') : t('alerts.enable')}
               </Button>
               <Button size="sm" variant="danger" onclick={() => (confirming = s)}>{t('common.delete')}</Button>
             </td>
@@ -318,10 +342,5 @@
 />
 
 <style>
-  /* --danger is not defined in app.css; the theme name is --error. An undefined
-     custom property with no fallback invalidates the whole declaration, so the
-     load-failure text would silently inherit body colour and stop reading as a
-     failure. */
-  .err { font-size: 13px; color: var(--error); margin: 0; }
   .acts { display: flex; gap: 6px; justify-content: flex-end; }
 </style>

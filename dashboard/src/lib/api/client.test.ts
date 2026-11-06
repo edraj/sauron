@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AxiosError } from 'axios';
-import { errorCode, normalizeError, unwrapBlobErrorBody } from './client';
+import { errorCode, errorMessage, normalizeError, unwrapBlobErrorBody } from './client';
 
 function blobError(status: number, envelope: unknown): AxiosError {
   const blob = new Blob([JSON.stringify(envelope)], { type: 'application/json' });
@@ -88,5 +88,52 @@ describe('errorCode', () => {
     expect(errorCode(new Error('boom'))).toBeNull();
     expect(errorCode('nope')).toBeNull();
     expect(errorCode(undefined)).toBeNull();
+  });
+});
+
+function bodyError(status: number, data: unknown): AxiosError {
+  return new AxiosError(
+    `Request failed with status code ${status}`,
+    'ERR_BAD_RESPONSE',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    {} as any,
+    undefined,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    { status, statusText: '', data, headers: {}, config: {} as any },
+  );
+}
+
+describe('normalizeError on a body with no envelope', () => {
+  // The API's TimeoutLayer answers 503 with an EMPTY body; a reverse proxy in
+  // front of a dead API answers 503 with its own HTML page. Only the first is
+  // "took too long", so the two must not share a code.
+  it('marks an empty body as such', () => {
+    expect(normalizeError(bodyError(503, '')).code).toBe('empty_response');
+    expect(normalizeError(bodyError(503, undefined)).code).toBe('empty_response');
+  });
+
+  it('keeps a non-empty body without an envelope as a plain http_error', () => {
+    expect(normalizeError(bodyError(503, '<html>502 Bad Gateway</html>')).code).toBe('http_error');
+  });
+});
+
+describe('errorMessage', () => {
+  // What the API client rejects with: a plain object, NOT an Error. Pages that
+  // tested `instanceof Error` printed it as "[object Object]".
+  const apiError = { status: 422, code: 'invalid_filter', message: 'filter.level: unknown level', isNetwork: false };
+
+  it("reads an API rejection's own message", () => {
+    expect(errorMessage(apiError)).toBe('filter.level: unknown level');
+    expect(errorMessage(apiError, 'Save failed')).toBe('filter.level: unknown level');
+  });
+
+  it('reads an Error', () => {
+    expect(errorMessage(new Error('boom'), 'Save failed')).toBe('boom');
+  });
+
+  it("uses the caller's fallback when there is no message to show", () => {
+    expect(errorMessage('weird', 'Save failed')).toBe('Save failed');
+    expect(errorMessage(new Error(''), 'Save failed')).toBe('Save failed');
+    expect(errorMessage({ ...apiError, message: '' }, 'Save failed')).toBe('Save failed');
   });
 });

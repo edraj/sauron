@@ -3,7 +3,6 @@
   // the /rollups/status poll (on scope change + every 60 s) and publishes
   // readiness to rollupState so pages can ≈-mark their sketch-derived
   // figures. All decisions live in models/freshness.ts (pure, tested).
-  import Badge from './Badge.svelte';
   import { getRollupStatus } from '../../api/rollups';
   import { rollupChip } from '../../models/freshness';
   import { rollupState } from '../../stores/rollups.svelte';
@@ -45,8 +44,21 @@
   const view = $derived(rollupChip(status));
 </script>
 
+<!-- Plain text, like `Freshness`: a stamp is passive metadata about the data
+     below, and a filled chip gave it the weight of the buttons beside it. It
+     takes colour only when the state is worth noticing (building, stale). -->
 {#if view}
-  <span title={view.title}>
-    <Badge tone={view.tone} size="sm">{view.label}</Badge>
-  </span>
+  <span class="rc {view.tone}" title={view.title}>{view.label}</span>
 {/if}
+
+<style>
+  .rc {
+    font-size: var(--text-xs);
+    color: var(--text-faint);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .rc.warning {
+    color: var(--warning);
+  }
+</style>

@@ -19,7 +19,7 @@
 
   A button that issues no request is worse than no button: it invites the user
   to conclude the page is genuinely gone rather than that Sauron needs
-  reloading. So the affordance is one primary action: it recovers when the
+  reloading. So the affordance is a single action: it recovers when the
   chunk is fetchable again — restored at the same hash, or a fresh
   index.html naming hashes that exist — and does not when the chunk is
   genuinely gone at that hash.
@@ -58,15 +58,17 @@
   }
 </script>
 
+<!-- Laid out by ErrorState's conventions (hairline-circle glyph, --text-md
+     title, muted reason, raw text as a faint "Details" line, one secondary
+     action) without importing it: its Retry would be the dead button the note
+     above explains, and this file's imports are paid on every first load. -->
 <div class="route-error" role="alert">
-  <Icon name="triangle-alert" size={26} />
-  <h1>{t('ui.route.errorTitle')}</h1>
-  <p class="lede">
-    {t('prose.route.error')}
-  </p>
-  <p class="detail"><code>{message}</code></p>
-  <div class="actions">
-    <Button variant="primary" onclick={reload}>
+  <div class="glyph" aria-hidden="true"><Icon name="triangle-alert" size={15} /></div>
+  <h1 class="title">{t('ui.route.errorTitle')}</h1>
+  <p class="reason">{t('prose.route.error')}</p>
+  <p class="details"><span>{t('common.loadError.details')}:</span> <code>{message}</code></p>
+  <div class="action">
+    <Button variant="secondary" onclick={reload}>
       <Icon name="refresh" size={14} />
       {t('ui.route.reload')}
     </Button>
@@ -80,42 +82,43 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 12px;
-    padding: 24px;
+    gap: 4px;
+    padding: 40px 24px;
     text-align: center;
-    color: var(--error);
   }
-  h1 {
+  .glyph {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    border: 1px solid color-mix(in srgb, var(--error) 35%, transparent);
+    color: var(--error);
+    margin-bottom: 8px;
+  }
+  .title {
     margin: 0;
-    font-size: 18px;
-    font-weight: 600;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
-  .lede {
+  .reason {
     margin: 0;
-    max-width: 46ch;
-    font-size: 13px;
+    max-width: 52ch;
+    font-size: var(--text-sm);
     color: var(--text-muted);
   }
-  .detail {
+  .details {
     margin: 0;
-    max-width: 60ch;
+    max-width: 64ch;
+    font-size: var(--text-xs);
+    color: var(--text-faint);
+    overflow-wrap: anywhere;
   }
-  .detail code {
-    font-size: 12px;
-    word-break: break-all;
-    color: var(--error);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
-    border-radius: var(--radius);
-    padding: 6px 10px;
-    display: inline-block;
+  .details code {
+    font-size: inherit;
   }
-  .actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    justify-content: center;
-    margin-top: 4px;
+  .action {
+    margin-top: 10px;
   }
 </style>

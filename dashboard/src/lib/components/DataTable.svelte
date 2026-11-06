@@ -28,30 +28,27 @@
 </div>
 
 <style>
+  /* No frame: a table is rows and hairlines, aligned with the page text. The
+     wrapper only scrolls — a wide table scrolls inside itself, never the page. */
   .dt-wrap {
     width: 100%;
     overflow-x: auto;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    background: var(--surface);
   }
   .dt {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .dt :global(thead th) {
     position: sticky;
     top: 0;
     z-index: 1;
     text-align: start;
-    font-size: 11px;
-    font-weight: 620;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-faint);
-    background: var(--surface-2);
-    padding: 9px 14px;
+    background: var(--dt-bg);
+    padding: 8px 12px;
     white-space: nowrap;
     border-bottom: 1px solid var(--border);
   }
@@ -61,21 +58,29 @@
     font-variant-numeric: tabular-nums;
   }
   .dt :global(tbody td) {
-    padding: 10px 14px;
+    padding: 11px 12px;
     border-bottom: 1px solid var(--border);
     color: var(--text);
     vertical-align: middle;
     white-space: nowrap;
+  }
+  /* The outer columns sit on the page's text edge, as the header and the
+     sections around the table do. */
+  .dt :global(tr > :first-child) {
+    padding-inline-start: 2px;
+  }
+  .dt :global(tr > :last-child) {
+    padding-inline-end: 2px;
   }
   .dt :global(tbody tr:last-child td) {
     border-bottom: none;
   }
   .dt :global(tbody tr.clickable) {
     cursor: pointer;
-    transition: background 0.1s ease;
+    transition: background-color 0.12s ease;
   }
   .dt :global(tbody tr.clickable:hover) {
-    background: var(--surface-2);
+    background: var(--dt-hover);
   }
   /* The first cell of a navigable row is a real `<a href>`, so the row can be
      opened in a new tab with the middle button or the context menu. It has to
@@ -86,15 +91,13 @@
     text-decoration: none;
   }
   /* Keyed off a hover on the ROW, not the anchor, so the underline tracks the
-     real click target — the whole row navigates, not just the link.
-     `tr.clickable` lives in this component's own markup, so no `:global` gymnastics
-     are needed here the way they are in the pages that style their own cells. */
+     real click target — the whole row navigates, not just the link. */
   .dt :global(tbody tr.clickable:hover td .row-link) {
     text-decoration: underline;
   }
   .dt :global(td .cell-mono) {
     font-family: var(--font-mono);
-    font-size: 12px;
+    font-size: var(--text-2xs);
   }
   .dt :global(td .cell-muted) {
     color: var(--text-muted);

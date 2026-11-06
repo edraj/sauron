@@ -34,8 +34,8 @@
     background: color-mix(in srgb, var(--surface-3) 60%, transparent);
   }
   .lang {
-    font-size: 11px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: var(--text-faint);
@@ -44,7 +44,7 @@
     margin: 0;
     padding: 14px 16px;
     overflow-x: auto;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     line-height: 1.6;
     color: var(--text);
   }

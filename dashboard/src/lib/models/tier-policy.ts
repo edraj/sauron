@@ -31,6 +31,8 @@
  * it would only relax strictness, not crash the page.
  */
 
+import { t } from '../i18n';
+
 /** Bounds for a restore pin's lifetime, matching the server's allowed range. */
 export const RESTORE_MIN_DAYS = 1;
 export const RESTORE_MAX_DAYS = 365;
@@ -121,15 +123,13 @@ export function revertWouldLower(p: RotationAges): boolean {
  * describe the same consequence in the same words.
  *
  * Only meaningful when `revertWouldLower` is true; callers guard on it.
+ * Translated on each call — call it from markup, as `Storage.svelte` does.
  */
 export function describeRevert(p: RotationAges): string {
-  return (
-    `Reverting drops the ${p.effective_hot_days}-day override and puts ` +
-    `${p.configured_hot_days} days in force. On its next cycle the tier worker ` +
-    `will export and then drop everything between ${p.configured_hot_days} and ` +
-    `${p.effective_hot_days} days old. Raising the number afterwards does not ` +
-    `bring it back into Postgres — that needs a restore from cold.`
-  );
+  return t('storage.revertNote.lower', {
+    effective: p.effective_hot_days,
+    configured: p.configured_hot_days,
+  });
 }
 
 /**
@@ -182,15 +182,12 @@ export function retentionRevertWouldDelete(p: RetentionAges): boolean {
 export function describeRetentionRevert(p: RetentionAges): string {
   const from =
     p.effective_session_retention_days === 0
-      ? 'off'
-      : `${p.effective_session_retention_days} days`;
-  return (
-    `Reverting drops the override (currently ${from}) and puts ` +
-    `${p.configured_session_retention_days} days in force. On the next daily pass, ` +
-    `raw sessions older than ${p.configured_session_retention_days} days are deleted ` +
-    `permanently — sessions have no cold copy, so past-retention days survive only ` +
-    `as aggregates. Raising the number afterwards does not bring them back.`
-  );
+      ? t('storage.retentionOffShort')
+      : t('storage.revertNote.days', { n: p.effective_session_retention_days });
+  return t('storage.revertNote.retention', {
+    from,
+    configured: p.configured_session_retention_days,
+  });
 }
 
 /** A restore pin lifetime within the server's bounds, or null. */

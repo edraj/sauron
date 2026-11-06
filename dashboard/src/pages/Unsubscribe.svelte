@@ -2,8 +2,9 @@
   import { t } from '../lib/i18n';
   import { querystring } from 'svelte-spa-router';
   import { get } from 'svelte/store';
-  import Card from '../lib/components/ui/Card.svelte';
+  import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import { unsubscribe } from '../lib/api/notification-prefs';
 
@@ -29,21 +30,43 @@
   });
 </script>
 
-<div class="wrap">
-  <Card title={t('auth.unsubscribe.title')}>
-    {#if state === 'missing'}
+<AuthLayout title={t('auth.unsubscribe.title')}>
+  {#if state === 'missing'}
+    <div class="panel" role="status">
       <p>{t('auth.unsubscribe.missingToken')}</p>
-    {:else if state === 'working'}
-      <Spinner />
-    {:else}
-      <p>{t('auth.unsubscribe.done')}</p>
-      <p class="hint">{t('auth.unsubscribe.reenable')}</p>
-      <Button href="#/account" variant="primary">{t('auth.unsubscribe.manage')}</Button>
-    {/if}
-  </Card>
-</div>
+    </div>
+  {:else if state === 'working'}
+    <div class="working"><Spinner size={18} /></div>
+  {:else}
+    <div class="form">
+      <InlineNotice tone="success">{t('auth.unsubscribe.done')}</InlineNotice>
+      <div class="panel">
+        <p class="muted">{t('auth.unsubscribe.reenable')}</p>
+      </div>
+      <Button href="#/account" variant="primary" size="lg" fullWidth>{t('auth.unsubscribe.manage')}</Button>
+    </div>
+  {/if}
+</AuthLayout>
 
 <style>
-  .wrap { max-width: 520px; margin: 64px auto; padding: 0 16px; }
-  .hint { font-size: 13px; color: var(--text-faint); }
+  .form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: var(--text-sm);
+    line-height: 1.5;
+  }
+  .muted {
+    color: var(--text-muted);
+  }
+  .working {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0;
+  }
 </style>

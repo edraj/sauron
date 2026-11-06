@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.8.1
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -364,6 +364,20 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Fri Nov 06 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.9.0-1
+- Dashboard: the Quiet refresh. One type scale, theme tokens and spacing rhythm
+  across every page; shared page header, error, select, segmented-control,
+  textarea and section-loading components replace per-page copies, with source
+  guards in the test suite that fail on drift.
+- Dashboard: the issue page puts the events chart and stack trace at full width,
+  Breadcrumbs and Context beside the Overview rail, and Contexts beside
+  Additional data; the error quick view pairs the last two the same way.
+- Dashboard: remaining English-only strings translated to Arabic, and caught
+  request errors read through one helper instead of printing "[object Object]".
+- Dashboard: Inter and Noto Sans Arabic are bundled rather than fetched.
+- follow-redirects 1.16.2 (via axios) for GHSA-q3jh-wrc6-jgq8, GHSA-8r9p-f939-6h3c
+  and GHSA-mrwp-f3q8-3g9p.
+
 * Tue Sep 01 2026 Kefah Issa <kefah@oodi.iq> - 1.8.1-1
 - Licence scope corrected. 1.8.0 relicensed the whole tree LGPL-3.0-only; only the
   client SDKs under sdks/ were meant to move. The server -- the backend workspace and

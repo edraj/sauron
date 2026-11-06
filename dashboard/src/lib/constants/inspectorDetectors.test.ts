@@ -5,7 +5,8 @@ import fs from 'node:fs';
 // @ts-expect-error -- no @types/node in this project; the Node runtime that
 // executes vitest provides this builtin regardless.
 import path from 'node:path';
-import { DETECTORS } from './inspectorDetectors';
+import { DETECTORS, detectorHint } from './inspectorDetectors';
+import { t } from '../i18n';
 
 // Same contract pattern as `permissions.test.ts` reading `rbac.rs`: parse the
 // detector ids straight out of the backend source rather than comparing
@@ -77,9 +78,18 @@ describe('DETECTORS', () => {
 
   it('labels and hints every detector', () => {
     for (const d of DETECTORS) {
-      expect(d.label.trim()).not.toBe('');
-      expect(d.hint.trim()).not.toBe('');
+      expect(t(d.labelKey).trim()).not.toBe('');
+      expect(detectorHint(d).trim()).not.toBe('');
     }
+  });
+
+  it('keeps the example literal and translates only the hint', () => {
+    const email = DETECTORS.find((d) => d.id === 'email');
+    expect(email && detectorHint(email)).toBe('jane@acme.co.uk — requires a dot-separated host');
+    const ipv4 = DETECTORS.find((d) => d.id === 'ipv4');
+    expect(ipv4 && detectorHint(ipv4)).toBe('203.0.113.7');
+    const jwt = DETECTORS.find((d) => d.id === 'jwt');
+    expect(jwt && detectorHint(jwt)).toBe('A signed three-segment token');
   });
 
   it('has no duplicate ids', () => {

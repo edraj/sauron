@@ -3,9 +3,14 @@
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { push } from 'svelte-spa-router';
+  import { formatNumber } from '../lib/i18n';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
+  import CopyButton from '../lib/components/ui/CopyButton.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import FactList from '../lib/components/FactList.svelte';
+  import Fact from '../lib/components/Fact.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -48,6 +53,13 @@
   const detail = $derived(view.data ?? null);
   const loading = $derived(view.loading);
   const error = $derived(view.error);
+  /**
+   * Nothing to show and nothing failing — or the server saying 404. Either is
+   * "this screen isn't here", which gets the way back rather than a Retry.
+   */
+  const notFound = $derived(
+    !loading && !detail && (!error || view.errorStatus === 404),
+  );
 
   // `scopeKey` belongs in the key: it carries the selected environment, which the
   // axios interceptor adds to the request but which appears in none of these
@@ -119,7 +131,7 @@
    * replaced. Falls back to the issue id, which always exists.
    */
   function exceptionLabel(x: { exception_type: string | null; message: string | null; issue_id: string }) {
-    return x.exception_type ?? x.message ?? `Issue ${x.issue_id.slice(0, 8)}`;
+    return x.exception_type ?? x.message ?? t('screen.issueFallback', { id: x.issue_id.slice(0, 8) });
   }
 
   function deviceLabel(d: { family: string | null; model: string | null; device_key: string }) {
@@ -127,33 +139,49 @@
   }
 </script>
 
-  <button class="back" onclick={() => push('/screens')}>
-    <Icon name="arrow-left" size={14} />
-    {t('screens.title')}
-  </button>
+  <!-- The heading is the name in the URL, so it is on screen before the stats
+       request returns. -->
+  <PageHeader
+    title={screenName}
+    titleClass="mono"
+    back={{ label: t('nav.screens'), href: '#/screens' }}
+  >
+    {#snippet meta()}
+      <CopyButton value={screenName} size="sm" />
+    {/snippet}
+    {#snippet freshness()}
+      {#if detail}<Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />{/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    {/snippet}
+  </PageHeader>
 
-  <!-- Only the stat tiles wait on the stats request. The heading is the name
-       in the URL, and the four lists below fetch on demand and never depended
-       on it — so neither is held behind it any more. -->
-  {#if error && !(loading && !detail)}
-    <EmptyState title={t('screen.error.load')} description={error} icon="triangle-alert">
+  <!-- Only the stat tiles wait on the stats request. The four lists below
+       fetch on demand and never depended on it — so neither is held behind
+       it. -->
+  {#if notFound}
+    <EmptyState
+      title={t('screen.notFound')}
+      description={t('screen.empty.body')}
+      icon="layout-panel-top"
+    >
       {#snippet action()}
         <Button variant="secondary" onclick={() => push('/screens')}>{t('screen.backToList')}</Button>
       {/snippet}
     </EmptyState>
-  {:else if loading || detail}
+  {:else if error && !(loading && !detail)}
+    <ErrorState
+      title={t('screen.error.load')}
+      error={view}
+      onretry={() => sessionStore.currentAppId && load(sessionStore.currentAppId, screenName, true)}
+    />
+  {:else}
     {@const stats = detail?.stats}
-    <div class="screen-head">
-      <h1 class="page-title mono screen-title">{screenName}</h1>
-      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
-    </div>
-
     <StatTiles min={150}>
       <StatTile
         label={t('screens.column.views')}
         value={stats ? compactNumber(stats.views) : ''}
-        tone="primary"
         loading={!stats}
       />
       <StatTile
@@ -189,7 +217,7 @@
         <CollapsibleFetchCard
           title={t('explore.column.events')}
           icon="zap"
-          emptyNote="No events on this screen."
+          emptyNote={t('screen.empty.events')}
           fetcher={fetchEvents}
           rowKey={(e) => e.id}
         >
@@ -200,19 +228,21 @@
                 <span class="faint push"><TimeValue value={e.occurred_at} asText /></span>
               {/snippet}
               {#snippet expanded()}
-                <dl class="facts">
-                  <div><dt>{t('screen.distinctId')}</dt><dd class="mono">{e.distinct_id}</dd></div>
-                  {#if e.session_id}
-                    <div><dt>{t('sessions.column.session')}</dt><dd class="mono">{e.session_id}</dd></div>
-                  {/if}
-                  {#if e.release}
-                    <div><dt>{t('issue.field.release')}</dt><dd class="mono">{e.release}</dd></div>
-                  {/if}
-                </dl>
-                <p class="sub">{t('events.properties')}</p>
-                <KeyValueList data={e.properties} emptyLabel="No properties" />
+                <div class="facts">
+                  <FactList>
+                    <Fact label={t('screen.distinctId')} mono>{e.distinct_id}</Fact>
+                    {#if e.session_id}
+                      <Fact label={t('sessions.column.session')} mono>{e.session_id}</Fact>
+                    {/if}
+                    {#if e.release}
+                      <Fact label={t('issue.field.release')} mono>{e.release}</Fact>
+                    {/if}
+                  </FactList>
+                </div>
+                <p class="section-label sub">{t('events.properties')}</p>
+                <KeyValueList data={e.properties} emptyLabel={t('screen.empty.properties')} />
                 {#if e.tags && Object.keys(e.tags).length > 0}
-                  <p class="sub">{t('ui.section.tags')}</p>
+                  <p class="section-label sub">{t('ui.section.tags')}</p>
                   <KeyValueList data={e.tags} />
                 {/if}
               {/snippet}
@@ -224,34 +254,36 @@
           <CollapsibleFetchCard
             title={t('screens.column.exceptions')}
             icon="triangle-alert"
-            emptyNote="No exceptions on this screen."
+            emptyNote={t('screen.empty.exceptions')}
             fetcher={fetchExceptions}
             rowKey={(x) => x.id}
           >
             {#snippet row(x)}
               <SectionRow
                 onopen={() => push('/issues/' + x.issue_id)}
-                openLabel="Open issue"
+                openLabel={t('screen.open.issue')}
               >
                 {#snippet children()}
                   <span class="mono truncate">{exceptionLabel(x)}</span>
                   <span class="faint push"><TimeValue value={x.occurred_at} asText /></span>
                 {/snippet}
                 {#snippet expanded()}
-                  <dl class="facts">
-                    {#if x.exception_type}
-                      <div><dt>{t('issue.field.type')}</dt><dd class="mono">{x.exception_type}</dd></div>
-                    {/if}
-                    {#if x.message}
-                      <div><dt>{t('screen.message')}</dt><dd>{x.message}</dd></div>
-                    {/if}
-                    {#if x.culprit}
-                      <div><dt>{t('screen.culprit')}</dt><dd class="mono">{x.culprit}</dd></div>
-                    {/if}
-                    {#if x.distinct_id}
-                      <div><dt>{t('screen.distinctId')}</dt><dd class="mono">{x.distinct_id}</dd></div>
-                    {/if}
-                  </dl>
+                  <div class="facts">
+                    <FactList>
+                      {#if x.exception_type}
+                        <Fact label={t('issue.field.type')} mono>{x.exception_type}</Fact>
+                      {/if}
+                      {#if x.message}
+                        <Fact label={t('screen.message')}>{x.message}</Fact>
+                      {/if}
+                      {#if x.culprit}
+                        <Fact label={t('screen.culprit')} mono>{x.culprit}</Fact>
+                      {/if}
+                      {#if x.distinct_id}
+                        <Fact label={t('screen.distinctId')} mono>{x.distinct_id}</Fact>
+                      {/if}
+                    </FactList>
+                  </div>
                 {/snippet}
               </SectionRow>
             {/snippet}
@@ -261,14 +293,14 @@
         <CollapsibleFetchCard
           title={t('devices.title')}
           icon="smartphone"
-          emptyNote="No devices seen on this screen."
+          emptyNote={t('screen.empty.devices')}
           fetcher={fetchDevices}
           rowKey={(d) => d.device_key}
         >
           {#snippet row(d)}
             <SectionRow
               onopen={() => push('/devices/' + encodeURIComponent(d.device_key))}
-              openLabel="Open device"
+              openLabel={t('screen.open.device')}
             >
               {#snippet children()}
                 <span class="truncate">{deviceLabel(d)}</span>
@@ -277,27 +309,24 @@
                 </span>
               {/snippet}
               {#snippet expanded()}
-                <dl class="facts">
-                  <div><dt>{t('screen.deviceKey')}</dt><dd class="mono">{d.device_key}</dd></div>
-                  {#if d.os_name}
-                    <div>
-                      <dt>OS</dt>
-                      <dd>{d.os_name}{d.os_version ? ' ' + d.os_version : ''}</dd>
-                    </div>
-                  {/if}
-                  {#if d.arch}<div><dt>{t('device.field.arch')}</dt><dd>{d.arch}</dd></div>{/if}
-                  {#if d.browser}<div><dt>{t('device.field.browser')}</dt><dd>{d.browser}</dd></div>{/if}
-                  <div><dt>{t('screen.viewsHere')}</dt><dd>{compactNumber(d.views_on_screen)}</dd></div>
-                  <div><dt>{t('screen.eventsHere')}</dt><dd>{compactNumber(d.events_on_screen)}</dd></div>
-                  <div>
-                    <dt>{t('screen.exceptionsHere')}</dt>
-                    <dd>{compactNumber(d.exceptions_on_screen)}</dd>
-                  </div>
-                  <div>
-                    <dt>{t('screen.firstSeenHere')}</dt>
-                    <dd><TimeValue value={d.first_seen_on_screen} /></dd>
-                  </div>
-                </dl>
+                <div class="facts">
+                  <FactList>
+                    <Fact label={t('screen.deviceKey')} mono>{d.device_key}</Fact>
+                    {#if d.os_name}
+                      <Fact label={t('device.field.os')}>
+                        {d.os_name}{d.os_version ? ' ' + d.os_version : ''}
+                      </Fact>
+                    {/if}
+                    {#if d.arch}<Fact label={t('device.field.arch')}>{d.arch}</Fact>{/if}
+                    {#if d.browser}<Fact label={t('device.field.browser')}>{d.browser}</Fact>{/if}
+                    <Fact label={t('screen.viewsHere')}>{formatNumber(d.views_on_screen)}</Fact>
+                    <Fact label={t('screen.eventsHere')}>{formatNumber(d.events_on_screen)}</Fact>
+                    <Fact label={t('screen.exceptionsHere')}>{formatNumber(d.exceptions_on_screen)}</Fact>
+                    <Fact label={t('screen.firstSeenHere')}>
+                      <TimeValue value={d.first_seen_on_screen} />
+                    </Fact>
+                  </FactList>
+                </div>
               {/snippet}
             </SectionRow>
           {/snippet}
@@ -306,14 +335,14 @@
         <CollapsibleFetchCard
           title={t('users.title')}
           icon="users"
-          emptyNote="No users seen on this screen."
+          emptyNote={t('screen.empty.users')}
           fetcher={fetchUsers}
           rowKey={(u) => u.distinct_id}
         >
           {#snippet row(u)}
             <SectionRow
               onopen={() => push('/persons/' + encodeURIComponent(u.distinct_id))}
-              openLabel="Open user"
+              openLabel={t('screen.open.user')}
             >
               {#snippet children()}
                 <span class="mono truncate">{u.distinct_id}</span>
@@ -322,65 +351,32 @@
                 </span>
               {/snippet}
               {#snippet expanded()}
-                <dl class="facts">
-                  <div><dt>{t('screen.viewsHere')}</dt><dd>{compactNumber(u.views_on_screen)}</dd></div>
-                  <div><dt>{t('screen.eventsHere')}</dt><dd>{compactNumber(u.events_on_screen)}</dd></div>
-                  <div>
-                    <dt>{t('screen.exceptionsHere')}</dt>
-                    <dd>{compactNumber(u.exceptions_on_screen)}</dd>
-                  </div>
-                  <div>
-                    <dt>{t('screen.firstSeenHere')}</dt>
-                    <dd><TimeValue value={u.first_seen_on_screen} /></dd>
-                  </div>
-                </dl>
-                <p class="sub">{t('person.card.traits')}</p>
-                <KeyValueList data={u.properties} emptyLabel="No traits" />
+                <div class="facts">
+                  <FactList>
+                    <Fact label={t('screen.viewsHere')}>{formatNumber(u.views_on_screen)}</Fact>
+                    <Fact label={t('screen.eventsHere')}>{formatNumber(u.events_on_screen)}</Fact>
+                    <Fact label={t('screen.exceptionsHere')}>{formatNumber(u.exceptions_on_screen)}</Fact>
+                    <Fact label={t('screen.firstSeenHere')}>
+                      <TimeValue value={u.first_seen_on_screen} />
+                    </Fact>
+                  </FactList>
+                </div>
+                <p class="section-label sub">{t('person.card.traits')}</p>
+                <KeyValueList data={u.properties} emptyLabel={t('person.noTraits')} />
               {/snippet}
             </SectionRow>
           {/snippet}
         </CollapsibleFetchCard>
       </div>
     {/key}
-  {:else}
-    <EmptyState
-      title={t('screen.notFound')}
-      description={t('screen.empty.body')}
-      icon="layout-panel-top"
-    />
   {/if}
 
 <style>
-  .screen-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-    margin-bottom: 16px;
-  }
-  .back:hover {
-    color: var(--text);
-  }
-  .screen-title {
-    word-break: break-word;
-    margin-bottom: 18px;
-  }
   .lists {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 18px;
-    margin-top: 20px;
+    gap: var(--page-gap);
+    margin-top: var(--page-gap);
     align-items: start;
   }
   .truncate {
@@ -390,7 +386,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     vertical-align: middle;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   /* Pushes the timestamp to the row's trailing edge, so the times line up in a
      column regardless of how long each row's leading label is. */
@@ -398,33 +394,13 @@
     margin-inline-start: auto;
   }
   .facts {
-    display: grid;
-    gap: 4px;
     margin: 0 0 10px;
   }
-  .facts div {
-    display: flex;
-    gap: 8px;
-    font-size: 12.5px;
-  }
-  .facts dt {
-    color: var(--text-muted);
-    min-width: 110px;
-    flex: none;
-  }
-  .facts dd {
-    margin: 0;
-    word-break: break-word;
-  }
   .sub {
-    font-size: 11.5px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-faint);
     margin: 10px 0 4px;
   }
   .faint {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     white-space: nowrap;
   }

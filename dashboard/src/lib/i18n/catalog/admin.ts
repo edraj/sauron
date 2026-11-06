@@ -9,6 +9,20 @@ export const admin = {
     ar: 'ليس لديك صلاحية الوصول إلى أي قسم إداري في هذه المؤسسة. اطلب الصلاحية من أحد مالكي المؤسسة.',
   },
 
+  // --- admin rail (sentence case, one label per page) ------------------------
+  'admin.nav.members': { en: 'Members', ar: 'الأعضاء' },
+  'admin.nav.roles': { en: 'Roles', ar: 'الأدوار' },
+  'admin.nav.projects': { en: 'Projects', ar: 'المشاريع' },
+  'admin.nav.environments': { en: 'Environments', ar: 'البيئات' },
+  'admin.nav.settings': { en: 'App settings', ar: 'إعدادات التطبيق' },
+  'admin.nav.sourceMaps': { en: 'Source maps', ar: 'خرائط المصدر' },
+  'admin.nav.alerts': { en: 'Alerts', ar: 'التنبيهات' },
+  'admin.nav.storage': { en: 'Storage', ar: 'التخزين' },
+  'admin.nav.privacy': { en: 'Privacy', ar: 'الخصوصية' },
+  'admin.nav.wallOfShame': { en: 'Wall of shame', ar: 'جدار العار' },
+  'admin.nav.ingestFailures': { en: 'Ingest failures', ar: 'إخفاقات الاستقبال' },
+  'admin.nav.purge': { en: 'Purge data', ar: 'حذف البيانات' },
+
   // --- members -------------------------------------------------------------
   'members.title': { en: 'Members', ar: 'الأعضاء' },
   'members.column.member': { en: 'Member', ar: 'العضو' },

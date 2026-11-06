@@ -90,7 +90,7 @@
     align-items: center;
     gap: 4px;
     width: 100%;
-    padding: 9px 14px;
+    padding: 8px 12px;
     background: none;
     border: none;
     font: inherit;
@@ -100,12 +100,20 @@
     cursor: pointer;
     transition: color 0.12s ease;
   }
+  /* Match DataTable's outer-column inset, which this cell's own `padding: 0`
+     overrides. */
+  .sortable:first-child .sort-btn {
+    padding-inline-start: 2px;
+  }
+  .sortable:last-child .sort-btn {
+    padding-inline-end: 2px;
+  }
   .sort-btn:hover,
   .sort-btn.active {
     color: var(--text);
   }
   .sort-btn:focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--primary);
     outline-offset: -2px;
   }
   /* Reserve the caret's width always, so the header does not shift sideways

@@ -12,7 +12,7 @@
   fact is noise.
 -->
 <script lang="ts">
-  import Icon from '../ui/Icon.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import { disclosuresFor } from './disclosures';
   import type { ClampInfo } from '../../api/search';
 
@@ -25,29 +25,19 @@
   const items = $derived(disclosuresFor(clamped, payloadSearched));
 </script>
 
-{#each items as d (d.text)}
-  <p class="disclosure {d.tone}">
-    <Icon name={d.tone === 'warning' ? 'triangle-alert' : 'info'} size={14} />
-    <span>{d.text}</span>
-  </p>
-{/each}
+{#if items.length > 0}
+  <div class="disclosures">
+    {#each items as d (d.text)}
+      <InlineNotice tone={d.tone}>{d.text}</InlineNotice>
+    {/each}
+  </div>
+{/if}
 
 <style>
-  .disclosure {
+  .disclosures {
     display: flex;
-    align-items: center;
+    flex-direction: column;
     gap: 8px;
     margin: 0 0 12px;
-    padding: 8px 12px;
-    border-radius: var(--radius);
-    font-size: 12.5px;
-  }
-  .disclosure.warning {
-    background: var(--warning-soft);
-    color: var(--warning);
-  }
-  .disclosure.info {
-    background: var(--info-soft);
-    color: var(--info);
   }
 </style>

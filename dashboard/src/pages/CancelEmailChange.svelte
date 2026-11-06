@@ -4,6 +4,7 @@
   import { querystring } from 'svelte-spa-router';
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import { cancelEmailChange, previewEmailChange } from '../lib/api/auth';
   import type { EmailChangePreview } from '../lib/api/auth';
   import { errorMessage, isNormalizedError } from '../lib/api/client';
@@ -77,24 +78,25 @@
     <!-- "Nothing was changed", not "the change was undone": it had not taken
          effect, and telling someone their address was reverted would send them
          looking for a change that never happened. -->
-    <div class="panel" role="status">
-      <p>{t('prose.auth.emailChangeCancelled')}</p>
-      <p><a href="#/login">{t('auth.forgot.backToSignIn')}</a></p>
-    </div>
+    <InlineNotice tone="success">{t('prose.auth.emailChangeCancelled')}</InlineNotice>
   {:else if preview}
     <div class="form">
-      {#if error}<div class="alert" role="alert">{error}</div>{/if}
+      {#if error}<InlineNotice tone="error">{error}</InlineNotice>{/if}
       <!-- `preview.new_email` is DELIBERATELY not rendered here, and the server
            does not send it for a cancellation token: this page is reached from
            the mail to the address being REPLACED, which must never learn what
            it is being replaced with. Do not add it if a future API change
            starts sending the field. -->
-      <p>{t('prose.auth.emailChangeCancelIntro')}</p>
-      <p class="muted">{t('prose.auth.emailChangeOrg')} {preview.org_name}</p>
+      <div class="panel">
+        <p>{t('prose.auth.emailChangeCancelIntro')}</p>
+        <p class="muted">{t('prose.auth.emailChangeOrg')} {preview.org_name}</p>
+      </div>
       <Button variant="danger" size="lg" fullWidth loading={submitting} onclick={stop}>
         {t('auth.emailChange.stop')}
       </Button>
-      <p class="muted">{t('prose.auth.emailChangeCancelIgnore')}</p>
+      <div class="panel">
+        <p class="muted">{t('prose.auth.emailChangeCancelIgnore')}</p>
+      </div>
     </div>
   {/if}
 
@@ -104,20 +106,19 @@
 </AuthLayout>
 
 <style>
-  .panel {
-    text-align: center;
-  }
   .form {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: var(--text-sm);
+    line-height: 1.5;
   }
   .muted {
     color: var(--text-muted);
-    font-size: 13px;
-  }
-  .alert {
-    color: var(--danger, #c0392b);
-    font-size: 13.5px;
   }
 </style>

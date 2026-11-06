@@ -1,5 +1,6 @@
 <script lang="ts">
   import { localeStore } from '../i18n/locale.svelte';
+  import { formatNumber, t } from '../i18n';
   import type { UserSeriesPoint } from '../models';
   import { formatDateTime } from '../utils/format';
 
@@ -9,7 +10,7 @@
     emptyLabel?: string;
   }
 
-  let { data, height = 180, emptyLabel = 'No user activity in this range' }: Props = $props();
+  let { data, height = 180, emptyLabel }: Props = $props();
 
   /**
    * ONE scale across both series.
@@ -39,7 +40,7 @@
 </script>
 
 {#if data.length === 0}
-  <div class="chart-empty" style="height:{height}px">{emptyLabel}</div>
+  <div class="chart-empty" style="height:{height}px">{emptyLabel ?? t('chart.empty.userActivity')}</div>
 {:else}
   <div class="chart">
     <div class="plot" style="height:{height}px">
@@ -47,13 +48,16 @@
         {#each data as point (point.bucket)}
           <div
             class="col"
-            title={`${formatDateTime(point.bucket)} · ${point.active} active · ${point.new_users} new`}
+            title={`${formatDateTime(point.bucket)} · ${t('users.activity.tip', { active: formatNumber(point.active), new: formatNumber(point.new_users) })}`}
           >
             <div class="pair">
               <div class="bar active" style="height:{barHeight(point.active)}%">
                 <!-- Anchored to the active bar, which is the taller of the two
                      (new is a subset), so the tip clears both. -->
-                <span class="tip">{point.active} active · {point.new_users} new<br />{label(point.bucket)}</span>
+                <span class="tip"
+                  >{t('users.activity.tip', { active: formatNumber(point.active), new: formatNumber(point.new_users) })}<br
+                  />{label(point.bucket)}</span
+                >
               </div>
               <div class="bar new" style="height:{barHeight(point.new_users)}%"></div>
             </div>
@@ -63,7 +67,9 @@
     </div>
     <div class="axis">
       <span>{label(data[0].bucket)}</span>
-      <span class="legend"><i class="k a"></i> active <i class="k n"></i> new</span>
+      <span class="legend"
+        ><i class="k a"></i> {t('users.activity.active')} <i class="k n"></i> {t('users.activity.new')}</span
+      >
       <span>{label(data[data.length - 1].bucket)}</span>
     </div>
   </div>
@@ -79,6 +85,7 @@
     align-items: flex-end;
     gap: 3px;
     padding: 4px 2px 0;
+    /* An axis, not a gridline: `--border` (see TimeSeriesChart). */
     border-bottom: 1px solid var(--border);
   }
   .col {
@@ -110,10 +117,10 @@
   }
   .bar.active {
     position: relative; /* positioning context for .tip */
-    background: linear-gradient(to top, color-mix(in srgb, var(--primary) 55%, transparent), var(--primary));
+    background: var(--chart-1);
   }
   .bar.new {
-    background: linear-gradient(to top, color-mix(in srgb, var(--info) 55%, transparent), var(--info));
+    background: var(--chart-2);
   }
   .col:hover .bar { filter: brightness(1.18); }
   .tip {
@@ -125,7 +132,7 @@
     background: var(--surface-3);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
     color: var(--text);
     opacity: 0;
@@ -135,16 +142,16 @@
     box-shadow: var(--shadow);
   }
   .col:hover .tip { opacity: 1; }
-  .axis { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-faint); }
+  .axis { display: flex; justify-content: space-between; align-items: center; font-size: var(--text-xs); color: var(--text-faint); }
   .legend { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); }
   .k { display: inline-block; width: 9px; height: 9px; border-radius: 2px; vertical-align: middle; }
-  .k.a { background: var(--primary); }
-  .k.n { background: var(--info); }
+  .k.a { background: var(--chart-1); }
+  .k.n { background: var(--chart-2); }
   .chart-empty {
     display: grid;
     place-items: center;
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
   }

@@ -19,6 +19,18 @@ const base = {
   last_seen_at: '2026-08-01T00:00:00Z',
 };
 
+describe('findingBadges detector', () => {
+  it('names a known detector in words, not by its wire id', () => {
+    const b = findingBadges({ ...base, detector: 'credit_card' });
+    expect(b.find((x) => x.id === 'detector:credit_card')?.label).toBe('Credit card');
+  });
+
+  it('falls back to the wire id for a detector this dashboard does not know', () => {
+    const b = findingBadges({ ...base, detector: 'future_thing' });
+    expect(b.find((x) => x.id === 'detector:future_thing')?.label).toBe('future_thing');
+  });
+});
+
 describe('formatMatchCount', () => {
   it('is exact when the scan was not truncated', () => {
     expect(formatMatchCount(41200, true)).toBe('41,200');

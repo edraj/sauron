@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
-  import { formatDateTime } from '../lib/utils/format';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { formatNumber, labelFor, t, type MessageKey } from '../lib/i18n';
+  import { formatDuration } from '../lib/utils/format';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
@@ -32,6 +33,7 @@
   import { listProjectEnvironments } from '../lib/api/environments';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import Textarea from '../lib/components/ui/Textarea.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -39,7 +41,12 @@
   import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import CountChip from '../lib/components/ui/CountChip.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -93,10 +100,10 @@
   const meta = $derived(view.data?.meta ?? null);
   const loading = $derived(view.loading);
   let refreshing = $state(false);
-  // Mutations report through the same banner as the load, and a `$derived`
-  // cannot be assigned to — so they keep their own state and this is the fold.
+  // A failed mutation (or test send) is reported in its own notice, apart from
+  // a failed LOAD: the load failure replaces the page with ErrorState when
+  // there is nothing to show, and a mutation failure never does.
   let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
   let notice = $state<string | null>(null);
 
   const orgId = $derived(sessionStore.currentOrgId);
@@ -345,7 +352,7 @@
       monitorOptions = [
         {
           id: r.monitor_id,
-          name: 'Pinned monitor (outside the selected project)',
+          name: t('alerts.pinnedMonitorOutside'),
           kind: 'http',
           target: '',
           status: 'unknown',
@@ -450,15 +457,17 @@
     if (untouched) rTemplate = TRIGGER_TEMPLATES[next];
   }
 
-  const TRIGGER_LABELS: Record<TriggerType, string> = {
-    monitor_down: 'Monitor goes down',
-    monitor_up: 'Monitor recovers',
-    issue_new: 'New issue appears',
-    issue_regression: 'Resolved issue regresses',
-    error_threshold: 'Error count crosses threshold',
-    error_spike: 'Error rate spikes',
-    event_threshold: 'Event count crosses threshold',
-    perf_degradation: 'Latency degrades',
+  // Catalog keys, not words: `triggerLabel` resolves them through `t()` at
+  // render time, so a language switch re-labels (and re-sorts) the column.
+  const TRIGGER_LABELS: Record<TriggerType, MessageKey> = {
+    monitor_down: 'alerts.trigger.monitorDown',
+    monitor_up: 'alerts.trigger.monitorUp',
+    issue_new: 'alerts.trigger.issueNew',
+    issue_regression: 'alerts.trigger.issueRegression',
+    error_threshold: 'alerts.trigger.errorThreshold',
+    error_spike: 'alerts.trigger.errorSpike',
+    event_threshold: 'alerts.trigger.eventThreshold',
+    perf_degradation: 'alerts.trigger.perfDegradation',
   };
 
   const KIND_LABELS: Record<ChannelKind, string> = {
@@ -476,7 +485,44 @@
   // than defensive noise — and passing the accessor a lookup that disagreed
   // with the cell is precisely the "orders by one value, displays another" bug.
   const kindLabel = (k: ChannelKind): string => KIND_LABELS[k] ?? k;
-  const triggerLabel = (t: TriggerType): string => TRIGGER_LABELS[t] ?? t;
+  const triggerLabel = (k: TriggerType): string => labelFor(TRIGGER_LABELS, k);
+
+  const kindOptions = $derived(Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label })));
+  const triggerOptions = $derived(
+    (Object.keys(TRIGGER_LABELS) as TriggerType[]).map((value) => ({ value, label: triggerLabel(value) })),
+  );
+  const monitorSelectOptions = $derived([
+    { value: '', label: t('alerts.allMonitors') },
+    ...monitorOptions.map((m) => ({ value: m.id, label: m.name })),
+  ]);
+  const comparatorOptions = $derived([
+    { value: 'gte', label: t('alerts.cmp.atLeast') },
+    { value: 'gt', label: t('prose.alerts.isMoreThan') },
+    { value: 'lte', label: t('alerts.cmp.atMost') },
+    { value: 'lt', label: t('prose.alerts.isLessThan') },
+    { value: 'eq', label: t('alerts.cmp.equals') },
+  ]);
+  const metricOptions = $derived((meta?.metrics ?? ['p95']).map((m) => ({ value: m, label: m })));
+  const severityOptions = $derived([
+    { value: 'info', label: t('alerts.severity.info') },
+    { value: 'warning', label: t('alerts.severity.warning') },
+    { value: 'critical', label: t('alerts.severity.critical') },
+  ]);
+
+  const SEVERITY_LABELS: Record<string, MessageKey> = {
+    info: 'alerts.severity.info',
+    warning: 'alerts.severity.warning',
+    critical: 'alerts.severity.critical',
+  };
+  const severityLabel = (s: string): string => labelFor(SEVERITY_LABELS, s);
+
+  const DELIVERY_LABELS: Record<AlertEvent['status'], MessageKey> = {
+    sent: 'alerts.delivery.sent',
+    failed: 'alerts.delivery.failed',
+    throttled: 'alerts.delivery.throttled',
+    skipped: 'alerts.delivery.skipped',
+  };
+  const deliveryLabel = (s: AlertEvent['status']): string => labelFor(DELIVERY_LABELS, s);
 
   /**
    * Channel/rule TYPE metadata — the static catalogue of what fields each
@@ -627,8 +673,12 @@
     notice = null;
     try {
       const res = await testChannel(c.id);
-      if (res.ok) notice = `Test notification delivered to “${c.name}”.`;
-      else actionError = `Test to “${c.name}” failed: ${res.error ?? 'unknown error'}`;
+      if (res.ok) notice = t('alerts.testDelivered', { name: c.name });
+      else
+        actionError = t('alerts.testFailed', {
+          name: c.name,
+          error: res.error ?? t('alerts.unknownError'),
+        });
     } catch (e) {
       actionError = errorMessage(e);
     } finally {
@@ -737,8 +787,6 @@
   const statusTone = (s: string) =>
     s === 'sent' ? 'success' : s === 'failed' ? 'error' : 'neutral';
 
-  const fmtTime = (iso: string) => formatDateTime(iso);
-
   /**
    * The channel a delivery went to, or `null` when there is no name to show.
    *
@@ -830,62 +878,76 @@
 </script>
 
 <AdminShell>
-  <div class="alerts">
-    <header class="head">
-      <div>
-        <h1 class="page-title">{t('alerts.title')}</h1>
-        <p class="sub muted">
-          {t('prose.alerts.subtitle')}
-        </p>
-      </div>
-      <div class="controls">
-        <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
-      </div>
-    </header>
+  <PageHeader title={t('alerts.title')} subtitle={t('prose.alerts.subtitle')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
+    {/snippet}
+    {#snippet primary()}
+      <!-- The one primary action follows the tab: History has none. -->
+      {#if tab === 'channels' && !showChannelForm}
+        <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
+          {t('alerts.newChannel')}
+        </Button>
+      {:else if tab === 'rules' && !showRuleForm}
+        <Button
+          variant="primary"
+          lockedReason={writeLock}
+          disabled={channels.length === 0}
+          title={channels.length === 0 ? t('alerts.createChannelFirst') : undefined}
+          onclick={openNewRule}
+        >
+          {t('alerts.newRule')}
+        </Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
 
+  <div class="alerts">
     <nav class="tabs" aria-label={t('alerts.sections')}>
       <button class="tab" class:active={tab === 'channels'} onclick={() => (tab = 'channels')}>
-        {t('alerts.tab.channels')} <span class="count">{channels.length}</span>
+        {t('alerts.tab.channels')} <CountChip n={formatNumber(channels.length)} />
       </button>
       <button class="tab" class:active={tab === 'rules'} onclick={() => (tab = 'rules')}>
-        {t('alerts.tab.rules')} <span class="count">{rules.length}</span>
+        {t('alerts.tab.rules')} <CountChip n={formatNumber(rules.length)} />
       </button>
       <button class="tab" class:active={tab === 'history'} onclick={() => (tab = 'history')}>
         {t('alerts.tab.history')}
       </button>
     </nav>
 
-    {#if error}
-      <div class="err-banner" role="alert">
-        <Icon name="triangle-alert" size={15} />
-        <span>{error}</span>
-      </div>
+    {#if view.error && view.data !== undefined}
+      <!-- A forced Refresh failed over lists we already had: they stay. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
+    {/if}
+    {#if actionError}
+      <InlineNotice tone="error">{actionError}</InlineNotice>
     {/if}
     {#if notice}
-      <div class="ok-banner" role="status">
-        <Icon name="circle-check" size={15} />
-        <span>{notice}</span>
-      </div>
+      <InlineNotice tone="success">{notice}</InlineNotice>
     {/if}
 
     {#if loading}
       <Skeleton rows={6} />
+    {:else if view.error && view.data === undefined}
+      <ErrorState
+        title={t('common.couldntLoad', { thing: t('alerts.thing') })}
+        error={view}
+        onretry={refresher.run}
+      />
     {:else if tab === 'channels'}
       <!-- ---------------- Channels ---------------- -->
-      <div class="section-head">
-        <p class="muted small">
-          {t('prose.alerts.channels')}
-        </p>
-        {#if !showChannelForm}
-          <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
-            {t('alerts.newChannel')}
-          </Button>
-        {/if}
-      </div>
+      <p class="muted small">{t('prose.alerts.channels')}</p>
 
       {#if showChannelForm}
-        <Card title={editingChannelId ? 'Edit channel' : 'New channel'}>
+        <Card title={editingChannelId ? t('alerts.editChannel') : t('alerts.newChannel')}>
           <div class="form-grid">
             <Input label={t('common.name')} bind:value={chName} placeholder={t('prose.placeholder.opsSlack')} required />
 
@@ -894,25 +956,21 @@
                    secret that is never returned cannot be round-tripped, so a
                    blank field has to mean "keep" rather than "clear". -->
               <p class="span-2 muted small">
-                Type is fixed after creation. Secrets are never returned — leave a credential
-                field blank to keep what is stored, or type a new value to replace it.
+                {t('alerts.editChannelNote')}
                 {#if chKind === 'webhook'}
-                  The destination URL is stored encrypted and is not shown; retype it to change it.
+                  {t('alerts.editWebhookNote')}
                 {/if}
               </p>
             {/if}
 
-            <div class="field">
-              <label class="lbl" for="ch-kind">{t('monitors.column.type')}</label>
-              <div class="control select">
-                <select id="ch-kind" bind:value={chKind} disabled={editingChannelId !== null}>
-                  {#each Object.entries(KIND_LABELS) as [k, label] (k)}
-                    <option value={k}>{label}</option>
-                  {/each}
-                </select>
-                <span class="affix"><Icon name="chevron-down" size={15} /></span>
-              </div>
-            </div>
+            <Select
+              id="ch-kind"
+              label={t('monitors.column.type')}
+              value={chKind}
+              options={kindOptions}
+              disabled={editingChannelId !== null}
+              onchange={(v) => (chKind = v as ChannelKind)}
+            />
 
             {#if chKind === 'slack' || chKind === 'discord'}
               <div class="span-2">
@@ -1001,7 +1059,7 @@
             {:else}
               <div class="span-2">
                 <Input
-                  label="URL"
+                  label={t('alerts.field.url')}
                   bind:value={chFields.url}
                   placeholder="https://example.com/hooks/sauron"
                   required
@@ -1019,7 +1077,7 @@
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={closeChannelForm}>{t('common.cancel')}</Button>
+            <Button variant="secondary" onclick={closeChannelForm}>{t('common.cancel')}</Button>
             <Button
               variant="primary"
               loading={savingChannel}
@@ -1034,6 +1092,8 @@
       {/if}
 
       {#if channels.length === 0}
+        <!-- The setup action is `secondary`: "New channel" is already the
+             header's one primary button. -->
         <EmptyState
           title={t('alerts.empty.channels')}
           description={t('alerts.empty.channelsBody')}
@@ -1041,7 +1101,7 @@
         >
           {#snippet action()}
             {#if !showChannelForm}
-              <Button variant="primary" lockedReason={writeLock} onclick={openNewChannel}>
+              <Button variant="secondary" lockedReason={writeLock} onclick={openNewChannel}>
                 {t('alerts.newChannel')}
               </Button>
             {/if}
@@ -1074,14 +1134,14 @@
                 <td>{kindLabel(c.kind)}</td>
                 <td>
                   {#if c.has_secret}
-                    <Badge tone="success" size="sm">stored</Badge>
+                    <Badge tone="success" size="sm">{t('alerts.secretStored')}</Badge>
                   {:else}
                     <span class="muted">—</span>
                   {/if}
                 </td>
                 <td>
                   <Badge tone={c.enabled ? 'success' : 'neutral'} size="sm">
-                    {c.enabled ? 'enabled' : 'disabled'}
+                    {c.enabled ? t('alerts.state.enabled') : t('alerts.state.disabled')}
                   </Badge>
                 </td>
                 <td class="num actions">
@@ -1095,15 +1155,13 @@
                     {t('alerts.test')}
                   </Button>
                   <Button size="sm" lockedReason={writeLock} onclick={() => toggleChannel(c)}>
-                    {c.enabled ? 'Disable' : 'Enable'}
+                    {c.enabled ? t('alerts.disable') : t('alerts.enable')}
                   </Button>
                   <Button
                     size="sm"
                     lockedReason={writeLock}
                     disabled={c.config_error}
-                    title={c.config_error
-                      ? 'This channel’s stored payload cannot be decrypted, so it cannot be edited'
-                      : undefined}
+                    title={c.config_error ? t('alerts.configErrorTitle') : undefined}
                     onclick={() => openEditChannel(c)}
                   >
                     {t('common.edit')}
@@ -1141,25 +1199,10 @@
       {/if}
     {:else if tab === 'rules'}
       <!-- ---------------- Rules ---------------- -->
-      <div class="section-head">
-        <p class="muted small">
-          {t('prose.alerts.rules')}
-        </p>
-        {#if !showRuleForm}
-          <Button
-            variant="primary"
-            lockedReason={writeLock}
-            disabled={channels.length === 0}
-            title={channels.length === 0 ? 'Create a channel first' : undefined}
-            onclick={openNewRule}
-          >
-            {t('alerts.newRule')}
-          </Button>
-        {/if}
-      </div>
+      <p class="muted small">{t('prose.alerts.rules')}</p>
 
       {#if showRuleForm}
-        <Card title={editingRuleId ? 'Edit alert rule' : 'New alert rule'}>
+        <Card title={editingRuleId ? t('alerts.editRule') : t('alerts.newRuleTitle')}>
           <div class="form-grid">
             <Input label={t('common.name')} bind:value={rName} placeholder={t('prose.placeholder.ruleName')} required />
 
@@ -1169,93 +1212,61 @@
               </p>
             {/if}
 
-            <div class="field">
-              <label class="lbl" for="r-trigger">{t('alerts.column.trigger')}</label>
-              <div class="control select">
-                <select
-                  id="r-trigger"
-                  value={rTrigger}
-                  onchange={(e) => selectTrigger(e.currentTarget.value as TriggerType)}
-                  disabled={editingRuleId !== null}
-                >
-                  {#each Object.entries(TRIGGER_LABELS) as [k, label] (k)}
-                    <option value={k}>{label}</option>
-                  {/each}
-                </select>
-                <span class="affix"><Icon name="chevron-down" size={15} /></span>
-              </div>
-            </div>
+            <Select
+              id="r-trigger"
+              label={t('alerts.column.trigger')}
+              value={rTrigger}
+              options={triggerOptions}
+              disabled={editingRuleId !== null}
+              onchange={(v) => selectTrigger(v as TriggerType)}
+            />
 
             {#if needs.monitor}
-              <div class="field">
-                <label class="lbl" for="r-monitor">{t('alerts.column.monitor')}</label>
-                <div class="control select">
-                  <select
-                    id="r-monitor"
-                    bind:value={rMonitor}
-                    disabled={editingRuleId !== null || !projectId}
-                  >
-                    <option value="">{t('alerts.allMonitors')}</option>
-                    {#each monitorOptions as m (m.id)}
-                      <option value={m.id}>{m.name}</option>
-                    {/each}
-                  </select>
-                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
-                </div>
-                {#if !projectId}
-                  <p class="muted small">{t('alerts.pinToMonitor')}</p>
-                {/if}
-              </div>
+              <Select
+                id="r-monitor"
+                label={t('alerts.column.monitor')}
+                bind:value={rMonitor}
+                options={monitorSelectOptions}
+                disabled={editingRuleId !== null || !projectId}
+                hint={!projectId ? t('alerts.pinToMonitor') : undefined}
+              />
             {/if}
 
             {#if needs.threshold}
-              <div class="field">
-                <label class="lbl" for="r-cmp">{t('alerts.column.condition')}</label>
-                <div class="control select">
-                  <select id="r-cmp" bind:value={rComparator}>
-                    <option value="gte">is at least</option>
-                    <option value="gt">{t('prose.alerts.isMoreThan')}</option>
-                    <option value="lte">is at most</option>
-                    <option value="lt">{t('prose.alerts.isLessThan')}</option>
-                    <option value="eq">equals</option>
-                  </select>
-                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
-                </div>
-              </div>
+              <Select
+                id="r-cmp"
+                label={t('alerts.column.condition')}
+                bind:value={rComparator}
+                options={comparatorOptions}
+              />
               <Input
-                label={rTrigger === 'perf_degradation' ? 'Threshold (ms)' : 'Threshold (count)'}
+                label={rTrigger === 'perf_degradation'
+                  ? t('alerts.field.thresholdMs')
+                  : t('alerts.field.thresholdCount')}
                 bind:value={rThreshold}
               />
             {/if}
 
             {#if needs.metric}
-              <div class="field">
-                <label class="lbl" for="r-metric">{t('alerts.column.metric')}</label>
-                <div class="control select">
-                  <select id="r-metric" bind:value={rMetric}>
-                    {#each meta?.metrics ?? ['p95'] as m (m)}
-                      <option value={m}>{m}</option>
-                    {/each}
-                  </select>
-                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
-                </div>
-              </div>
+              <Select
+                id="r-metric"
+                label={t('alerts.column.metric')}
+                bind:value={rMetric}
+                options={metricOptions}
+              />
             {/if}
 
             {#if needs.op}
-              <div class="field">
-                <label class="lbl" for="r-op">{t('alerts.field.opFilter')}</label>
-                <div class="control select">
-                  <select id="r-op" bind:value={rOp}>
-                    <option value="">{t('alerts.field.opAny')}</option>
-                    {#each opChoices as o (o)}
-                      <option value={o}>{opLabel(o)}</option>
-                    {/each}
-                  </select>
-                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
-                </div>
-                <p class="hint">{t('alerts.field.opHint')}</p>
-              </div>
+              <Select
+                id="r-op"
+                label={t('alerts.field.opFilter')}
+                bind:value={rOp}
+                options={[
+                  { value: '', label: t('alerts.field.opAny') },
+                  ...opChoices.map((o) => ({ value: o, label: opLabel(o) })),
+                ]}
+                hint={t('alerts.field.opHint')}
+              />
             {/if}
 
             {#if needs.spike}
@@ -1297,36 +1308,27 @@
             {/if}
 
             {#if needs.env}
-              <div class="field">
-                <label class="lbl" for="r-env">{t('alerts.field.envFilter')}</label>
-                <div class="control select">
-                  <select id="r-env" bind:value={rEnvironment}>
-                    <option value="">{t('alerts.field.envAny')}</option>
-                    {#each environmentChoices as e (e)}
-                      <option value={e}>{e}</option>
-                    {/each}
-                  </select>
-                  <span class="affix"><Icon name="chevron-down" size={15} /></span>
-                </div>
-                <p class="hint">
-                  {environmentOptions.length === 0
-                    ? t('alerts.field.envNone')
-                    : t('alerts.field.optional')}
-                </p>
-              </div>
+              <Select
+                id="r-env"
+                label={t('alerts.field.envFilter')}
+                bind:value={rEnvironment}
+                options={[
+                  { value: '', label: t('alerts.field.envAny') },
+                  ...environmentChoices.map((e) => ({ value: e, label: e })),
+                ]}
+                hint={environmentOptions.length === 0
+                  ? t('alerts.field.envNone')
+                  : t('alerts.field.optional')}
+              />
             {/if}
 
-            <div class="field">
-              <label class="lbl" for="r-sev">{t('alerts.column.severity')}</label>
-              <div class="control select">
-                <select id="r-sev" bind:value={rSeverity}>
-                  <option value="info">{t('alerts.severity.info')}</option>
-                  <option value="warning">{t('alerts.severity.warning')}</option>
-                  <option value="critical">{t('alerts.severity.critical')}</option>
-                </select>
-                <span class="affix"><Icon name="chevron-down" size={15} /></span>
-              </div>
-            </div>
+            <Select
+              id="r-sev"
+              label={t('alerts.column.severity')}
+              value={rSeverity}
+              options={severityOptions}
+              onchange={(v) => (rSeverity = v as AlertSeverity)}
+            />
 
             <Input
               label={t('alerts.field.throttle')}
@@ -1335,18 +1337,18 @@
             />
 
             <div class="span-2">
-              <label class="lbl" for="r-template">{t('alerts.messageTemplate')}</label>
-              <textarea
+              <Textarea
                 id="r-template"
-                class="textarea"
+                label={t('alerts.messageTemplate')}
                 bind:value={rTemplate}
-                rows="3"
                 placeholder={TRIGGER_TEMPLATES[rTrigger]}
-              ></textarea>
+              />
               <p class="hint">
-                {t('alerts.optionalUse')} <code>{'{{variable}}'}</code> placeholders.
+                {t('alerts.optionalUse')} <code>{'{{variable}}'}</code> {t('alerts.placeholders')}
                 {#if meta?.template_vars?.[rTrigger]}
-                  Available: {meta.template_vars[rTrigger].map((v) => `{{${v}}}`).join(', ')}
+                  {t('alerts.availableVars', {
+                    vars: meta.template_vars[rTrigger].map((v) => `{{${v}}}`).join(', '),
+                  })}
                 {/if}
               </p>
             </div>
@@ -1370,7 +1372,7 @@
           </div>
 
           <div class="form-foot">
-            <Button variant="ghost" onclick={closeRuleForm}>{t('common.cancel')}</Button>
+            <Button variant="secondary" onclick={closeRuleForm}>{t('common.cancel')}</Button>
             <Button
               variant="primary"
               loading={savingRule}
@@ -1392,7 +1394,7 @@
         >
           {#snippet action()}
             {#if !showRuleForm && channels.length > 0}
-              <Button variant="primary" lockedReason={writeLock} onclick={openNewRule}>
+              <Button variant="secondary" lockedReason={writeLock} onclick={openNewRule}>
                 {t('alerts.newRule')}
               </Button>
             {/if}
@@ -1440,23 +1442,23 @@
                   {triggerLabel(r.trigger_type)}
                   {#if r.monitor_id}
                     <span class="muted small">
-                      · {monitorOptions.find((m) => m.id === r.monitor_id)?.name ?? 'pinned monitor'}
+                      · {monitorOptions.find((m) => m.id === r.monitor_id)?.name ?? t('alerts.pinnedMonitor')}
                     </span>
                   {/if}
                 </td>
                 <td>
-                  <Badge tone={severityTone(r.severity)} size="sm">{r.severity}</Badge>
+                  <Badge tone={severityTone(r.severity)} size="sm">{severityLabel(r.severity)}</Badge>
                 </td>
-                <td class="num">{r.channel_ids.length}</td>
-                <td class="num">{r.throttle_seconds}s</td>
+                <td class="num">{formatNumber(r.channel_ids.length)}</td>
+                <td class="num">{formatDuration(r.throttle_seconds * 1000)}</td>
                 <td>
                   <Badge tone={r.enabled ? 'success' : 'neutral'} size="sm">
-                    {r.enabled ? 'enabled' : 'disabled'}
+                    {r.enabled ? t('alerts.state.enabled') : t('alerts.state.disabled')}
                   </Badge>
                 </td>
                 <td class="num actions">
                   <Button size="sm" lockedReason={writeLock} onclick={() => toggleRule(r)}>
-                    {r.enabled ? 'Disable' : 'Enable'}
+                    {r.enabled ? t('alerts.disable') : t('alerts.enable')}
                   </Button>
                   <Button size="sm" lockedReason={writeLock} onclick={() => openEditRule(r)}>
                     {t('common.edit')}
@@ -1517,7 +1519,7 @@
           {#snippet children()}
             {#each historyPage.rows as h (h.id)}
               <tr>
-                <td class="nowrap">{fmtTime(h.created_at)}</td>
+                <td class="nowrap"><TimeValue value={h.created_at} /></td>
                 <td>
                   {h.title}
                   {#if h.error}
@@ -1525,8 +1527,8 @@
                   {/if}
                 </td>
                 <td>{channelName(h.channel_id) ?? '—'}</td>
-                <td><Badge tone={statusTone(h.status)} size="sm">{h.status}</Badge></td>
-                <td class="num">{h.attempts}</td>
+                <td><Badge tone={statusTone(h.status)} size="sm">{deliveryLabel(h.status)}</Badge></td>
+                <td class="num">{formatNumber(h.attempts)}</td>
               </tr>
             {/each}
           {/snippet}
@@ -1549,9 +1551,13 @@
   {#if confirmDelete}
     <ConfirmDialog
       open
-      title={`Delete ${confirmDelete.kind}?`}
-      message={`“${confirmDelete.name}” will be removed. This cannot be undone.`}
-      confirmLabel={t('common.delete')}
+      title={confirmDelete.kind === 'channel'
+        ? t('alerts.confirmDelete.channelTitle')
+        : t('alerts.confirmDelete.ruleTitle')}
+      message={t('alerts.confirmDelete.body', { name: confirmDelete.name })}
+      confirmLabel={confirmDelete.kind === 'channel'
+        ? t('alerts.confirmDelete.channelAction')
+        : t('alerts.confirmDelete.ruleAction')}
       danger
       onconfirm={doDelete}
       oncancel={() => (confirmDelete = null)}
@@ -1563,24 +1569,7 @@
   .alerts {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
     gap: 16px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    margin-top: 4px;
-    font-size: 13px;
-    max-width: 62ch;
-  }
-  .controls {
-    display: flex;
-    gap: 8px;
-    align-items: center;
   }
   .tabs {
     display: flex;
@@ -1588,9 +1577,12 @@
     border-bottom: 1px solid var(--border);
   }
   .tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     padding: 8px 14px;
-    font-size: 13.5px;
-    font-weight: 550;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
     background: none;
     border: none;
@@ -1601,26 +1593,11 @@
     color: var(--text);
   }
   .tab.active {
-    color: var(--primary);
+    color: var(--text);
     border-bottom-color: var(--primary);
   }
-  .count {
-    display: inline-block;
-    margin-inline-start: 6px;
-    padding: 1px 6px;
-    border-radius: 999px;
-    background: var(--surface-2);
-    font-size: 11px;
-  }
-  .section-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
   .small {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     max-width: 70ch;
   }
   .form-grid {
@@ -1631,57 +1608,18 @@
   .span-2 {
     grid-column: 1 / -1;
   }
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 550;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
-  }
-  .control.select {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-  .control.select select {
-    width: 100%;
-    appearance: none;
-    padding: 9px 32px 9px 11px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13.5px;
-  }
-  .affix {
-    position: absolute;
-    inset-inline-end: 10px;
-    display: grid;
-    place-items: center;
-    color: var(--text-faint);
-    pointer-events: none;
-  }
-  .textarea {
-    width: 100%;
-    padding: 9px 11px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13.5px;
-    font-family: inherit;
-    resize: vertical;
   }
   .hint {
     margin-top: 5px;
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .hint code {
-    font-size: 11.5px;
+    font-size: var(--text-2xs);
   }
   .form-foot {
     display: flex;
@@ -1701,10 +1639,10 @@
     gap: 7px;
     padding: 6px 11px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--surface);
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     cursor: pointer;
   }
   .chip:hover {
@@ -1716,7 +1654,7 @@
     color: var(--primary);
   }
   .chip-kind {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .chip.selected .chip-kind {
@@ -1733,25 +1671,8 @@
   }
   .err-detail {
     margin-top: 3px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--error);
-  }
-  .err-banner,
-  .ok-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    font-size: 13px;
-  }
-  .err-banner {
-    background: color-mix(in srgb, var(--error) 12%, transparent);
-    color: var(--error);
-  }
-  .ok-banner {
-    background: color-mix(in srgb, var(--success) 12%, transparent);
-    color: var(--success);
   }
 
   @media (max-width: 720px) {

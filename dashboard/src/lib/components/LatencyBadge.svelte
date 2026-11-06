@@ -28,16 +28,16 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     line-height: 1;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
   .lat.md {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .lat.sm {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   .dot {
     width: 7px;

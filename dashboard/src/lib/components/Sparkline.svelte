@@ -12,7 +12,7 @@
     data,
     width = 120,
     height = 32,
-    color = 'var(--primary)',
+    color = 'var(--chart-1)',
     fill = true,
     strokeWidth = 1.5,
   }: Props = $props();

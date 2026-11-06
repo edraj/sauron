@@ -1,12 +1,13 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
-  import { onMount } from 'svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import CodeBlock from '../lib/components/ui/CodeBlock.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon, { type IconName } from '../lib/components/ui/Icon.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
+  import { scrollSpyMargin, topbarOffset } from '../lib/stores/topbar-offset.svelte';
   import { buildDsn, appTypeIcon, appTypeLabel } from '../lib/utils/format';
   import { fetchSchema, type SchemaDefinition } from '../lib/api/schema';
 
@@ -819,7 +820,11 @@ GROUP BY name, op`;
     scrollToId('quickstart');
   }
 
-  onMount(() => {
+  // An effect, not onMount: it reads the bar's measured height, so a bar that
+  // changes height (a phone wraps it to two rows) rebuilds the observer with
+  // the new margin instead of keeping the one it started with.
+  $effect(() => {
+    const rootMargin = scrollSpyMargin(topbarOffset.px);
     const els = sectionIds
       .map((id) => document.getElementById(id))
       .filter((el): el is HTMLElement => el !== null);
@@ -831,7 +836,7 @@ GROUP BY name, op`;
           .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
         if (topMost) activeSection = topMost.target.id;
       },
-      { rootMargin: '-72px 0px -65% 0px', threshold: 0 },
+      { rootMargin, threshold: 0 },
     );
     els.forEach((el) => io.observe(el));
     return () => io.disconnect();
@@ -882,14 +887,7 @@ GROUP BY name, op`;
 {/snippet}
 
   <div class="docs-page">
-    <div class="head">
-      <div>
-        <h1 class="page-title">{t('docs.title')}</h1>
-        <p class="muted sub">
-          {t('docs.subtitle')}
-        </p>
-      </div>
-    </div>
+    <PageHeader title={t('docs.title')} subtitle={t('docs.subtitle')} />
 
     <div class="docs-layout">
       <nav class="docs-nav" aria-label={t('docs.sections')}>
@@ -1712,14 +1710,6 @@ GROUP BY name, op`;
   </div>
 
 <style>
-  .head {
-    margin-bottom: 18px;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-    max-width: 640px;
-  }
   .docs-page {
     /* Was 1120px, which left a third of a wide screen blank while the
        reference tables and code blocks inside were the things being scrolled.
@@ -1745,23 +1735,23 @@ GROUP BY name, op`;
     min-width: 0;
   }
   .doc-sec {
-    scroll-margin-top: calc(var(--topbar-h) + 16px);
+    scroll-margin-top: calc(var(--topbar-offset) + 16px);
   }
 
   /* in-page docs nav (sticky table of contents) */
   .docs-nav {
     position: sticky;
-    top: calc(var(--topbar-h) + 16px);
+    top: calc(var(--topbar-offset) + 16px);
     align-self: start;
-    max-height: calc(100vh - var(--topbar-h) - 32px);
+    max-height: calc(100vh - var(--topbar-offset) - 32px);
     overflow-y: auto;
   }
   .nav-group + .nav-group {
     margin-top: 18px;
   }
   .nav-label {
-    font-size: 11px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--text-faint);
@@ -1784,8 +1774,8 @@ GROUP BY name, op`;
     background: transparent;
     border: 1px solid transparent;
     color: var(--text-muted);
-    font-size: 13px;
-    font-weight: 500;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     cursor: pointer;
     transition: all 0.12s ease;
   }
@@ -1797,7 +1787,7 @@ GROUP BY name, op`;
     color: var(--primary);
     background: var(--primary-soft);
     border-color: var(--primary-border);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 
   /* card header with a leading icon */
@@ -1808,8 +1798,8 @@ GROUP BY name, op`;
     color: var(--text-muted);
   }
   .card-h h3 {
-    font-size: 14.5px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   /* Where this SDK is published. Rendered through Card's `actions` slot, which
@@ -1823,7 +1813,7 @@ GROUP BY name, op`;
     padding: 3px 9px;
     border: 1px solid var(--border);
     border-radius: 999px;
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     text-decoration: none;
     white-space: nowrap;
@@ -1834,7 +1824,7 @@ GROUP BY name, op`;
     color: var(--text);
   }
   .reg-link code {
-    font-size: 11.5px;
+    font-size: var(--text-2xs);
     color: var(--text);
   }
   .reg-on {
@@ -1860,15 +1850,15 @@ GROUP BY name, op`;
     display: inline-flex;
     align-items: center;
     gap: 7px;
-    font-weight: 600;
-    font-size: 13.5px;
+    font-weight: var(--weight-strong);
+    font-size: var(--text-sm);
   }
   .dsn-note {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin-inline-start: auto;
   }
   .dsn-env-hint {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin-top: 10px;
   }
   .dsn-row {
@@ -1883,7 +1873,7 @@ GROUP BY name, op`;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     overflow-x: auto;
     white-space: nowrap;
     color: var(--text);
@@ -1904,7 +1894,7 @@ GROUP BY name, op`;
     flex-shrink: 0;
   }
   .dsn-empty p {
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .dsn-empty a {
     color: var(--primary);
@@ -1927,8 +1917,8 @@ GROUP BY name, op`;
     background: var(--surface-2);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-pill);
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
   }
   .node.key {
@@ -1938,7 +1928,7 @@ GROUP BY name, op`;
     font-family: var(--font-mono);
   }
   .concept-lead {
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     line-height: 1.55;
   }
   .signals {
@@ -1960,10 +1950,10 @@ GROUP BY name, op`;
     display: flex;
     flex-direction: column;
     gap: 2px;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .signal .muted {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     line-height: 1.45;
   }
   .s-ic {
@@ -2002,8 +1992,8 @@ GROUP BY name, op`;
     border-radius: 50%;
     background: var(--primary-soft);
     color: var(--primary);
-    font-size: 12.5px;
-    font-weight: 680;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
   }
   .step-body {
     flex: 1;
@@ -2013,12 +2003,12 @@ GROUP BY name, op`;
     gap: 8px;
   }
   .step-title {
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     margin-top: 3px;
   }
   .step-desc {
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin-top: -4px;
     line-height: 1.5;
   }
@@ -2043,12 +2033,12 @@ GROUP BY name, op`;
     border-top: none;
   }
   .api-sig {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text);
     word-break: break-word;
   }
   .api-desc {
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
 
   /* inline code (within paragraphs) */
@@ -2068,8 +2058,8 @@ GROUP BY name, op`;
      without them. */
   .doc-h4 {
     margin: 18px 0 6px;
-    font-size: 0.875rem;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
 
@@ -2097,13 +2087,13 @@ GROUP BY name, op`;
     display: flex;
     flex-direction: column;
     gap: 7px;
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     line-height: 1.5;
   }
   .mini-steps b {
     color: var(--text);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
   .mini-steps a {
     color: var(--primary);
@@ -2112,14 +2102,14 @@ GROUP BY name, op`;
     text-decoration: underline;
   }
   .fine {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     line-height: 1.55;
     margin-top: 14px;
   }
 
   /* verify */
   .verify-lead {
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     margin-bottom: 12px;
     line-height: 1.5;
   }
@@ -2136,8 +2126,8 @@ GROUP BY name, op`;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     color: var(--text-muted);
-    font-size: 13px;
-    font-weight: 540;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     transition: all 0.13s ease;
   }
   .vl:hover {
@@ -2160,12 +2150,12 @@ GROUP BY name, op`;
     padding-top: 0;
   }
   .ts-q {
-    font-size: 13.5px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     margin-bottom: 4px;
   }
   .ts-a {
-    font-size: 13px;
+    font-size: var(--text-sm);
     line-height: 1.55;
   }
 
@@ -2176,8 +2166,8 @@ GROUP BY name, op`;
     gap: 14px;
     margin-top: 8px;
     color: var(--text-faint);
-    font-size: 11px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     text-transform: uppercase;
     letter-spacing: 0.08em;
   }
@@ -2189,8 +2179,8 @@ GROUP BY name, op`;
     background: var(--border);
   }
   .q-h {
-    font-size: 13px;
-    font-weight: 620;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
     margin: 20px 0 9px;
   }
@@ -2198,7 +2188,7 @@ GROUP BY name, op`;
     margin-top: 4px;
   }
   .q-note {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     line-height: 1.55;
     margin-top: 10px;
   }
@@ -2260,12 +2250,12 @@ GROUP BY name, op`;
     min-width: 0;
   }
   .fl-tx b {
-    font-size: 13.5px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .fl-tx .muted {
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
 
   @media (max-width: 900px) {

@@ -1,0 +1,226 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600&family=Geist+Mono:wght@400;500&display=swap">
+
+<h2>Quiet: the shared parts every page will use</h2>
+<p class="subtitle">These are the pieces that differ from page to page today. Each would be built once and used everywhere. Nothing here is final; tell me what looks wrong.</p>
+
+<div class="qk-fit"><div class="qk-stage">
+<div class="qk">
+
+  <div class="qk-row">
+    <div class="qk-cell wide">
+      <div class="qk-cap">1 · List page header (every list page)</div>
+      <div class="qk-surface">
+        <div class="ph">
+          <div>
+            <h1 class="ph-title">Sessions</h1>
+            <p class="ph-sub">User sessions with their activity, duration and errors over time.</p>
+          </div>
+          <div class="ph-actions">
+            <span class="fresh">Updated just now</span>
+            <span class="ibtn">↻</span>
+            <span class="btn">Export CSV</span>
+            <span class="btn primary">New funnel</span>
+          </div>
+        </div>
+        <p class="qk-rule">Title, one-line subtitle, then on the right: <b>Updated</b> stamp → Refresh → secondary actions → one primary action. Same order, same spot, every page.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="qk-row">
+    <div class="qk-cell wide">
+      <div class="qk-cap">2 · Detail page header (every detail page)</div>
+      <div class="qk-surface">
+        <a class="back">← Exceptions</a>
+        <div class="ph">
+          <div>
+            <div class="dh-title-row"><h1 class="ph-title">TypeError: Cannot read properties of undefined</h1><span class="lvl fatal">Fatal</span></div>
+            <div class="dh-meta"><span class="mono">a3f9c1e2…7b0d</span><span class="copy">Copy</span><span class="sep">·</span><span>First seen Oct 24</span><span class="sep">·</span><span>2,418 events</span><span class="sep">·</span><span>1,102 users</span></div>
+          </div>
+          <div class="ph-actions">
+            <span class="fresh">Updated just now</span>
+            <span class="ibtn">↻</span>
+            <span class="btn">Ignore</span>
+            <span class="btn primary">Resolve</span>
+          </div>
+        </div>
+        <p class="qk-rule">The back link always names the list it returns to. The ID line always has Copy. Everything else matches the list header.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="qk-row three">
+    <div class="qk-cell">
+      <div class="qk-cap">3 · Couldn't load</div>
+      <div class="qk-surface state">
+        <div class="st-icon err">!</div>
+        <div class="st-title">Couldn't load sessions</div>
+        <div class="st-desc">The server took too long to answer. Your data is safe.</div>
+        <span class="btn sm">Retry</span>
+      </div>
+    </div>
+    <div class="qk-cell">
+      <div class="qk-cap">4 · Nothing here yet</div>
+      <div class="qk-surface state">
+        <div class="st-icon">○</div>
+        <div class="st-title">No sessions yet</div>
+        <div class="st-desc">Sessions appear here once your app sends its first event.</div>
+        <span class="btn sm">Set up the SDK</span>
+      </div>
+    </div>
+    <div class="qk-cell">
+      <div class="qk-cap">5 · Loading</div>
+      <div class="qk-surface state skel">
+        <i style="width:62%"></i><i style="width:88%"></i><i style="width:74%"></i><i style="width:81%"></i><i style="width:55%"></i>
+      </div>
+    </div>
+  </div>
+
+  <div class="qk-row two">
+    <div class="qk-cell">
+      <div class="qk-cap">6 · Controls (one height: 32px)</div>
+      <div class="qk-surface ctl-demo">
+        <div class="ctl-line">
+          <span class="ctl">+ Add filter</span>
+          <span class="ctl input">⌕&nbsp; Search sessions…</span>
+        </div>
+        <div class="ctl-line">
+          <span class="ctl select">Last activity <em>▾</em></span>
+          <span class="seg"><b>24h</b><b class="on">7d</b><b>30d</b><b>90d</b><b>Custom</b></span>
+        </div>
+        <div class="ctl-line">
+          <label class="field"><span>Environment name</span><span class="ctl input full">staging</span><small>Lowercase letters, numbers and dashes.</small></label>
+        </div>
+      </div>
+    </div>
+    <div class="qk-cell">
+      <div class="qk-cap">7 · Confirm a destructive action</div>
+      <div class="qk-surface dlg-wrap">
+        <div class="dlg">
+          <div class="dlg-title">Delete source map?</div>
+          <div class="dlg-body">Stack traces for release 3.1.21 will no longer be de-obfuscated. This can't be undone.</div>
+          <div class="dlg-foot"><span class="btn">Cancel</span><span class="btn danger">Delete source map</span></div>
+        </div>
+        <p class="qk-rule">Cancel on the left, the action on the right, named after what it does. Irreversible = red, always confirmed.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="qk-row two">
+    <div class="qk-cell">
+      <div class="qk-cap">8 · Status and level</div>
+      <div class="qk-surface">
+        <div class="tags">
+          <span class="lvl fatal">Fatal</span><span class="lvl error">Error</span><span class="lvl warn">Warning</span><span class="lvl info">Info</span>
+        </div>
+        <div class="tags">
+          <span class="pill">Unresolved</span><span class="pill ok">Resolved</span><span class="pill">Ignored</span><span class="pill up">Up</span><span class="pill down">Down</span>
+        </div>
+        <p class="qk-rule">Level = colored dot + word. Status = quiet pill, color only when it means something. Always human words, never raw values like <code>unresolved</code>.</p>
+      </div>
+    </div>
+    <div class="qk-cell">
+      <div class="qk-cap">9 · Text sizes (33 today → 6)</div>
+      <div class="qk-surface type">
+        <div style="font-size:19px;font-weight:600;letter-spacing:-0.01em">19 · Page title</div>
+        <div style="font-size:15px;font-weight:600">15 · Section title</div>
+        <div style="font-size:13px;font-weight:500">13 · Body, table cells, buttons</div>
+        <div style="font-size:12px;color:#8a8f98">12 · Labels, captions, meta</div>
+        <div style="font-size:22px;font-weight:500">22 · Stat numbers</div>
+        <div style="font-size:11.5px;font-family:'Geist Mono',monospace;color:#8a8f98">11.5 mono · IDs, stack frames</div>
+        <p class="qk-rule">Three weights: 400, 500, 600. Numbers always 1,234 (never 1.2K in tables); dates always the same format.</p>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div></div>
+
+<style>
+  .qk-fit { width: 100%; overflow: hidden; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.25); }
+  .qk-stage { width: 1180px; transform-origin: top left; }
+  .qk, .qk * { box-sizing: border-box; margin: 0; }
+  .qk { background: #0b0c0e; color: #e4e5e8; font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; font-size: 13px; line-height: 1.45; padding: 28px; display: flex; flex-direction: column; gap: 22px; -webkit-font-smoothing: antialiased; }
+  .qk-row { display: grid; gap: 22px; }
+  .qk-row.two { grid-template-columns: 1fr 1fr; }
+  .qk-row.three { grid-template-columns: 1fr 1fr 1fr; }
+  .qk-cap { font-size: 12px; color: #5b606a; margin-bottom: 8px; }
+  .qk-surface { border-top: 1px solid #1d1f23; padding-top: 16px; }
+  .qk-rule { margin-top: 14px; color: #6f747e; font-size: 12px; max-width: 70ch; }
+  .qk-rule b { color: #a6aab3; font-weight: 500; }
+  .qk-rule code, .pill code { font-family: 'Geist Mono', monospace; font-size: 11.5px; color: #a6aab3; }
+
+  .ph { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+  .ph-title { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; }
+  .ph-sub { color: #8a8f98; margin-top: 4px; }
+  .ph-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .fresh { color: #5b606a; font-size: 12px; margin-right: 4px; }
+  .ibtn, .btn { height: 32px; display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; border: 1px solid #26292e; background: #111215; color: #e4e5e8; font-weight: 500; white-space: nowrap; }
+  .ibtn { width: 32px; font-size: 15px; }
+  .btn { padding: 0 12px; }
+  .btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; }
+  .btn.primary { background: #7c83f7; border-color: #7c83f7; color: #fff; }
+  .btn.danger { background: #d9545e; border-color: #d9545e; color: #fff; }
+
+  .back { display: inline-block; color: #8a8f98; font-size: 12.5px; margin-bottom: 10px; }
+  .dh-title-row { display: flex; align-items: center; gap: 10px; }
+  .dh-meta { display: flex; align-items: center; gap: 8px; color: #8a8f98; margin-top: 6px; font-size: 12.5px; }
+  .dh-meta .mono { font-family: 'Geist Mono', monospace; font-size: 12px; color: #a6aab3; }
+  .copy { font-size: 11.5px; padding: 1px 7px; border: 1px solid #26292e; border-radius: 5px; color: #a6aab3; }
+  .sep { color: #3a3e46; }
+
+  .state { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 26px 18px 6px; gap: 6px; min-height: 196px; }
+  .st-icon { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; border: 1px solid #26292e; color: #8a8f98; font-weight: 600; margin-bottom: 4px; }
+  .st-icon.err { color: #ef6b73; border-color: rgba(239,107,115,0.35); }
+  .st-title { font-weight: 600; font-size: 14px; }
+  .st-desc { color: #8a8f98; font-size: 12.5px; max-width: 30ch; margin-bottom: 8px; }
+  .skel { align-items: stretch; gap: 12px; padding-top: 24px; }
+  .skel i { display: block; height: 10px; border-radius: 3px; background: linear-gradient(90deg, #15171a, #1d1f23, #15171a); }
+
+  .ctl-demo { display: flex; flex-direction: column; gap: 12px; }
+  .ctl-line { display: flex; gap: 8px; align-items: center; }
+  .ctl { height: 32px; display: inline-flex; align-items: center; padding: 0 11px; border: 1px solid #26292e; border-radius: 6px; background: #111215; color: #e4e5e8; font-weight: 500; white-space: nowrap; }
+  .ctl.input { flex: 1; color: #5b606a; font-weight: 400; }
+  .ctl.input.full { width: 100%; color: #e4e5e8; }
+  .ctl.select em { font-style: normal; color: #5b606a; margin-left: 10px; font-size: 10px; }
+  .seg { display: inline-flex; height: 32px; padding: 3px; gap: 2px; border: 1px solid #26292e; border-radius: 6px; background: #111215; }
+  .seg b { display: inline-flex; align-items: center; padding: 0 10px; border-radius: 4px; font-weight: 500; color: #8a8f98; font-size: 12px; }
+  .seg b.on { background: #1f2126; color: #f2f3f5; }
+  .field { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+  .field > span:first-child { font-size: 12px; color: #a6aab3; font-weight: 500; }
+  .field small { font-size: 12px; color: #5b606a; }
+
+  .dlg-wrap { padding-top: 18px; }
+  .dlg { background: #111215; border: 1px solid #26292e; border-radius: 8px; padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,0.5); }
+  .dlg-title { font-weight: 600; font-size: 15px; }
+  .dlg-body { color: #8a8f98; margin-top: 6px; }
+  .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+  .tags { display: flex; gap: 14px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .lvl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #e4e5e8; font-weight: 500; }
+  .lvl::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--c); }
+  .lvl.fatal { --c: #e86a9a; } .lvl.error { --c: #ef6b73; } .lvl.warn { --c: #e2a85a; } .lvl.info { --c: #5cb0e6; }
+  .pill { font-size: 12px; padding: 1px 8px; border-radius: 5px; background: #17191d; color: #a6aab3; border: 1px solid #1f2126; }
+  .pill.ok, .pill.up { color: #4cb782; background: rgba(76,183,130,0.1); border-color: rgba(76,183,130,0.2); }
+  .pill.down { color: #ef6b73; background: rgba(239,107,115,0.1); border-color: rgba(239,107,115,0.2); }
+  .type { display: flex; flex-direction: column; gap: 8px; }
+</style>
+
+<script>
+  (function () {
+    function fit() {
+      document.querySelectorAll('.qk-fit').forEach(function (box) {
+        var stage = box.firstElementChild;
+        if (!box.clientWidth) return;
+        var s = Math.min(1, box.clientWidth / 1180);
+        stage.style.transform = 'scale(' + s + ')';
+        box.style.height = (stage.scrollHeight * s) + 'px';
+      });
+    }
+    fit();
+    window.addEventListener('resize', fit);
+    if (window.ResizeObserver) new ResizeObserver(fit).observe(document.body);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+  })();
+</script>

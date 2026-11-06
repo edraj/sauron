@@ -39,6 +39,8 @@
  * the first place.
  */
 
+import { t } from '../i18n';
+
 /** What `() => import('./pages/X.svelte')` resolves to. */
 export type RouteChunkLoader<T> = () => Promise<T>;
 
@@ -57,7 +59,7 @@ export type RouteChunkOutcome<T> =
 export function chunkErrorMessage(err: unknown): string {
   if (err instanceof Error && err.message.trim() !== '') return err.message;
   if (typeof err === 'string' && err.trim() !== '') return err;
-  return 'The page could not be downloaded.';
+  return t('ui.route.chunkFailed');
 }
 
 /**

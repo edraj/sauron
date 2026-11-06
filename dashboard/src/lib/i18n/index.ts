@@ -35,6 +35,20 @@ export function t(key: MessageKey, params?: Record<string, string | number>): st
 }
 
 /**
+ * The words for a wire value the API speaks in (`resolved`, `db_contention`,
+ * `succeeded`…): translated when `map` knows it, shown exactly as sent when it
+ * does not — a value the server adds before the dashboard learns it stays
+ * readable rather than vanishing.
+ *
+ * Own-property lookup only: the value is server input, and a plain
+ * `map[value]` resolves `constructor` to Object.prototype's. Call it from
+ * markup or a `$derived` so it follows a language switch.
+ */
+export function labelFor(map: Record<string, MessageKey>, value: string): string {
+  return Object.prototype.hasOwnProperty.call(map, value) ? t(map[value]) : value;
+}
+
+/**
  * Translate a count-dependent string, selecting the grammatical form with
  * `Intl.PluralRules`.
  *

@@ -1,4 +1,5 @@
 import type { AccountSession } from './index';
+import { t } from '../i18n';
 
 /** Longest raw user-agent string rendered before it is elided. */
 const MAX_RAW_UA = 60;
@@ -22,12 +23,12 @@ function isLive(s: AccountSession): boolean {
 export function describeSession(s: AccountSession): string {
   const browser = clean(s.browser);
   const os = clean(s.os);
-  if (browser && os) return `${browser} on ${os}`;
+  if (browser && os) return t('account.sessions.browserOnOs', { browser, os });
   if (browser) return browser;
   if (os) return os;
   const raw = clean(s.user_agent);
   if (raw) return raw.length > MAX_RAW_UA ? `${raw.slice(0, MAX_RAW_UA)}…` : raw;
-  return 'Unknown device';
+  return t('devices.unknownDevice');
 }
 
 // `sortSessions` used to live here — current session first, then most recently

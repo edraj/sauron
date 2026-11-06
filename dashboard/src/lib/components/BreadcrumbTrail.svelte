@@ -77,7 +77,7 @@
 <style>
   .empty {
     padding: 8px 2px;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .trail {
     list-style: none;
@@ -135,12 +135,12 @@
     flex-wrap: wrap;
   }
   .cat {
-    font-size: 12.5px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .type-chip {
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     background: var(--surface-2);
     border: 1px solid var(--border);
@@ -148,12 +148,12 @@
     border-radius: var(--radius-pill);
   }
   .time {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     margin-inline-start: auto;
   }
   .summary {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     margin-top: 2px;
     word-break: break-word;

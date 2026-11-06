@@ -1,4 +1,5 @@
 import type { ScopeType } from './index';
+import { formatNumber, t, type MessageKey } from '../i18n';
 
 /**
  * The pure selection model behind the org/project/app scope tree.
@@ -127,8 +128,8 @@ export function isEmptySelection(sel: ScopeSelection): boolean {
 }
 
 /**
- * The one-line English summary of a selection ("Full access to Acme",
- * "2 projects, 1 app").
+ * The one-line summary of a selection ("Full access to Acme", "2 projects,
+ * 1 app"), in the active language — call it from a `$derived` or markup.
  *
  * Lives here rather than inline in ScopeTree so it is testable at all — the
  * dashboard has no DOM test environment, so a component-local `$derived` could
@@ -142,17 +143,28 @@ export function describeSelection(
   projectOfApp?: Record<string, string>,
   appOfEnv?: Record<string, string>,
 ): string {
-  if (isEmptySelection(sel)) return 'Nothing selected yet.';
-  if (sel.org) return `Full access to ${orgName}`;
+  if (isEmptySelection(sel)) return t('scope.summary.none');
+  if (sel.org) return t('scope.summary.fullAccess', { org: orgName });
   const scopes = selectionToScopes(sel, orgId, projectOfApp, appOfEnv);
   const projectCount = scopes.filter((s) => s.scope_type === 'project').length;
   const envCount = scopes.filter((s) => s.scope_type === 'env').length;
   const appCount = scopes.length - projectCount - envCount;
   const parts: string[] = [];
-  if (projectCount) parts.push(`${projectCount} project${projectCount === 1 ? '' : 's'}`);
-  if (appCount) parts.push(`${appCount} app${appCount === 1 ? '' : 's'}`);
-  if (envCount) parts.push(`${envCount} environment${envCount === 1 ? '' : 's'}`);
-  return parts.join(', ');
+  if (projectCount) {
+    parts.push(countLabel(projectCount, 'scope.summary.projectOne', 'scope.summary.projectMany'));
+  }
+  if (appCount) parts.push(countLabel(appCount, 'scope.summary.appOne', 'scope.summary.appMany'));
+  if (envCount) parts.push(countLabel(envCount, 'scope.summary.envOne', 'scope.summary.envMany'));
+  return parts.join(t('scope.summary.separator'));
+}
+
+/**
+ * "1 app" / "3 apps": the `one` key for exactly one, `many` otherwise, with the
+ * number formatted for the UI locale. Shared by the summary above and the
+ * tree's per-row hints.
+ */
+export function countLabel(n: number, one: MessageKey, many: MessageKey): string {
+  return t(n === 1 ? one : many, { n: formatNumber(n) });
 }
 
 /**

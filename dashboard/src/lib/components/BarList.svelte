@@ -70,13 +70,13 @@
     transition: width 0.3s ease;
   }
   .bl-row.interactive:hover .fill {
-    background: color-mix(in srgb, var(--primary) 22%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 22%, transparent);
   }
   .bl-row.selected {
     border-color: var(--primary-border);
   }
   .bl-row.selected .fill {
-    background: color-mix(in srgb, var(--primary) 26%, transparent);
+    background: color-mix(in srgb, var(--chart-1) 26%, transparent);
   }
   .name,
   .count {
@@ -84,15 +84,15 @@
     z-index: 1;
   }
   .name {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .count {
-    font-size: 12.5px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     color: var(--text-muted);
     flex-shrink: 0;
   }

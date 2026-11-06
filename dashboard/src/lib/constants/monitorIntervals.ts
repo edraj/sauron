@@ -2,29 +2,46 @@
 // backend's `sauron-core::MONITOR_INTERVAL_PRESETS`; the API rejects any value
 // not in this set, so keep the two in sync.
 
+import { t, type MessageKey } from '../i18n';
+
 export interface IntervalPreset {
   seconds: number;
-  label: string;
+  /**
+   * Catalog key for the human label. A key, not a string: this list is a
+   * module-level constant, and a `t()` call here would freeze the language at
+   * import time. Translate with `intervalLabel` where it renders.
+   */
+  labelKey: MessageKey;
 }
 
 export const MONITOR_INTERVALS: IntervalPreset[] = [
-  { seconds: 1, label: '1 second' },
-  { seconds: 5, label: '5 seconds' },
-  { seconds: 15, label: '15 seconds' },
-  { seconds: 30, label: '30 seconds' },
-  { seconds: 60, label: '1 minute' },
-  { seconds: 180, label: '3 minutes' },
-  { seconds: 300, label: '5 minutes' },
-  { seconds: 900, label: '15 minutes' },
-  { seconds: 1800, label: '30 minutes' },
-  { seconds: 3600, label: '1 hour' },
-  { seconds: 10800, label: '3 hours' },
-  { seconds: 21600, label: '6 hours' },
-  { seconds: 43200, label: '12 hours' },
-  { seconds: 86400, label: '24 hours' },
+  { seconds: 1, labelKey: 'monitor.interval.1s' },
+  { seconds: 5, labelKey: 'monitor.interval.5s' },
+  { seconds: 15, labelKey: 'monitor.interval.15s' },
+  { seconds: 30, labelKey: 'monitor.interval.30s' },
+  { seconds: 60, labelKey: 'monitor.interval.1m' },
+  { seconds: 180, labelKey: 'monitor.interval.3m' },
+  { seconds: 300, labelKey: 'monitor.interval.5m' },
+  { seconds: 900, labelKey: 'monitor.interval.15m' },
+  { seconds: 1800, labelKey: 'monitor.interval.30m' },
+  { seconds: 3600, labelKey: 'monitor.interval.1h' },
+  { seconds: 10800, labelKey: 'monitor.interval.3h' },
+  { seconds: 21600, labelKey: 'monitor.interval.6h' },
+  { seconds: 43200, labelKey: 'monitor.interval.12h' },
+  { seconds: 86400, labelKey: 'monitor.interval.24h' },
 ];
 
-/** Human label for a stored interval; falls back to `${seconds}s` for legacy values. */
+/** A preset's label in the active language. Call at render time. */
+export function intervalLabel(preset: IntervalPreset): string {
+  return t(preset.labelKey);
+}
+
+/**
+ * Human label for a stored interval; falls back to `${seconds}s` for legacy
+ * values (`s` is a unit symbol, left as is in every locale). Call at render
+ * time.
+ */
 export function formatInterval(seconds: number): string {
-  return MONITOR_INTERVALS.find((i) => i.seconds === seconds)?.label ?? `${seconds}s`;
+  const preset = MONITOR_INTERVALS.find((i) => i.seconds === seconds);
+  return preset ? intervalLabel(preset) : `${seconds}s`;
 }

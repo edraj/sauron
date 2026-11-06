@@ -113,32 +113,28 @@
 
 <style>
   /*
-   * A footer BAR, not a row floated under the table.
-   *
-   * The old rule was `padding: 10px 2px 0` with no border, which read as
-   * whatever sat above it and put the controls at a 2px inset that lined up
-   * with nothing. The 18px here is `Card`'s own `card-head` inset, so inside a
-   * `padding="none"` card — what every table view uses — the pager's controls
-   * sit on the same vertical line as the card's title, and the border-top
-   * mirrors `card-head`'s border-bottom.
+   * A footer bar under the table: one hairline above it, controls on the
+   * page's text edge. The 2px inset is `DataTable`'s own outer-column inset,
+   * so the count caption lines up with the first column and the Next button
+   * with the last.
    */
   .pager {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 12px 18px;
+    padding: 10px 2px;
     border-top: 1px solid var(--border);
     /*
      * Fixed height so the bar does not resize when `label` is null — which is
      * the whole duration of every page move, since a count that describes rows
      * no longer on screen is not a count the caller can stand behind.
      */
-    min-height: 56px;
+    min-height: 48px;
     box-sizing: border-box;
   }
   .range {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
   .nav {
@@ -151,21 +147,25 @@
     gap: 6px;
     align-items: center;
   }
+  /* `Button` secondary at `sm`: the control surface, a `--border-strong`
+     edge, 28px tall. The current page takes the segmented control's
+     selected fill, so "where am I" reads the same as every other picker. */
   .pg {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    padding: 6px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    height: 28px;
+    padding: 0 10px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
     color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 550;
-    transition: color 0.12s ease, border-color 0.12s ease;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    transition: color 0.12s ease, background-color 0.12s ease;
   }
   .pg.num {
-    padding: 6px 10px;
+    padding: 0 10px;
     /*
      * Sized to the widest page number, not to this button's own. `1ch` is the
      * zero glyph's advance and `tabular-nums` makes every digit share it (which
@@ -184,12 +184,11 @@
   }
   .pg:hover:not(:disabled, .active, .gap) {
     color: var(--text);
-    border-color: var(--border-strong);
+    background: var(--surface-2);
   }
   .pg.active {
     background: var(--surface-3);
     color: var(--text);
-    border-color: var(--border-strong);
     cursor: default;
   }
   .pg:disabled {
@@ -201,7 +200,7 @@
    * the strip stays an even grid and nothing in it looks clickable that is not.
    */
   .pg.gap {
-    padding: 6px 10px;
+    padding: 0 10px;
     min-width: calc(var(--pg-digits, 1) * 1ch + 23px);
     justify-content: center;
     background: transparent;
@@ -210,7 +209,7 @@
   }
   .compact {
     display: none;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     padding: 0 4px;
   }

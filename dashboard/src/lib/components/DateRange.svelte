@@ -94,49 +94,50 @@
 {/if}
 
 <style>
-  /* `--control-h` tall like every other toolbar control: 3px inset + 28px
-     pills + 1px border. It was 41px, five taller than the Refresh button it
-     sits beside, which is the kind of gap that reads as a mistake without
-     anyone being able to say why. */
+  /* Drawn exactly like `ui/SegmentedControl`: a 3px inset track on the
+     control surface, `--control-h` tall, the selected segment on
+     `--surface-3`. Not rendered THROUGH it because the Custom chip is not a
+     plain segment — it carries an icon, anchors the calendar popover, and a
+     second click on it while it is already selected must reopen the picker,
+     which a radio segment ignores by design. */
   .ranges {
     display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    min-height: var(--control-h);
+    align-items: stretch;
+    height: var(--control-h);
     padding: 3px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    gap: 2px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
+    flex-shrink: 0;
   }
   .range {
-    height: 28px;
-    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 10px;
     border: none;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    border-radius: var(--radius-sm);
-    transition: color 0.13s ease, background 0.13s ease;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    white-space: nowrap;
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .range:hover {
     color: var(--text);
   }
   .range.active {
-    background: var(--surface);
+    background: var(--surface-3);
     color: var(--text);
-    box-shadow: var(--shadow-sm);
   }
   .custom {
-    display: inline-flex;
-    align-items: center;
     gap: 5px;
     /* The label grows with the selection ("July 2026"), so it needs a ceiling
        or a long custom span pushes the rest of the toolbar off-screen. */
     max-width: 180px;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
   }
   .cal {
     display: inline-flex;

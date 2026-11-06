@@ -77,7 +77,7 @@
         ? error.exception_value
           ? `${error.exception_type}: ${error.exception_value}`
           : error.exception_type
-        : (error.message ?? 'Error')
+        : (error.message ?? t('level.error'))
       : '',
   );
 
@@ -180,8 +180,8 @@
       {/if}
 
       <!-- Every payload section folds (native `<details>`, open by default),
-           and Contexts / Additional data stack full-width like the detail
-           page's cards instead of splitting one row — their values run long. -->
+           and Contexts / Additional data share one row, as the issue page's
+           cards do; either one alone takes the full width. -->
       {#if hasStack}
         <details class="qv-section" open>
           <summary class="qv-section-head">
@@ -220,28 +220,32 @@
             <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
             <span class="section-label">{t('ui.section.context')}</span>
           </summary>
-          <KeyValueList data={error.context} emptyLabel="No context" />
+          <KeyValueList data={error.context} emptyLabel={t('issueQuickView.noContext')} />
         </details>
       {/if}
 
-      {#if hasContexts}
-        <details class="qv-section" open>
-          <summary class="qv-section-head">
-            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
-            <span class="section-label">{t('ui.section.contexts')}</span>
-          </summary>
-          <JsonTree value={error.contexts} name="contexts" expandTo={2} />
-        </details>
-      {/if}
+      {#if hasContexts || hasExtra}
+        <div class="qv-pair">
+          {#if hasContexts}
+            <details class="qv-section" open>
+              <summary class="qv-section-head">
+                <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+                <span class="section-label">{t('ui.section.contexts')}</span>
+              </summary>
+              <JsonTree value={error.contexts} name="contexts" expandTo={2} />
+            </details>
+          {/if}
 
-      {#if hasExtra}
-        <details class="qv-section" open>
-          <summary class="qv-section-head">
-            <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
-            <span class="section-label">{t('ui.section.extra')}</span>
-          </summary>
-          <JsonTree value={error.extra} name="extra" expandTo={2} />
-        </details>
+          {#if hasExtra}
+            <details class="qv-section" open>
+              <summary class="qv-section-head">
+                <span class="qv-chev"><Icon name="chevron-down" size={13} /></span>
+                <span class="section-label">{t('ui.section.extra')}</span>
+              </summary>
+              <JsonTree value={error.extra} name="extra" expandTo={2} />
+            </details>
+          {/if}
+        </div>
       {/if}
     </div>
   {/if}
@@ -265,8 +269,8 @@
   }
   .qv-title {
     margin: 0;
-    font-size: 15px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     /* Arbitrary exception text in a fixed-width dialog: wrap rather than push
        the close button off the header. */
     word-break: break-word;
@@ -277,7 +281,7 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .sep {
@@ -292,8 +296,8 @@
     border: none;
     padding: 0;
     color: var(--primary);
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
   }
   .more:hover {
     text-decoration: underline;
@@ -319,8 +323,8 @@
       background 0.12s ease;
   }
   .qv-link:hover {
-    border-color: var(--primary-border);
-    background: var(--primary-soft);
+    border-color: var(--border-strong);
+    background: var(--surface-3);
   }
   .ql-icon {
     display: grid;
@@ -337,9 +341,7 @@
     flex: 1;
   }
   .ql-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .ql-value,
@@ -349,14 +351,31 @@
     white-space: nowrap;
   }
   .ql-value {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .ql-extra {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .qv-section {
     min-width: 0;
+  }
+  .qv-pair {
+    display: flex;
+    gap: 18px;
+    align-items: flex-start;
+  }
+  .qv-pair > .qv-section {
+    flex: 1 1 0;
+  }
+  @media (max-width: 720px) {
+    .qv-pair {
+      flex-direction: column;
+    }
+    .qv-pair > .qv-section {
+      flex: none;
+      width: 100%;
+    }
   }
   .qv-section[open] > .qv-section-head {
     margin-bottom: 8px;
@@ -383,19 +402,9 @@
   :global([dir='rtl']) .qv-section:not([open]) .qv-chev {
     transform: rotate(90deg);
   }
-  .section-label {
-    font-size: 11px;
-    font-weight: 620;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-muted);
-  }
   .qv-tags {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-  }
-  .faint {
-    color: var(--text-faint);
   }
 </style>

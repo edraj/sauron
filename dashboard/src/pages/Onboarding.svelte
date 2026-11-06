@@ -2,7 +2,9 @@
   import { t } from '../lib/i18n';
   import { onMount, onDestroy } from 'svelte';
   import { push } from 'svelte-spa-router';
+  import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import CodeBlock from '../lib/components/ui/CodeBlock.svelte';
@@ -44,6 +46,40 @@
   );
 
   const step = $derived(!project ? 1 : !app ? 2 : 3);
+
+  // The card's heading and lead line, per step. The project and app names used
+  // to sit in an accent-coloured span inside the h1; they are plain text now,
+  // since the accent is not for headings.
+  const heading = $derived(
+    step === 1
+      ? t('auth.onboarding.createProject')
+      : step === 2
+        ? t('auth.onboarding.addAppTo', { project: project?.name ?? '' })
+        : t('auth.onboarding.connectApp', { app: app?.name ?? '' }),
+  );
+  const lead = $derived(
+    step === 1
+      ? t('auth.onboarding.projectHelp')
+      : step === 2
+        ? t('auth.onboarding.appHelp')
+        : t('auth.onboarding.connectHelp'),
+  );
+  const stepLabel = $derived(
+    step === 1
+      ? t('auth.onboarding.step1')
+      : step === 2
+        ? t('auth.onboarding.step2')
+        : t('auth.onboarding.step3'),
+  );
+  // Presence flags, not counts: the API does an existence check so polling
+  // this every few seconds need not scan every partition.
+  const arriving = $derived(
+    firstEvent.errors && firstEvent.events
+      ? t('auth.onboarding.arriving.both')
+      : firstEvent.errors
+        ? t('auth.onboarding.arriving.errors')
+        : t('auth.onboarding.arriving.events'),
+  );
 
   // projects.rs create_project is `authorize_org(PROJECT_CREATE)`; apps.rs
   // create_app is `authorize_project(APP_CREATE)`. The two are separate grants,
@@ -144,6 +180,8 @@
     }
   }
 
+  // A button, not a link: signing out is an action. As a link, "open in new
+  // tab" skipped the handler and opened /login while still signed in.
   async function signOut() {
     await authStore.logout();
     sessionStore.reset();
@@ -151,232 +189,126 @@
   }
 </script>
 
-<div class="ob">
-  <header class="ob-top">
-    <div class="brand">
-      <span class="mark" aria-hidden="true"><span class="eye"></span></span>
-      <span class="name">Sauron</span>
-    </div>
-    <button class="link" onclick={signOut}>{t('auth.signOut')}</button>
-  </header>
-
-  <div class="ob-body">
-    {#if step === 1}
-      <div class="intro">
-        <span class="step-pill">{t('auth.onboarding.step1')}</span>
-        <h1>{t('auth.onboarding.createProject')}</h1>
-        <p class="lead">
-          {t('auth.onboarding.projectHelp')}
-        </p>
+<!-- The steps live inside AuthLayout's wide card: one form per step, and the
+     connect step's DSN, snippet and first-event status as sections of it. The
+     step counter and the only exit (sign out) share the footer line. -->
+<AuthLayout title={heading} subtitle={lead} width="md">
+  {#if step === 1}
+    <form class="form" onsubmit={handleCreateProject}>
+      {#if projectError}<InlineNotice tone="error">{projectError}</InlineNotice>{/if}
+      <Input
+        label={t('auth.onboarding.projectName')}
+        bind:value={projectName}
+        placeholder={t('auth.placeholder.projectName')}
+        required
+      />
+      <Button
+        type="submit"
+        variant="primary"
+        size="lg"
+        loading={creatingProject}
+        lockedReason={createProjectLock}
+        fullWidth
+      >
+        {t('auth.onboarding.createProjectBtn')}
+      </Button>
+    </form>
+  {:else if step === 2}
+    <form class="form" onsubmit={handleCreateApp}>
+      {#if appError}<InlineNotice tone="error">{appError}</InlineNotice>{/if}
+      <Input
+        label={t('auth.onboarding.appName')}
+        bind:value={appName}
+        placeholder={t('auth.placeholder.appName')}
+        required
+      />
+      <div class="field">
+        <span class="lbl" id="ob-app-type">{t('auth.onboarding.appType')}</span>
+        <div class="type-grid" role="group" aria-labelledby="ob-app-type">
+          {#each APP_TYPES as opt (opt.value)}
+            <button
+              type="button"
+              class="type-opt"
+              class:selected={appType === opt.value}
+              aria-pressed={appType === opt.value}
+              onclick={() => (appType = opt.value as AppType)}
+            >
+              <Icon name={appTypeIcon(opt.value)} size={18} />
+              <span class="t-label">{opt.label}</span>
+            </button>
+          {/each}
+        </div>
       </div>
-      <Card>
-        <form class="create-form" onsubmit={handleCreateProject}>
-          {#if projectError}<div class="alert">{projectError}</div>{/if}
-          <Input label={t('auth.onboarding.projectName')} bind:value={projectName} placeholder={t('auth.placeholder.projectName')} required />
-          <Button
-            type="submit"
-            variant="primary"
-            size="lg"
-            loading={creatingProject}
-            lockedReason={createProjectLock}
-            fullWidth
-          >
-            {t('auth.onboarding.createProjectBtn')}
-          </Button>
-        </form>
-      </Card>
-    {:else if step === 2}
-      <div class="intro">
-        <span class="step-pill">{t('auth.onboarding.step2')}</span>
-        <h1>{t('auth.onboarding.addApp')} <span class="hl">{project?.name}</span></h1>
-        <p class="lead">{t('auth.onboarding.appHelp')}</p>
-      </div>
-      <Card>
-        <form class="create-form" onsubmit={handleCreateApp}>
-          {#if appError}<div class="alert">{appError}</div>{/if}
-          <Input label={t('auth.onboarding.appName')} bind:value={appName} placeholder={t('auth.placeholder.appName')} required />
-          <div class="field">
-            <span class="lbl">{t('auth.onboarding.appType')}</span>
-            <div class="type-grid">
-              {#each APP_TYPES as opt (opt.value)}
-                <button
-                  type="button"
-                  class="type-opt"
-                  class:selected={appType === opt.value}
-                  onclick={() => (appType = opt.value as AppType)}
-                >
-                  <span class="t-icon"><Icon name={appTypeIcon(opt.value)} size={18} /></span>
-                  <span class="t-label">{opt.label}</span>
-                </button>
-              {/each}
-            </div>
-          </div>
-          <Button
-            type="submit"
-            variant="primary"
-            size="lg"
-            loading={creatingApp}
-            lockedReason={createAppLock}
-            fullWidth
-          >
-            {t('auth.onboarding.createApp')}
-          </Button>
-        </form>
-      </Card>
-    {:else if app}
-      <div class="intro">
-        <span class="step-pill">{t('auth.onboarding.step3')}</span>
-        <h1>{t('auth.onboarding.connect')} <span class="hl"><Icon name={appTypeIcon(app.app_type)} size={18} /> {app.name}</span></h1>
-        <p class="lead">
-          {t('auth.onboarding.connectHelp')}
-        </p>
-      </div>
-
-      {#if dsn}
-        <Card title={t('auth.onboarding.yourDsn')}>
+      <Button
+        type="submit"
+        variant="primary"
+        size="lg"
+        loading={creatingApp}
+        lockedReason={createAppLock}
+        fullWidth
+      >
+        {t('auth.onboarding.createApp')}
+      </Button>
+    </form>
+  {:else if app}
+    <div class="connect">
+      <Card title={t('auth.onboarding.yourDsn')}>
+        {#if dsn}
           <div class="dsn-row">
             <code class="dsn mono">{dsn}</code>
             <CopyButton value={dsn} />
           </div>
-        </Card>
+        {:else}
+          <div class="dsn-loading">
+            <Spinner size={16} />
+            <span class="muted">{t('auth.onboarding.settingUp')}</span>
+          </div>
+        {/if}
+      </Card>
 
+      {#if dsn}
         <Card title={t('auth.onboarding.installSnippet')}>
           <CodeBlock code={snippet} language="javascript" />
         </Card>
-      {:else}
-        <Card title={t('auth.onboarding.yourDsn')}>
-          <div class="dsn-loading">
-            <Spinner size={18} />
-            <span class="muted">{t('auth.onboarding.settingUp')}</span>
-          </div>
-        </Card>
       {/if}
 
-      <div class="waiting" class:done={firstEvent.received}>
-        {#if firstEvent.received}
-          <div class="w-icon done-icon"><Icon name="check" size={16} /></div>
-          <div class="w-text">
-            <strong>{t('auth.onboarding.received')}</strong>
-            <!-- Presence flags, not counts: the API does an existence check so
-                 polling this every few seconds need not scan every partition. -->
-            <span class="muted">
-              {#if firstEvent.errors && firstEvent.events}
-                Errors and analytics events are arriving.
-              {:else if firstEvent.errors}
-                Errors are arriving.
-              {:else}
-                Analytics events are arriving.
-              {/if}
-            </span>
-          </div>
-          <Button variant="primary" onclick={() => push('/issues')}>
-            <span class="btn-inline">{t('auth.onboarding.goToIssues')} <Icon name="arrow-right" size={14} /></span>
-          </Button>
-        {:else}
-          <div class="w-icon"><Spinner size={18} /></div>
+      {#if firstEvent.received}
+        <InlineNotice tone="success">
+          <strong>{t('auth.onboarding.received')}</strong>
+          <span class="muted">{arriving}</span>
+          {#snippet action()}
+            <Button variant="primary" size="sm" onclick={() => push('/issues')}>
+              <span class="btn-inline">
+                {t('auth.onboarding.goTo', { page: t('nav.issues') })}
+                <Icon name="arrow-right" size={14} />
+              </span>
+            </Button>
+          {/snippet}
+        </InlineNotice>
+      {:else}
+        <div class="waiting">
+          <Spinner size={16} />
           <div class="w-text">
             <strong>{t('auth.onboarding.waiting')}</strong>
             <span class="muted">{t('auth.onboarding.polling')}</span>
           </div>
-          <button class="link" onclick={() => push('/issues')}>{t('auth.onboarding.skip')}</button>
-        {/if}
-      </div>
-    {/if}
-  </div>
-</div>
+          <Button variant="ghost" size="sm" onclick={() => push('/issues')}>
+            {t('auth.onboarding.skip')}
+          </Button>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#snippet footer()}
+    <span>{stepLabel}</span>
+    <span class="sep" aria-hidden="true">·</span>
+    <Button variant="ghost" size="sm" onclick={signOut}>{t('auth.signOut')}</Button>
+  {/snippet}
+</AuthLayout>
 
 <style>
-  .ob {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
-  .ob-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .mark {
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-    background: radial-gradient(circle at 50% 45%, #ffe08a 0%, #f5a623 45%, #e0524a 100%);
-    display: grid;
-    place-items: center;
-  }
-  .eye {
-    width: 5px;
-    height: 15px;
-    background: #0a0c10;
-    border-radius: 50%;
-  }
-  .name {
-    font-weight: 700;
-    font-size: 16px;
-  }
-  .link {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-  }
-  .link:hover {
-    color: var(--text);
-    text-decoration: underline;
-  }
-  .ob-body {
-    flex: 1;
-    width: 100%;
-    max-width: 620px;
-    margin: 0 auto;
-    padding: 40px 22px 64px;
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    animation: fade-in 0.25s ease;
-  }
-  .intro {
-    margin-bottom: 4px;
-  }
-  .step-pill {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--primary);
-    background: var(--primary-soft);
-    padding: 4px 10px;
-    border-radius: var(--radius-pill);
-    margin-bottom: 12px;
-  }
-  .intro h1 {
-    font-size: 25px;
-  }
-  .hl {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--primary);
-  }
-  .btn-inline {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .lead {
-    color: var(--text-muted);
-    margin-top: 8px;
-    font-size: 14px;
-  }
-  .create-form {
+  .form {
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -384,11 +316,11 @@
   .field {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
   }
   .type-grid {
@@ -402,98 +334,88 @@
     align-items: center;
     gap: 6px;
     padding: 12px 8px;
-    background: var(--surface-2);
+    background: none;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     color: var(--text-muted);
-    transition: all 0.13s ease;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      border-color 0.12s ease,
+      background-color 0.12s ease;
   }
   .type-opt:hover {
-    border-color: var(--text-faint);
+    background: var(--surface-2);
     color: var(--text);
   }
   .type-opt.selected {
     border-color: var(--primary);
     background: var(--primary-soft);
-    color: var(--primary);
-  }
-  .t-icon {
-    font-size: 20px;
-    line-height: 1;
+    color: var(--text);
   }
   .t-label {
-    font-size: 12px;
-    font-weight: 540;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
   }
-  .alert {
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-    color: var(--error);
-    font-size: 13px;
+  .connect {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
   }
   .dsn-row {
     display: flex;
     align-items: center;
     gap: 12px;
   }
-  .dsn-loading {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 13px;
-  }
   .dsn {
     flex: 1;
-    padding: 10px 12px;
+    min-width: 0;
+    padding: 8px 10px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 12.5px;
+    font-size: var(--text-2xs);
     overflow-x: auto;
     white-space: nowrap;
     color: var(--text);
   }
+  .dsn-loading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .muted {
+    color: var(--text-muted);
+  }
+  .btn-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
   .waiting {
     display: flex;
     align-items: center;
-    gap: 14px;
-    padding: 16px 18px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-  }
-  .waiting.done {
-    border-color: color-mix(in srgb, var(--success) 45%, transparent);
-    background: color-mix(in srgb, var(--success-soft) 60%, var(--surface));
-  }
-  .w-icon {
-    width: 34px;
-    height: 34px;
-    display: grid;
-    place-items: center;
-    border-radius: 50%;
-    background: var(--surface-2);
-    flex-shrink: 0;
-  }
-  .done-icon {
-    background: var(--success);
-    color: #fff;
-    font-weight: 700;
+    gap: 12px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
   }
   .w-text {
     display: flex;
     flex-direction: column;
     gap: 2px;
     flex: 1;
+    min-width: 0;
   }
   .w-text strong {
-    font-size: 14px;
-    font-weight: 620;
+    font-weight: var(--weight-medium);
   }
   .w-text .muted {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
+  }
+  /* Matches the separator on Login's two-link footer. */
+  .sep {
+    margin: 0 6px;
+    color: var(--text-muted);
   }
 
   @media (max-width: 480px) {

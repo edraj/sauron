@@ -13,8 +13,10 @@
 -->
 <script lang="ts" generics="T">
   import { t } from '../i18n';
+  import { localeStore } from '../i18n/locale.svelte';
   import type { Snippet } from 'svelte';
   import Card from './ui/Card.svelte';
+  import CountChip from './ui/CountChip.svelte';
   import Button from './ui/Button.svelte';
   import Icon, { type IconName } from './ui/Icon.svelte';
   import Skeleton from './ui/Skeleton.svelte';
@@ -73,7 +75,7 @@
   );
 </script>
 
-<Card padding="none">
+<Card>
   {#snippet header()}
     <button
       class="head-toggle"
@@ -81,11 +83,11 @@
       aria-expanded={open}
       aria-controls={bodyId}
     >
-      <Icon name={open ? 'chevron-down' : 'chevron-right'} size={15} />
+      <span class="chev" class:collapsed={!open}><Icon name="chevron-down" size={15} /></span>
       <Icon name={icon} size={15} />
       <span class="title">{title}</span>
       {#if section.loaded}
-        <span class="count">{section.seen}{section.hasNext ? '+' : ''}</span>
+        <CountChip n={`${section.seen}${section.hasNext ? '+' : ''}`} />
       {/if}
     </button>
   {/snippet}
@@ -108,7 +110,7 @@
       <div class="prompt">
         <p class="muted">{t('ui.empty.notLoaded')}</p>
         <Button variant="secondary" size="sm" onclick={() => section.load(0, call)}>
-          Fetch {title.toLowerCase()}
+          {t('ui.fetchCard.load', { title: title.toLocaleLowerCase(localeStore.tag) })}
         </Button>
       </div>
     {:else if section.loading && !section.loaded}
@@ -120,7 +122,7 @@
              still the previous one, and re-fetching THAT would succeed and look
              recovered without ever reaching the page the user asked for. -->
         <Button variant="secondary" size="sm" onclick={() => section.retry(call)}>
-          {t('ui.tryAgain')}
+          {t('common.retry')}
         </Button>
       </div>
     {:else if section.rows.length === 0}
@@ -159,29 +161,29 @@
     border: none;
     padding: 0;
     color: var(--text);
-    font-size: 14.5px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     cursor: pointer;
     width: 100%;
     text-align: start;
   }
-  .head-toggle:hover {
-    color: var(--primary);
+  /* Same disclosure chevron as `Card collapsible`: one glyph, rotated. */
+  .chev {
+    display: inline-flex;
+    color: var(--text-faint);
+    transition: transform 0.12s ease;
+  }
+  .chev.collapsed {
+    transform: rotate(-90deg);
+  }
+  :global([dir='rtl']) .chev.collapsed {
+    transform: rotate(90deg);
   }
   .title {
     white-space: nowrap;
   }
-  .count {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-faint);
-    background: var(--surface-alt, transparent);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 1px 7px;
-  }
   .body {
-    padding: 14px 18px;
+    padding: 0;
   }
   /* `hidden` is overridden by the `display` this rule's siblings set, so it is
      restated here — without it the collapsed body still occupies the card. */
@@ -197,14 +199,14 @@
   }
   .muted {
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .empty-note {
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .error-note {
-    color: var(--error, #d33);
-    font-size: 13px;
+    color: var(--error);
+    font-size: var(--text-sm);
   }
   .rows {
     list-style: none;
@@ -221,13 +223,14 @@
     opacity: 0.5;
   }
   .rows li {
-    border-bottom: 1px solid var(--border-subtle, var(--border));
+    border-bottom: 1px solid var(--border);
   }
   .rows li:last-child {
     border-bottom: none;
   }
+  /* Flush with the rows above it, as the section body now is. */
   .pager {
-    padding: 10px 18px;
+    padding: 10px 0 0;
     border-top: 1px solid var(--border);
   }
 </style>

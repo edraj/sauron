@@ -7,8 +7,14 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import StatTiles from '../lib/components/StatTiles.svelte';
+  import StatTile from '../lib/components/StatTile.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import Textarea from '../lib/components/ui/Textarea.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
@@ -58,6 +64,9 @@
   const loadingEvents = $derived(catalogView.loading);
   let computing = $state(false);
   let error = $state<string | null>(null);
+  // The caught failure itself, so ErrorState can say what happened in words
+  // (a `query_timeout` 503 is "took too long"); `error` stays the message.
+  let computeFailure = $state<unknown>(null);
   let refreshing = $state(false);
 
   let saved = $state<SavedFunnel[]>([]);
@@ -129,11 +138,11 @@
     try {
       if (dialogMode === 'edit' && loadedId) {
         await updateFunnel(aid, loadedId, body);
-        toastStore.success('Funnel updated.');
+        toastStore.success(t('funnels.toast.updated'));
       } else {
         const created = await saveFunnel(aid, body);
         loadedId = created.id;
-        toastStore.success('Funnel saved.');
+        toastStore.success(t('funnels.toast.saved'));
       }
       showDetailsDialog = false;
       await loadSaved(aid);
@@ -156,12 +165,12 @@
     if (!aid) return;
     try {
       await saveFunnel(aid, {
-        name: `Copy of ${f.name}`,
+        name: t('funnels.copyOf', { name: f.name }),
         description: f.description ?? undefined,
         steps: [...f.steps],
       });
       await loadSaved(aid);
-      toastStore.success('Funnel duplicated.');
+      toastStore.success(t('funnels.toast.duplicated'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     }
@@ -186,7 +195,7 @@
       await deleteFunnel(aid, f.id);
       if (loadedId === f.id) loadedId = null;
       await loadSaved(aid);
-      toastStore.success('Funnel deleted.');
+      toastStore.success(t('funnels.toast.deleted'));
       showDeleteConfirm = false;
       pendingDelete = null;
     } catch (err) {
@@ -210,6 +219,7 @@
   async function compute(aid: string, win: DateRangeValue) {
     if (steps.length < 2) return;
     const wanted = [...steps];
+    computeFailure = null;
     computing = true;
     error = null;
     try {
@@ -220,6 +230,7 @@
         hasData: envelope.data !== null,
       });
       if (status.error) {
+        computeFailure = null;
         error = status.error;
         result = null;
         pending = null;
@@ -234,6 +245,7 @@
       }
     } catch (err) {
       error = errorMessage(err);
+      computeFailure = err;
       result = null;
       pending = null;
     }
@@ -348,14 +360,17 @@
   const refresher = pageRefresher(refresh);
 
   const overallConv = $derived(result ? (result.steps.at(-1)?.conv_from_start ?? 0) : 0);
+  const pickerOptions = $derived(available.map((ev) => ({ value: ev.name, label: ev.name })));
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('funnels.title')}</h1>
-      <p class="muted sub">{t('funnels.subtitle')}</p>
-    </div>
-    <div class="controls">
+  <PageHeader title={t('funnels.title')} subtitle={t('funnels.subtitle')}>
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
+    {/snippet}
+  </PageHeader>
+
+  <div class="page">
+    <div class="filters">
       <DateRange
         value={range}
         onchange={(v) => {
@@ -363,28 +378,20 @@
           rangeStore.set(v);
         }}
       />
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
     </div>
-  </div>
 
   {#if loadingEvents}
-    <Card><Skeleton rows={4} /></Card>
+    <Skeleton rows={4} />
   {:else if error && available.length === 0}
-    <Card>
-      <EmptyState title={t('funnels.error.events')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('funnels.error.events')} error={catalogView.error ? catalogView : error} onretry={retry} />
   {:else if available.length === 0}
-    <Card>
-      <EmptyState
-        title={t('funnels.empty.title')}
-        description={t('funnels.empty.body')}
-        icon="chart-column"
-      />
-    </Card>
+    <!-- The catalogue is a fixed 90 days, not the picker's window — so this is
+         the one empty state on the page that may say "yet". -->
+    <EmptyState
+      title={t('funnels.empty.title')}
+      description={t('funnels.empty.body')}
+      icon="chart-column"
+    />
   {:else}
     {#if saved.length > 0}
       <Card title={t('funnels.card.saved')}>
@@ -392,19 +399,24 @@
           <SearchInput bind:value={funnelSearch} placeholder={t('funnels.search')} width="280px" />
         </div>
         {#if filteredFunnels.length === 0}
-          <p class="muted empty-steps">No funnels match “{funnelSearch}”.</p>
+          <EmptyState
+            size="section"
+            title={t('common.empty.match', { things: t('funnels.noun') })}
+            description={t('common.empty.matchHint')}
+          />
         {:else}
           <ul class="saved-list">
             {#each filteredFunnels as f (f.id)}
               <li class="saved-item" class:active={f.id === loadedId}>
                 <button class="load" type="button" onclick={() => loadFunnel(f)} title={t('funnels.loadThis')}>
                   <span class="sf-name truncate">{f.name}</span>
-                  <span class="sf-meta">{f.steps.length} steps{#if f.created_by_name} · {f.created_by_name}{/if}</span>
+                  <span class="sf-meta">{t('funnels.stepCount', { n: formatNumber(f.steps.length) })}{#if f.created_by_name} · {f.created_by_name}{/if}</span>
                 </button>
                 <div class="sf-actions">
                   <button
                     type="button"
-                    title="Duplicate"
+                    title={t('funnels.duplicate')}
+                    aria-label={t('funnels.duplicate')}
                     use:lockTip={writeLock}
                     onclick={() => duplicateFunnel(f)}
                   >
@@ -412,7 +424,8 @@
                   </button>
                   <button
                     type="button"
-                    title="Delete"
+                    title={t('common.delete')}
+                    aria-label={t('common.delete')}
                     use:lockTip={writeLock}
                     onclick={() => openDeleteConfirm(f)}
                   >
@@ -429,25 +442,21 @@
     <div class="grid">
       <Card title={t('funnels.card.builder')}>
         {#if steps.length === 0}
-          <p class="muted empty-steps">{t('funnels.addTwoSteps')}</p>
+          <EmptyState size="section" title={t('funnels.empty.noSteps')} description={t('funnels.addTwoSteps')} />
         {:else}
           <ol class="steps">
             {#each steps as step, i (i)}
               <li class="step">
                 <span class="snum">{i + 1}</span>
                 <span class="sname mono truncate">{step}</span>
-                <button class="remove" type="button" title={t('funnels.removeStep')} onclick={() => removeStep(i)}><Icon name="x" size={14} /></button>
+                <button class="remove" type="button" title={t('funnels.removeStep')} aria-label={t('funnels.removeStep')} onclick={() => removeStep(i)}><Icon name="x" size={14} /></button>
               </li>
             {/each}
           </ol>
         {/if}
 
         <div class="add-row">
-          <select class="picker" bind:value={picked} aria-label={t('funnels.eventToAdd')}>
-            {#each available as ev (ev.name)}
-              <option value={ev.name}>{ev.name}</option>
-            {/each}
-          </select>
+          <Select bind:value={picked} options={pickerOptions} ariaLabel={t('funnels.eventToAdd')} size="sm" />
           <Button variant="secondary" size="sm" onclick={addStep}>{t('funnels.addStep')}</Button>
         </div>
 
@@ -468,57 +477,49 @@
       </Card>
 
       <Card title={t('funnels.card.results')}>
+        {#snippet actions()}
+          {#if computing && result}
+            <span class="updating-tag"><Spinner size={13} /> {t('funnels.updating')}</span>
+          {/if}
+        {/snippet}
         {#if computing && !result}
           <Skeleton rows={6} />
         {:else if error && !result}
-          <EmptyState title={t('funnels.error.compute')} description={error} icon="triangle-alert">
-            {#snippet action()}
-              <Button variant="secondary" onclick={onCompute}>{t('common.retry')}</Button>
-            {/snippet}
-          </EmptyState>
+          <ErrorState title={t('funnels.error.compute')} error={computeFailure ?? error} onretry={onCompute} size="section" />
         {:else if result}
           <div class="summary" class:updating={computing}>
-            <div class="sum-item">
-              <span class="sum-label section-label">{t('funnels.entered')}</span>
-              <span class="sum-val">{formatNumber(result.total_entered)}</span>
-            </div>
-            <div class="sum-item">
-              <span class="sum-label section-label">{t('funnels.overallConversion')}</span>
-              <span class="sum-val accent">{formatPercent(overallConv)}</span>
-            </div>
-            {#if computing}
-              <span class="updating-tag"><Spinner size={13} /> {t('funnels.updating')}</span>
-            {/if}
+            <StatTiles min={150}>
+              <StatTile label={t('funnels.entered')} value={formatNumber(result.total_entered)} />
+              <StatTile label={t('funnels.overallConversion')} value={formatPercent(overallConv)} />
+            </StatTiles>
           </div>
           <div class="chart-wrap">
             <FunnelChart result={result} />
           </div>
         {:else}
-          <p class="muted empty-steps">{t('funnels.computePrompt')}</p>
+          <EmptyState size="section" title={t('funnels.empty.notComputed')} description={t('funnels.computePrompt')} />
         {/if}
       </Card>
     </div>
   {/if}
+  </div>
 
   <Modal
     bind:open={showDetailsDialog}
-    title={dialogMode === 'edit' ? 'Edit funnel template' : 'Save funnel template'}
+    title={dialogMode === 'edit' ? t('funnels.dialog.editTitle') : t('funnels.dialog.saveTitle')}
     onclose={closeDialog}
   >
     <div class="dialog-form">
       <Input label={t('common.name')} bind:value={dialogName} placeholder={t('funnels.placeholder.name')} required />
-      <div class="ta-field">
-        <label class="ta-label" for="funnel-desc">{t('funnels.description')} <span class="ta-opt">optional</span></label>
-        <textarea
-          id="funnel-desc"
-          class="ta"
-          bind:value={dialogDesc}
-          rows="3"
-          placeholder={t('funnels.placeholder.description')}
-        ></textarea>
-      </div>
+      <Textarea
+        id="funnel-desc"
+        label={t('funnels.description')}
+        labelNote={t('funnels.optional')}
+        bind:value={dialogDesc}
+        placeholder={t('funnels.placeholder.description')}
+      />
       <p class="dialog-hint">
-        {steps.length} step{steps.length === 1 ? '' : 's'} will be saved from the builder.
+        {t('funnels.dialog.stepsHint', { n: formatNumber(steps.length) })}
       </p>
     </div>
     {#snippet footer()}
@@ -529,7 +530,7 @@
         disabled={!dialogName.trim() || steps.length < 2}
         loading={savingDialog}
       >
-        {dialogMode === 'edit' ? 'Save changes' : 'Save template'}
+        {dialogMode === 'edit' ? t('funnels.dialog.saveChanges') : t('funnels.saveTemplate')}
       </Button>
     {/snippet}
   </Modal>
@@ -537,9 +538,7 @@
   <ConfirmDialog
     bind:open={showDeleteConfirm}
     title={t('funnels.deleteTitle')}
-    message={pendingDelete
-      ? `“${pendingDelete.name}” will be permanently removed. This can't be undone.`
-      : ''}
+    message={pendingDelete ? t('funnels.deleteMessage', { name: pendingDelete.name }) : ''}
     confirmLabel={t('common.delete')}
     danger
     loading={deleting}
@@ -548,34 +547,22 @@
   />
 
 <style>
-  .head {
+  .page {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: var(--page-gap);
   }
-  .controls {
+  .filters {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-    max-width: 620px;
   }
   .grid {
     display: grid;
     grid-template-columns: minmax(300px, 360px) 1fr;
-    gap: 18px;
+    gap: var(--page-gap) 28px;
     align-items: start;
-  }
-
-  .empty-steps {
-    font-size: 13px;
   }
 
   .steps {
@@ -601,22 +588,22 @@
     width: 20px;
     height: 20px;
     border-radius: 50%;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 11px;
-    font-weight: 680;
+    background: var(--surface-3);
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     flex-shrink: 0;
   }
   .sname {
     flex: 1;
     min-width: 0;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .remove {
     background: none;
     border: none;
     color: var(--text-faint);
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 1;
     padding: 3px 5px;
     border-radius: var(--radius-sm);
@@ -627,25 +614,13 @@
     background: var(--error-soft);
   }
 
+  /* A grid, not a flex row, so the Select's root stretches to the free
+     width without reaching into its markup. */
   .add-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
     margin-top: 12px;
-  }
-  .picker {
-    flex: 1;
-    min-width: 0;
-    padding: 7px 10px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-    color: var(--text);
-    font-size: 12.5px;
-    font-family: inherit;
-  }
-  .picker:focus {
-    outline: none;
-    border-color: var(--primary-border);
   }
 
   .compute-row {
@@ -657,43 +632,22 @@
     border-top: 1px solid var(--border);
   }
   .hint {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
 
   .summary {
-    display: flex;
-    align-items: flex-end;
-    gap: 28px;
     margin-bottom: 20px;
-    transition: opacity 0.15s ease;
+    transition: opacity 0.12s ease;
   }
   .summary.updating {
     opacity: 0.75;
-  }
-  .sum-item {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .sum-label {
-    font-size: 10.5px;
-  }
-  .sum-val {
-    font-size: 22px;
-    font-weight: 660;
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-  }
-  .sum-val.accent {
-    color: var(--primary);
   }
   .updating-tag {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
-    margin-bottom: 2px;
   }
   .chart-wrap {
     padding-top: 4px;
@@ -736,13 +690,13 @@
     text-align: start;
   }
   .sf-name {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     max-width: 220px;
   }
   .sf-meta {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .sf-actions {
@@ -772,44 +726,8 @@
     flex-direction: column;
     gap: 14px;
   }
-  .ta-field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .ta-label {
-    font-size: 12.5px;
-    font-weight: 560;
-    color: var(--text-muted);
-  }
-  .ta-opt {
-    color: var(--text-faint);
-    font-weight: 400;
-  }
-  .ta {
-    width: 100%;
-    padding: 10px 13px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text);
-    font-family: inherit;
-    font-size: 13.5px;
-    line-height: 1.5;
-    resize: vertical;
-    min-height: 62px;
-    transition: border-color 0.14s ease, box-shadow 0.14s ease;
-  }
-  .ta:focus {
-    outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-soft);
-  }
-  .ta::placeholder {
-    color: var(--text-faint);
-  }
   .dialog-hint {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     margin: 0;
   }

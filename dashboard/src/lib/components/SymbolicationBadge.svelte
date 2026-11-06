@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { t } from '../i18n';
+  import Badge from './ui/Badge.svelte';
   import type { SymbolicationStatus } from '../models';
 
   interface Props {
@@ -18,63 +20,47 @@
 
   const label = $derived(
     status === 'symbolicated'
-      ? 'Symbolicated'
+      ? t('symbolication.symbolicated')
       : status === 'partial'
-        ? 'Partially symbolicated'
+        ? t('symbolication.partial')
         : status === 'no_artifacts'
           ? isDart
-            ? 'No symbols'
-            : 'No source maps'
+            ? t('symbolication.noSymbols')
+            : t('symbolication.noSourceMaps')
           : status === 'pending'
-            ? 'Pending'
-            : 'Not applicable',
+            ? t('symbolication.pending')
+            : t('symbolication.notApplicable'),
+  );
+
+  // Colour only where it means something: resolved is green, partly resolved
+  // amber; every other state is a neutral fact.
+  const tone = $derived(
+    status === 'symbolicated' ? 'success' : status === 'partial' ? 'warning' : 'neutral',
   );
 
   // Only the dead-end state earns a tooltip: it is the one status the reader
   // can do something about.
   const hint = $derived(
     status === 'no_artifacts'
-      ? `Upload ${isDart ? 'debug symbols' : 'source maps'} for this release to see original frames`
-      : '',
+      ? isDart
+        ? t('symbolication.hintSymbols')
+        : t('symbolication.hintSourceMaps')
+      : undefined,
   );
 </script>
 
 {#if status}
-  <span
-    class="sym-badge"
-    class:ok={status === 'symbolicated'}
-    class:partial={status === 'partial'}
-    class:none={status === 'no_artifacts'}
-    title={hint}
-  >
-    {label}
+  <span class="sym" class:help={!!hint} title={hint}>
+    <Badge {tone} size="sm">{label}</Badge>
   </span>
 {/if}
 
 <style>
-  .sym-badge {
-    font-size: 10px;
-    font-weight: 650;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    padding: 2px 7px;
-    border-radius: var(--radius-pill);
-    color: var(--text-muted);
-    background: var(--surface-2, var(--surface));
-    border: 1px solid var(--border);
-    white-space: nowrap;
+  .sym {
+    display: inline-flex;
+    flex-shrink: 0;
   }
-  .sym-badge.ok {
-    color: var(--success, #30a46c);
-    background: color-mix(in srgb, var(--success, #30a46c) 14%, transparent);
-    border-color: transparent;
-  }
-  .sym-badge.partial {
-    color: var(--warning, #f5a623);
-    background: color-mix(in srgb, var(--warning, #f5a623) 16%, transparent);
-    border-color: transparent;
-  }
-  .sym-badge.none {
+  .sym.help {
     cursor: help;
   }
 </style>

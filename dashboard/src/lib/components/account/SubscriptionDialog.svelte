@@ -1,9 +1,12 @@
 <script lang="ts">
-  import { t } from '../../i18n';
+  import { labelFor, t } from '../../i18n';
+  import { errorMessage } from '../../api/client';
+  import { LEVEL_KEYS } from '../../models/issue-labels';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
+  import Select from '../ui/Select.svelte';
   import ScopeTree from '../members/ScopeTree.svelte';
   import { EMPTY_SELECTION, type ScopeSelection } from '../../models/scope-tree';
   import {
@@ -186,33 +189,35 @@
           ...mutable,
         });
       }
-      toastStore.success('Subscription saved');
+      toastStore.success(t('notif.toast.saved'));
       onsaved();
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Could not save the subscription';
+      error = errorMessage(e, t('notif.toast.saveFailed'));
     } finally {
       saving = false;
     }
   }
 </script>
 
-<Modal bind:open size="lg" title={existing ? 'Edit subscription' : 'New subscription'} {onclose}>
+<Modal bind:open size="lg" title={existing ? t('notif.edit') : t('notif.new')} {onclose}>
   <div class="form">
     <!--
       Kind and scope are read-only while editing, because PATCH cannot change
       them. Leaving the controls live would let someone re-point a subscription
       at another app, get a green toast, and walk away believing it moved.
     -->
-    <label class="fld">
-      <span class="lbl">{t('notif.dialog.notifyMeAbout')}</span>
-      <!-- A raw select: there is no Select primitive in lib/components/ui. -->
-      <select class="sel" bind:value={kind} disabled={!!existing}>
-        <option value="error_spike">{t('notif.dialog.errorRate')}</option>
-        <option value="error_new_issue">{t('notif.dialog.newIssue')}</option>
-        <option value="error_regression">{t('notif.dialog.regression')}</option>
-        <option value="uptime">{t('notif.dialog.monitor')}</option>
-      </select>
-    </label>
+    <Select
+      label={t('notif.dialog.notifyMeAbout')}
+      value={kind}
+      disabled={!!existing}
+      options={[
+        { value: 'error_spike', label: t('notif.dialog.errorRate') },
+        { value: 'error_new_issue', label: t('notif.dialog.newIssue') },
+        { value: 'error_regression', label: t('notif.dialog.regression') },
+        { value: 'uptime', label: t('notif.dialog.monitor') },
+      ]}
+      onchange={(v) => (kind = v as SubscriptionKind)}
+    />
 
     <div class="fld">
       <span class="lbl">{t('notif.dialog.scope')}</span>
@@ -269,32 +274,33 @@
     {/if}
 
     {#if needs.level}
-      <label class="fld">
-        <span class="lbl">{t('notif.dialog.level')}</span>
-        <select class="sel" bind:value={level}>
-          <option value="">{t('notif.dialog.anyLevel')}</option>
-          <option value="error">error</option>
-          <option value="warning">warning</option>
-          <option value="fatal">fatal</option>
-        </select>
-      </label>
+      <Select
+        label={t('notif.dialog.level')}
+        bind:value={level}
+        options={[
+          { value: '', label: t('notif.dialog.anyLevel') },
+          ...(['error', 'warning', 'fatal'] as const).map((l) => ({ value: l, label: labelFor(LEVEL_KEYS, l) })),
+        ]}
+      />
     {/if}
 
     <div class="row">
-      <label class="fld">
-        <span class="lbl">{t('notif.column.delivery')}</span>
-        <select class="sel" bind:value={delivery}>
-          <option value="immediate">{t('notif.dialog.asItHappens')}</option>
-          <option value="hourly">{t('notif.dialog.hourly')}</option>
-          <option value="daily">{t('notif.dialog.daily')}</option>
-        </select>
-      </label>
+      <Select
+        label={t('notif.column.delivery')}
+        value={delivery}
+        options={[
+          { value: 'immediate', label: t('notif.dialog.asItHappens') },
+          { value: 'hourly', label: t('notif.dialog.hourly') },
+          { value: 'daily', label: t('notif.dialog.daily') },
+        ]}
+        onchange={(v) => (delivery = v as SubscriptionDelivery)}
+      />
       <Input label={t('notif.dialog.throttle')} bind:value={throttleSeconds} hint="0 – 604800" />
     </div>
 
     <div class="row">
-      <Input label={t('notif.dialog.quietFrom')} bind:value={quietStart} hint="e.g. 1320 = 22:00" />
-      <Input label={t('notif.dialog.quietUntil')} bind:value={quietEnd} hint="e.g. 360 = 06:00" />
+      <Input label={t('notif.dialog.quietFrom')} bind:value={quietStart} hint={t('notif.quietFromHint')} />
+      <Input label={t('notif.dialog.quietUntil')} bind:value={quietEnd} hint={t('notif.quietUntilHint')} />
       <Input label={t('notif.dialog.timezone')} bind:value={quietTz} hint={t('notif.dialog.timezoneHint')} />
     </div>
     <p class="hint">
@@ -306,11 +312,11 @@
         {#each problems as p (p)}<li>{p}</li>{/each}
       </ul>
     {/if}
-    {#if error}<p class="err">{error}</p>{/if}
+    {#if error}<p class="err" role="alert">{error}</p>{/if}
   </div>
 
   {#snippet footer()}
-    <Button onclick={onclose}>{t('common.cancel')}</Button>
+    <Button variant="secondary" onclick={onclose}>{t('common.cancel')}</Button>
     <Button variant="primary" disabled={problems.length > 0} loading={saving} onclick={save}>
       {t('common.save')}
     </Button>
@@ -320,21 +326,9 @@
 <style>
   .form { display: flex; flex-direction: column; gap: 16px; }
   .fld { display: flex; flex-direction: column; gap: 6px; }
-  .lbl { font-size: 12px; font-weight: 600; color: var(--text-faint); }
+  .lbl { font-size: var(--text-xs); font-weight: var(--weight-medium); color: var(--text-muted); }
   .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
-  .hint { font-size: 12px; color: var(--text-faint); margin: 0; }
-  /* --radius-md, --accent and --danger are not defined in app.css; the theme
-     names are --radius, --primary and --error. An undefined custom property
-     silently drops the whole declaration, so a "harmless" rename here means an
-     unstyled select and an invisible error message. */
-  .sel {
-    padding: 7px 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 13px;
-  }
+  .hint { font-size: var(--text-xs); color: var(--text-faint); margin: 0; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip {
     padding: 4px 10px;
@@ -342,10 +336,10 @@
     border-radius: var(--radius-pill);
     background: var(--surface);
     color: var(--text-faint);
-    font-size: 12px;
+    font-size: var(--text-xs);
     cursor: pointer;
   }
   .chip.on { border-color: var(--primary); color: var(--text); }
-  .problems { margin: 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-faint); }
-  .err { font-size: 13px; color: var(--error); margin: 0; }
+  .problems { margin: 0; padding-inline-start: 18px; font-size: var(--text-xs); color: var(--text-faint); }
+  .err { font-size: var(--text-sm); color: var(--error); margin: 0; }
 </style>

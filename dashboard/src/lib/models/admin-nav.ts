@@ -1,9 +1,11 @@
 import type { IconName } from '../components/ui/Icon.svelte';
+import type { MessageKey } from '../i18n';
 import { canAccessPage, pageLockedBy, resolvePageAccess, type LockReason } from './page-access';
 
 export interface AdminNavItem {
   href: string;
-  label: string;
+  /** Catalog key, so the rail is translated like every other nav label. */
+  labelKey: MessageKey;
   icon: IconName;
 }
 
@@ -15,18 +17,18 @@ export interface AdminNavItem {
  * AppShell's in-page gate cannot disagree about who may see a page.
  */
 export const ADMIN_NAV: AdminNavItem[] = [
-  { href: '/admin/members', label: 'Members', icon: 'key-round' },
-  { href: '/admin/roles', label: 'Roles', icon: 'shield-check' },
-  { href: '/admin/projects', label: 'Projects', icon: 'folders' },
-  { href: '/admin/environments', label: 'Environments', icon: 'layers' },
-  { href: '/admin/settings', label: 'App settings', icon: 'settings' },
-  { href: '/admin/source-maps', label: 'Source Maps', icon: 'braces' },
-  { href: '/admin/alerts', label: 'Alerts', icon: 'bell' },
-  { href: '/admin/storage', label: 'Storage', icon: 'server' },
-  { href: '/admin/privacy', label: 'Privacy', icon: 'shield-alert' },
-  { href: '/admin/wall-of-shame', label: 'Wall of Shame', icon: 'scroll-text' },
-  { href: '/admin/ingest-failures', label: 'Ingest failures', icon: 'refresh' },
-  { href: '/admin/purge', label: 'Purge data', icon: 'circle-x' },
+  { href: '/admin/members', labelKey: 'admin.nav.members', icon: 'key-round' },
+  { href: '/admin/roles', labelKey: 'admin.nav.roles', icon: 'shield-check' },
+  { href: '/admin/projects', labelKey: 'admin.nav.projects', icon: 'folders' },
+  { href: '/admin/environments', labelKey: 'admin.nav.environments', icon: 'layers' },
+  { href: '/admin/settings', labelKey: 'admin.nav.settings', icon: 'settings' },
+  { href: '/admin/source-maps', labelKey: 'admin.nav.sourceMaps', icon: 'braces' },
+  { href: '/admin/alerts', labelKey: 'admin.nav.alerts', icon: 'bell' },
+  { href: '/admin/storage', labelKey: 'admin.nav.storage', icon: 'server' },
+  { href: '/admin/privacy', labelKey: 'admin.nav.privacy', icon: 'shield-alert' },
+  { href: '/admin/wall-of-shame', labelKey: 'admin.nav.wallOfShame', icon: 'scroll-text' },
+  { href: '/admin/ingest-failures', labelKey: 'admin.nav.ingestFailures', icon: 'refresh' },
+  { href: '/admin/purge', labelKey: 'admin.nav.purge', icon: 'circle-x' },
 ];
 
 /** An admin child plus the permission keeping it locked, if any. */

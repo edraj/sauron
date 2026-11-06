@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { t } from '../i18n';
+  import { formatNumber, t } from '../i18n';
   import Card from './ui/Card.svelte';
   import Skeleton from './ui/Skeleton.svelte';
+  import ErrorState from './ui/ErrorState.svelte';
   import StatTiles from './StatTiles.svelte';
   import StatTile from './StatTile.svelte';
   import StoreInstallsChart from './StoreInstallsChart.svelte';
@@ -58,7 +59,12 @@
   {#if view.loading && !data}
     <Skeleton rows={4} height="46px" />
   {:else if view.error && !data}
-    <p class="err">{view.error}</p>
+    <ErrorState
+      size="section"
+      title={t('common.couldntLoad', { thing: t('ui.store.thing') })}
+      error={view}
+      onretry={() => void view.reload()}
+    />
   {:else}
     <StatTiles>
       <StatTile label={t('ui.store.installs')} value={compactNumber(totals.installs)} tone="success" />
@@ -78,7 +84,7 @@
       {#if lastSynced}
         <!-- Stated explicitly so day-old data is never mistaken for live data:
              store reports land 1-3 days late by design. -->
-        <p class="muted">Last synced {relativeTime(lastSynced)}.</p>
+        <p class="muted">{t('stores.status.synced', { when: relativeTime(lastSynced) })}</p>
       {/if}
       {#if applePending}
         <p class="muted">
@@ -89,8 +95,9 @@
         <!-- NOT drawn as zero bars: the store has not published these days, and
              a zero would assert that nobody installed the app. -->
         <p class="muted">
-          {pendingCount}
-          {pendingCount === 1 ? 'day' : 'days'} not yet published by the store.
+          {pendingCount === 1
+            ? t('ui.store.pendingOne')
+            : t('ui.store.pendingMany', { n: formatNumber(pendingCount) })}
         </p>
       {/if}
       {#each errored as s (s.store)}
@@ -111,11 +118,11 @@
     gap: 4px;
   }
   .notes p {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin: 0;
   }
   .err {
     color: var(--error);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
 </style>

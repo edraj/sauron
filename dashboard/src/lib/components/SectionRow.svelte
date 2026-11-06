@@ -11,6 +11,7 @@
 -->
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { t } from '../i18n';
   import Icon from './ui/Icon.svelte';
 
   interface Props {
@@ -28,7 +29,9 @@
     openLabel?: string;
   }
 
-  let { children, expanded, onopen = null, openLabel = 'Open' }: Props = $props();
+  let { children, expanded, onopen = null, openLabel }: Props = $props();
+
+  const openText = $derived(openLabel ?? t('section.row.open'));
 
   let isOpen = $state(false);
 </script>
@@ -39,11 +42,11 @@
     onclick={() => (isOpen = !isOpen)}
     aria-expanded={isOpen}
   >
-    <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} />
+    <span class="chev"><Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={12} /></span>
     {@render children()}
   </button>
   {#if onopen}
-    <button class="open" onclick={onopen} title={openLabel} aria-label={openLabel}>
+    <button class="open" onclick={onopen} title={openText} aria-label={openText}>
       <Icon name="arrow-up-right" size={13} />
     </button>
   {/if}
@@ -70,12 +73,18 @@
     border: none;
     padding: 0;
     color: var(--text);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     text-align: start;
     cursor: pointer;
   }
-  .summary:hover {
-    color: var(--primary);
+  .chev {
+    display: inline-flex;
+    flex: none;
+    color: var(--text-faint);
+    transition: color 0.12s ease;
+  }
+  .summary:hover .chev {
+    color: var(--text);
   }
   .open {
     flex: none;
@@ -84,15 +93,16 @@
     background: none;
     border: none;
     padding: 4px;
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-sm);
     color: var(--text-faint);
     cursor: pointer;
   }
   .open:hover {
-    color: var(--primary);
-    background: var(--surface-alt, transparent);
+    color: var(--text);
+    background: var(--surface-2);
   }
   .detail {
-    padding: 4px 0 12px 20px;
+    padding-block: 4px 12px;
+    padding-inline: 20px 0;
   }
 </style>

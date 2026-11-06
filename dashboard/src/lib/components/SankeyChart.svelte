@@ -65,7 +65,7 @@
           h,
           outAccum: 0,
           inAccum: 0,
-          hue: hueFromString(n.event),
+          hue: Math.abs(hueFromString(n.event)) % 5,
         });
         y += h + PAD;
       }
@@ -102,12 +102,12 @@
   <div class="sk-wrap">
     <svg viewBox="0 0 {WIDTH} {height}" width="100%" height={height} preserveAspectRatio="xMidYMid meet">
       {#each layout.ribbons as r, i (i)}
-        <path d={r.path} fill={`hsl(${r.hue} 60% 60% / 0.22)`} class="ribbon" />
+        <path d={r.path} style:fill={`color-mix(in srgb, var(--chart-${r.hue + 1}) 24%, transparent)`} class="ribbon" />
       {/each}
       {#each layout.nodes as n (n.key)}
         <g class="node">
-          <rect x={n.x} y={n.y} width={NODE_W} height={n.h} rx="3" fill={`hsl(${n.hue} 62% 60%)`}>
-            <title>{n.event} · step {n.step + 1} · {formatNumber(n.count)}</title>
+          <rect x={n.x} y={n.y} width={NODE_W} height={n.h} rx="3" style:fill={`var(--chart-${n.hue + 1})`}>
+            <title>{n.event} · {t('journeys.stepN', { n: n.step + 1 })} · {formatNumber(n.count)}</title>
           </rect>
           {#if n.h > 14}
             <text
@@ -141,12 +141,12 @@
   }
   .node-label {
     font-family: var(--font-mono);
-    font-size: 10.5px;
+    font-size: var(--text-xs);
     fill: var(--text-muted);
   }
   .sk-empty {
     padding: 40px;
     text-align: center;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
 </style>

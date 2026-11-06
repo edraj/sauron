@@ -19,6 +19,7 @@
 -->
 <script lang="ts">
   import { t } from '../../i18n';
+  import { errorMessage } from '../../api/client';
   import Icon from '../ui/Icon.svelte';
   import {
     fetchSchema,
@@ -94,7 +95,7 @@
         // stays fully usable and only the suggestions go away.
         if (!cancelled) {
           schema = null;
-          schemaError = err instanceof Error ? err.message : 'Suggestions unavailable';
+          schemaError = errorMessage(err, t('search.suggestionsUnavailable'));
         }
       });
     return () => {
@@ -265,7 +266,7 @@
   {#if error}
     <p class="msg err" role="alert">{error}</p>
   {:else if schemaError}
-    <p class="msg hint">{schemaError} — you can still type a query.</p>
+    <p class="msg hint">{t('search.schemaErrorHint', { error: schemaError })}</p>
   {/if}
 
   {#if open && suggestions.length}
@@ -301,13 +302,13 @@
     gap: 8px;
     height: var(--control-h);
     padding-inline: 10px 3px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    transition: border-color 0.13s ease, box-shadow 0.13s ease;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
   .shell:focus-within {
-    border-color: var(--primary-border);
+    border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-soft);
   }
   .shell.invalid {
@@ -332,7 +333,7 @@
     color: var(--text);
     outline: none;
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   input::placeholder {
     color: var(--text-faint);
@@ -350,33 +351,36 @@
   .clear:hover {
     color: var(--text);
   }
+  /* A segment inside the shell, on the same 3px inset as `SegmentedControl`
+     — and identical to `SearchInput`'s, so the two boxes cannot drift. */
   .go {
     flex-shrink: 0;
-    height: 28px;
-    padding: 0 11px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    height: calc(var(--control-h) - 8px);
+    padding: 0 10px;
+    background: var(--surface-2);
+    border: none;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    transition: color 0.13s ease, border-color 0.13s ease, background 0.13s ease;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    transition: color 0.12s ease, background-color 0.12s ease;
   }
   .go:hover {
     color: var(--text);
-    border-color: var(--border-strong);
+    background: var(--surface-3);
   }
+  /* The solid fills: white text on dark-theme `--primary` is 3.26:1, and
+     2.74:1 on `--primary-hover`. */
   .go.pending {
-    background: var(--primary);
-    border-color: transparent;
+    background: var(--primary-solid);
     color: var(--primary-contrast);
   }
   .go.pending:hover {
-    background: var(--primary-hover);
+    background: var(--primary-solid-hover);
   }
   .msg {
     margin: 6px 2px 0;
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 16px;
   }
   .msg.err {
@@ -413,19 +417,18 @@
     border-radius: var(--radius-sm);
     color: var(--text);
     text-align: start;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .menu li.sel button,
   .menu li button:hover {
-    background: var(--primary-soft);
-    color: var(--primary);
+    background: var(--surface-2);
   }
   .lbl {
     font-family: var(--font-mono);
   }
   .det {
     color: var(--text-faint);
-    font-size: 11px;
+    font-size: var(--text-xs);
     flex-shrink: 0;
   }
 </style>

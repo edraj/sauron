@@ -9,6 +9,7 @@
   import { setCurrentRoute } from './lib/stores/current-route';
   import Toast from './lib/components/ui/Toast.svelte';
   import Spinner from './lib/components/ui/Spinner.svelte';
+  import EyeMark from './lib/components/EyeMark.svelte';
 
   let booted = $state(false);
 
@@ -91,7 +92,7 @@
 
 {#if !booted}
   <div class="boot">
-    <div class="boot-mark" aria-hidden="true"><span class="eye"></span></div>
+    <EyeMark size={44} />
     <Spinner size={22} />
     <span class="boot-text">{t('prose.boot.loading')}</span>
   </div>
@@ -114,23 +115,8 @@
     justify-content: center;
     gap: 16px;
   }
-  .boot-mark {
-    width: 44px;
-    height: 44px;
-    border-radius: 12px;
-    background: radial-gradient(circle at 50% 45%, #ffe08a 0%, #f5a623 45%, #e0524a 100%);
-    display: grid;
-    place-items: center;
-    box-shadow: 0 0 30px rgba(240, 120, 60, 0.4);
-  }
-  .eye {
-    width: 7px;
-    height: 22px;
-    background: var(--bg);
-    border-radius: 50%;
-  }
   .boot-text {
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
 </style>

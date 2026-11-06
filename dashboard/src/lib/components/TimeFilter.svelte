@@ -1,5 +1,6 @@
 <script lang="ts">
   import { t } from '../i18n';
+  import Select from './ui/Select.svelte';
   /**
    * The time window control for the signal-browsing lists.
    *
@@ -41,6 +42,13 @@
     { key: 'after', label: t('ui.time.mode.after') },
     { key: 'before', label: t('ui.time.mode.before') },
     { key: 'between', label: t('ui.time.mode.between') },
+  ]);
+
+  const fieldOptions = $derived(fields.map((f) => ({ value: f.key, label: f.label })));
+  const modeOptions = $derived(MODES.map((m) => ({ value: m.key, label: m.label })));
+  const presetOptions = $derived([
+    ...presets.map((d) => ({ value: String(d), label: presetLabel(d) })),
+    { value: 'custom', label: t('ui.time.custom') },
   ]);
 
   function presetLabel(d: number): string {
@@ -102,12 +110,12 @@
     }
   }
 
-  function setField(e: Event) {
-    commit({ ...draft, field: (e.currentTarget as HTMLSelectElement).value });
+  function setField(field: string) {
+    commit({ ...draft, field });
   }
 
-  function setMode(e: Event) {
-    const mode = (e.currentTarget as HTMLSelectElement).value as TimeMode;
+  function setMode(value: string) {
+    const mode = value as TimeMode;
     custom = false;
     // Dropping the bounds the new mode cannot use is what keeps `toParams`
     // honest: a leftover `to` on an `after` filter would be sent and would
@@ -123,8 +131,7 @@
     }
   }
 
-  function setPreset(e: Event) {
-    const raw = (e.currentTarget as HTMLSelectElement).value;
+  function setPreset(raw: string) {
     if (raw === 'custom') {
       custom = true;
       return;
@@ -149,27 +156,21 @@
 
 <div class="timefilter">
   {#if fields.length > 1}
-    <select value={draft.field} onchange={setField} aria-label={t('ui.time.field')}>
-      {#each fields as f (f.key)}<option value={f.key}>{f.label}</option>{/each}
-    </select>
+    <Select value={draft.field} options={fieldOptions} onchange={setField} ariaLabel={t('ui.time.field')} />
   {:else if fields.length === 1}
     <!-- A select with a single option is a control that cannot be operated. -->
     <span class="static-field">{fields[0].label}</span>
   {/if}
 
-  <select value={draft.mode} onchange={setMode} aria-label={t('ui.time.comparison')}>
-    {#each MODES as m (m.key)}<option value={m.key}>{m.label}</option>{/each}
-  </select>
+  <Select value={draft.mode} options={modeOptions} onchange={setMode} ariaLabel={t('ui.time.comparison')} />
 
   {#if draft.mode === 'last'}
-    <select
+    <Select
       value={custom || !isPreset ? 'custom' : String(draft.lastDays)}
+      options={presetOptions}
       onchange={setPreset}
-      aria-label={t('ui.time.range')}
-    >
-      {#each presets as d (d)}<option value={String(d)}>{presetLabel(d)}</option>{/each}
-      <option value="custom">{t('ui.time.custom')}</option>
-    </select>
+      ariaLabel={t('ui.time.range')}
+    />
     {#if custom || !isPreset}
       <!-- TEXT, never type="number". `bind:value` on a numberlike input writes
            back `number | null` rather than the string this reads, and because
@@ -186,7 +187,7 @@
         onchange={setCustomDays}
         aria-label={t('ui.time.numberOfDays')}
       />
-      <span class="unit">days</span>
+      <span class="unit">{t('timeFilter.days')}</span>
     {/if}
   {:else}
     {#if draft.mode !== 'before'}
@@ -197,13 +198,13 @@
         aria-label={t('ui.time.from')}
       />
     {/if}
-    {#if draft.mode === 'between'}<span class="unit">to</span>{/if}
+    {#if draft.mode === 'between'}<span class="unit">{t('timeFilter.to')}</span>{/if}
     {#if draft.mode !== 'after'}
       <input
         type="datetime-local"
         value={toInput}
         onchange={(e) => setBound('to', e)}
-        aria-label="To"
+        aria-label={t('timeFilter.toLabel')}
       />
     {/if}
     <!-- The offset is shown because the value entered is read in the viewer's
@@ -218,52 +219,60 @@
 </div>
 
 <style>
-  /* `min-height`, not `height`: `between` mode carries two datetime inputs and
-     a zone label, which must be free to wrap on a narrow viewport. On one line
-     it is exactly `--control-h`: 3px inset + 28px controls + 1px border. */
+  /* A row of ordinary controls, each `--control-h` tall, rather than a
+     well with smaller controls inside it: beside the search box and the
+     DateRange segments they read as one family. `flex-wrap` because
+     `between` mode carries two datetime inputs and a zone label, which must
+     be free to wrap on a narrow viewport. */
   .timefilter {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
     min-height: var(--control-h);
-    padding: 3px 4px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
   }
-  .timefilter select,
+  /* `Input`'s shell, for the two raw inputs `Input` cannot host (it has no
+     `onchange` or `aria-label`). */
   .timefilter input {
-    height: 28px;
+    height: var(--control-h);
+    padding: 0 10px;
     background: var(--surface);
     color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 0 6px;
-    font-size: 12.5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    font-size: var(--text-sm);
+    outline: none;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .timefilter input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-soft);
   }
   .static-field,
   .unit {
+    display: inline-flex;
+    align-items: center;
     color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-sm);
     padding: 0 2px;
   }
   .static-field {
+    height: var(--control-h);
     color: var(--text);
+    font-weight: var(--weight-medium);
   }
   .days {
-    width: 62px;
+    width: 72px;
   }
   .tz {
     color: var(--text-muted);
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     padding: 0 2px;
     white-space: nowrap;
   }
   .err {
-    color: var(--danger, #b4232a);
-    font-size: 11.5px;
+    color: var(--error);
+    font-size: var(--text-xs);
     padding: 0 2px;
   }
 </style>

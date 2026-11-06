@@ -55,7 +55,7 @@
     border-inline-start-color: var(--info);
   }
   .ico {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     line-height: 1.4;
   }
   .toast.success .ico {
@@ -69,14 +69,14 @@
   }
   .msg {
     flex: 1;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
   }
   .close {
     background: none;
     border: none;
     color: var(--text-faint);
-    font-size: 11px;
+    font-size: var(--text-xs);
     padding: 2px;
     line-height: 1;
   }

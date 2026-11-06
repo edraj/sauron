@@ -1,4 +1,5 @@
 import type { UploadArtifactParams, UploadArtifactResult } from '../api/artifacts';
+import { t } from '../i18n';
 
 /**
  * Kind-dependent shape of the symbol-artifact upload form.
@@ -177,22 +178,23 @@ export function resetAfterUpload(
  * way to see that derivation worked rather than assuming it did.
  *
  * The JS wording is unchanged from before this form became kind-aware.
+ * Translated in the language active when the upload finishes.
  */
 export function uploadMessage(
   kind: ArtifactKind,
   res: Pick<UploadArtifactResult, 'deduped' | 'derived_debug_id'>,
 ): string {
   const base = res.deduped
-    ? 'Already uploaded (deduped)'
+    ? t('sourcemaps.toast.deduped')
     : kind === 'dart_obfuscation_map'
-      ? 'Obfuscation map uploaded'
+      ? t('sourcemaps.toast.obfuscationMap')
       : kind === 'dart_symbols'
-        ? 'Symbols uploaded'
-        : 'Source map uploaded';
+        ? t('sourcemaps.toast.symbols')
+        : t('sourcemaps.toast.sourceMap');
   // Only `dart_symbols` derives one — a map has no note to read, so its id came
   // from the uploader and echoing it back would confirm nothing.
   if (kind === 'dart_symbols' && res.derived_debug_id) {
-    return `${base} — debug id ${res.derived_debug_id}`;
+    return t('sourcemaps.toast.withDebugId', { base, id: res.derived_debug_id });
   }
   return base;
 }

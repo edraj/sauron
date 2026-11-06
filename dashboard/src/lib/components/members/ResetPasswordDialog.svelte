@@ -17,7 +17,7 @@
 
 <Modal
   open
-  title={action === 'reset' ? 'Reset this member’s password?' : 'Cancel the password reset?'}
+  title={action === 'reset' ? t('members.reset.title') : t('members.reset.cancelTitle')}
   dismissible={!busy}
   onclose={oncancel}
 >
@@ -27,14 +27,14 @@
          in. An admin who reads "we email them a link" and gets an unreachable
          account will not use this feature twice. -->
     <p class="lead">
-      <strong>{member.email} will not be able to sign in until they use the emailed link.</strong>
+      <strong>{t('members.reset.lockout', { email: member.email })}</strong>
     </p>
     <p>
       {t('prose.members.resetWarning')}
     </p>
   {:else}
     <p class="lead">
-      {member.email} will be able to sign in with their existing password again.
+      {t('members.reset.cancelLead', { email: member.email })}
     </p>
     <p>
       {t('prose.members.resetPending')}
@@ -42,21 +42,21 @@
   {/if}
 
   {#snippet footer()}
-    <Button variant="ghost" onclick={oncancel} disabled={busy}>{t('members.reset.neverMind')}</Button>
+    <Button variant="secondary" onclick={oncancel} disabled={busy}>{t('members.reset.neverMind')}</Button>
     <Button variant={action === 'reset' ? 'danger' : 'primary'} loading={busy} onclick={onconfirm}>
-      {action === 'reset' ? 'Reset password' : 'Cancel reset'}
+      {action === 'reset' ? t('members.reset.action') : t('members.reset.cancelAction')}
     </Button>
   {/snippet}
 </Modal>
 
 <style>
   .lead {
-    font-size: 14px;
+    font-size: var(--text-sm);
     line-height: 1.5;
     margin-bottom: 10px;
   }
   p {
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     line-height: 1.55;
     color: var(--text-muted);
   }

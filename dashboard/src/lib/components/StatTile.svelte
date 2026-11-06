@@ -2,7 +2,10 @@
   import type { Snippet } from 'svelte';
   import { t } from '../i18n';
 
-  type Tone = 'neutral' | 'primary' | 'success' | 'warning' | 'error' | 'info';
+  // No `primary`: a figure is coloured only when the colour says something
+  // (a severity, a health state). Accent-coloured headline numbers were
+  // decoration that made one tile per row look like a link.
+  type Tone = 'neutral' | 'success' | 'warning' | 'error' | 'info';
 
   interface Props {
     label: string;
@@ -87,10 +90,9 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
-    padding: 14px 16px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    padding: 4px 20px;
+    background: var(--bg);
+    box-shadow: -1px 0 0 var(--border), 0 -1px 0 var(--border);
     min-width: 0;
     position: relative;
     overflow: hidden;
@@ -106,23 +108,20 @@
     }
   }
   .stat-tile.interactive {
-    transition: border-color 0.13s ease, background 0.13s ease;
+    transition: background-color 0.12s ease;
   }
   .stat-tile.interactive:hover {
-    border-color: var(--border-strong);
-    background: var(--surface-2);
+    background: var(--surface);
   }
   .st-label {
-    font-size: 11.5px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-regular);
     color: var(--text-muted);
-    text-transform: uppercase;
   }
   .st-value {
-    font-size: 26px;
-    font-weight: 680;
-    letter-spacing: -0.02em;
+    font-size: var(--text-xl);
+    font-weight: var(--weight-medium);
+    letter-spacing: -0.01em;
     line-height: 1.15;
     font-variant-numeric: tabular-nums;
   }
@@ -131,14 +130,14 @@
      announce "Loading" five times. */
   .st-pending {
     display: block;
-    height: 30px;
+    height: 25px;
     width: 60%;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: linear-gradient(
       90deg,
-      var(--border, #2a2a2a) 25%,
-      var(--surface-2, #333) 50%,
-      var(--border, #2a2a2a) 75%
+      var(--surface-2) 25%,
+      var(--surface-3) 50%,
+      var(--surface-2) 75%
     );
     background-size: 200% 100%;
     animation: st-shimmer 1.4s ease-in-out infinite;
@@ -155,9 +154,6 @@
     .st-pending {
       animation: none;
     }
-  }
-  .st-value.primary {
-    color: var(--primary);
   }
   .st-value.success {
     color: var(--success);
@@ -178,8 +174,8 @@
     min-height: 16px;
   }
   .st-delta {
-    font-size: 12px;
-    font-weight: 620;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
   }
   .st-delta.up {
     color: var(--success);
@@ -191,7 +187,7 @@
     color: var(--text-faint);
   }
   .st-sub {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .st-sub-lines {

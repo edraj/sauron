@@ -1,5 +1,7 @@
 <script lang="ts">
   import { t } from '../i18n';
+  import Badge from './ui/Badge.svelte';
+  import Button from './ui/Button.svelte';
   import type { Frame, SymbolicatedFrame } from '../models';
 
   interface Props {
@@ -101,7 +103,7 @@
   }
 
   function loc(frame: Frame): string {
-    const file = frame.filename ?? frame.module ?? frame.abs_path ?? '<unknown>';
+    const file = frame.filename ?? frame.module ?? frame.abs_path ?? t('stack.unknownFile');
     if (frame.lineno != null) {
       return frame.colno != null
         ? `${file}:${frame.lineno}:${frame.colno}`
@@ -123,14 +125,9 @@
 {:else}
   {#if hasSymbolicated}
     <div class="toolbar">
-      <button
-        type="button"
-        class="toggle"
-        onclick={() => (showRaw = !showRaw)}
-        aria-pressed={showRaw}
-      >
-        {showRaw ? 'Show original' : 'Show minified'}
-      </button>
+      <Button variant="ghost" size="sm" onclick={() => (showRaw = !showRaw)}>
+        {showRaw ? t('stack.showOriginal') : t('stack.showMinified')}
+      </Button>
     </div>
   {/if}
   <div class="trace">
@@ -144,8 +141,9 @@
           aria-expanded={isOpen}
         >
           <span class="dots" aria-hidden="true">⋯</span>
-          {isOpen ? 'Hide' : 'Show'}
-          {chunk.frames.length} frame{chunk.frames.length === 1 ? '' : 's'}
+          {isOpen
+            ? t('stack.hideFrames', { n: chunk.frames.length })
+            : t('stack.showFrames', { n: chunk.frames.length })}
         </button>
       {/if}
       {#if !chunk.collapsible || isOpen}
@@ -155,8 +153,8 @@
             <div class="marker" aria-hidden="true"></div>
             <div class="body">
               <div class="fn-line">
-                <span class="fn">{frame.function ?? '<anonymous>'}</span>
-                {#if frame.in_app}<span class="chip">in app</span>{/if}
+                <span class="fn" data-ltr>{frame.function ?? t('stack.anonymousFn')}</span>
+                {#if frame.in_app}<Badge tone="primary" size="sm">{t('stack.inApp')}</Badge>{/if}
               </div>
               <div class="loc mono">{loc(frame)}</div>
               {#if c}
@@ -187,12 +185,12 @@
 <style>
   .empty {
     padding: 8px 2px;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .raw-trace {
     margin: 0;
     padding: 12px 14px;
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 1.5;
     color: var(--text-muted);
     background: var(--surface);
@@ -205,19 +203,6 @@
     display: flex;
     justify-content: flex-end;
     margin-bottom: 8px;
-  }
-  .toggle {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--primary);
-    background: var(--primary-soft);
-    border: 1px solid var(--border);
-    padding: 4px 10px;
-    border-radius: var(--radius-pill);
-    cursor: pointer;
-  }
-  .toggle:hover {
-    background: color-mix(in srgb, var(--primary-soft) 70%, var(--primary));
   }
   .trace {
     display: flex;
@@ -244,8 +229,8 @@
     gap: 8px;
     width: 100%;
     padding: 8px 14px;
-    font-size: 12px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     text-align: start;
     color: var(--text-muted);
     background: var(--surface-2);
@@ -258,10 +243,10 @@
   }
   .fold:hover {
     color: var(--text);
-    background: color-mix(in srgb, var(--primary-soft) 45%, var(--surface-2));
+    background: var(--surface-3);
   }
   .fold .dots {
-    font-size: 14px;
+    font-size: var(--text-sm);
     line-height: 1;
     color: var(--text-faint);
     letter-spacing: 0.08em;
@@ -292,9 +277,9 @@
   }
   .fn {
     font-family: var(--font-mono);
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
-    font-weight: 500;
+    font-weight: var(--weight-medium);
   }
   .frame.in-app .fn {
     color: var(--text);
@@ -302,18 +287,8 @@
   .frame:not(.in-app) .fn {
     color: var(--text-muted);
   }
-  .chip {
-    font-size: 10px;
-    font-weight: 650;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--primary);
-    background: var(--primary-soft);
-    padding: 2px 6px;
-    border-radius: var(--radius-pill);
-  }
   .loc {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     overflow-x: auto;
     white-space: nowrap;
@@ -327,7 +302,7 @@
   }
   .ctx-line {
     display: flex;
-    font-size: 12px;
+    font-size: var(--text-xs);
     white-space: pre;
     line-height: 1.5;
   }
@@ -345,10 +320,10 @@
     color: var(--text-muted);
   }
   .ctx-line.crash {
-    background: color-mix(in srgb, var(--danger, #e5484d) 16%, transparent);
+    background: color-mix(in srgb, var(--error) 16%, transparent);
   }
   .ctx-line.crash .src {
     color: var(--text);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 </style>

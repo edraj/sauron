@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatNumber } from '../i18n';
+  import { formatNumber, t } from '../i18n';
   import type { HistoBucket } from '../models';
 
   interface Props {
@@ -8,7 +8,7 @@
     emptyLabel?: string;
   }
 
-  let { data, height = 160, emptyLabel = 'No sessions in this range' }: Props = $props();
+  let { data, height = 160, emptyLabel }: Props = $props();
 
   const max = $derived(data.length ? Math.max(...data.map((d) => d.count), 1) : 1);
   const total = $derived(data.reduce((sum, d) => sum + d.count, 0));
@@ -20,7 +20,7 @@
 </script>
 
 {#if total === 0}
-  <div class="chart-empty" style="height:{height}px">{emptyLabel}</div>
+  <div class="chart-empty" style="height:{height}px">{emptyLabel ?? t('chart.empty.sessions')}</div>
 {:else}
   <div class="chart">
     <div class="plot" style="height:{height}px">
@@ -45,23 +45,23 @@
     width: 100%;
     max-width: 64px;
     border-radius: 4px 4px 0 0;
-    background: linear-gradient(to top, color-mix(in srgb, var(--primary) 55%, transparent), var(--primary));
+    background: var(--chart-1);
   }
   .cnt {
     position: absolute;
     bottom: calc(100% + 3px);
     left: 50%;
     transform: translateX(-50%);
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     white-space: nowrap;
   }
-  .lbl { font-size: 11.5px; color: var(--text-faint); white-space: nowrap; }
+  .lbl { font-size: var(--text-xs); color: var(--text-faint); white-space: nowrap; }
   .chart-empty {
     display: grid;
     place-items: center;
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
   }

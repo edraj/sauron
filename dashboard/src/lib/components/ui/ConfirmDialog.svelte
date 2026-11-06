@@ -44,7 +44,7 @@
 
 <style>
   .msg {
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     line-height: 1.55;
     margin: 0;

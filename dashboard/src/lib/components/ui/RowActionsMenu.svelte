@@ -124,7 +124,7 @@
     border: 1px solid transparent;
     border-radius: var(--radius);
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: var(--text-md);
     line-height: 1;
     padding: 4px 8px;
     cursor: pointer;
@@ -148,7 +148,7 @@
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--shadow);
     text-align: start;
   }
   /* The parent <td> is `white-space: nowrap` for the trigger's sake; items
@@ -161,7 +161,7 @@
     border: none;
     border-radius: calc(var(--radius) - 2px);
     color: var(--text);
-    font-size: 13px;
+    font-size: var(--text-sm);
     text-align: start;
     white-space: normal;
     cursor: pointer;

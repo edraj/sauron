@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t, joinList } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
@@ -7,7 +8,6 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -20,6 +20,9 @@
   import SearchDisclosure from '../lib/components/search/SearchDisclosure.svelte';
   import { combineFreshness } from '../lib/models/freshness';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import CursorPagination from '../lib/components/CursorPagination.svelte';
@@ -380,6 +383,22 @@
   );
 
   /**
+   * Which "nothing here" this is, by the spec's order: a filter or search the
+   * reader applied, then the window, and "yet" only at the widest window —
+   * where the range narrows nothing and the list really is everything there
+   * is. The untouched default view keeps its own reassurance.
+   */
+  const emptyKind = $derived<'default' | 'match' | 'range' | 'yet'>(
+    isUnresolvedDefault
+      ? 'default'
+      : filters.length > 0 || appliedSearch !== ''
+        ? 'match'
+        : range.kind === 'last' && range.days >= WIDEST_RANGE
+          ? 'yet'
+          : 'range',
+  );
+
+  /**
    * `force` bypasses the fresh-window short-circuit: the Refresh button and the
    * error-state Retry both mean "go to the network now".
    *
@@ -587,25 +606,22 @@
   });
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('issues.title')}</h1>
-      <p class="muted sub">{t('issues.subtitle')}</p>
-    </div>
-    <div class="controls">
+  <PageHeader title={t('issues.title')} subtitle={t('issues.subtitle')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <!--
         Spins for a background revalidate too, not just an explicit click: that
         spinner IS the "showing cached data, fetching fresh" hint, and without it
         the instant paint is indistinguishable from live data.
       -->
-      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
       <RefreshButton
         onclick={refresher.run}
         loading={refresher.busy || refreshing || revalidating || revalidatingStats}
-        title={revalidating || revalidatingStats ? 'Refreshing…' : 'Refresh'}
       />
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   {#if stats}
     <StatTiles min={140}>
@@ -633,13 +649,20 @@
       </Card>
     </div>
   {:else if loadingStats}
-    <div class="stats-grid"><Card><Skeleton rows={2} height="28px" /></Card><Card><Skeleton rows={1} height="200px" /></Card></div>
+    <div class="stats-loading">
+      <Skeleton rows={2} height="28px" />
+      <Skeleton rows={1} height="200px" />
+    </div>
   {/if}
 
   <FilterBar fields={ISSUE_FIELDS} bind:filters bind:search bind:range ranges={ISSUE_RANGES} appId={sessionStore.currentAppId ?? undefined} context="issues" error={searchError} {onSearch} />
   <SearchDisclosure {clamped} />
 
-  <Card padding="none">
+  <!--
+    No card around the table: a table is its own section — rows and
+    hairlines on the page's edge — and the toolbar above already opens it.
+  -->
+  <div class="list">
     <!--
       A forced Refresh or Retry that failed over rows we already had. The rows
       below are real, just older than the reader asked for, so they stay — and
@@ -648,49 +671,50 @@
       nothing needs interrupting, the data is simply not as fresh as requested.
     -->
     {#if staleError}
-      <p class="stale-banner" role="status">
-        <Icon name="triangle-alert" size={14} />
-        <span>Showing the last results that loaded — refreshing failed: {error}</span>
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={() =>
-            sessionStore.currentAppId &&
-            load(sessionStore.currentAppId, appliedSearch, list, true)}
-        >
-          {t('ui.tryAgain')}
-        </Button>
-      </p>
-    {/if}
-    {#if loading}
-      <Skeleton rows={6} />
-    {:else if fatalError}
-      <EmptyState
-        title={blockedFilterFields.length > 0
-          ? 'This filter needs more access'
-          : "Couldn't load issues"}
-        description={error ?? undefined}
-        icon="triangle-alert"
-      >
-        {#snippet action()}
-          {#if blockedFilterFields.length > 0}
-            <!-- Not a Retry: the grant will not change between clicks, so the
-                 only route back to a rendered page is dropping the chip. -->
-            <Button variant="secondary" onclick={dropBlockedFilters}>
-              Remove {blockedFilterLabels} filter{blockedFilterFields.length > 1 ? 's' : ''}
-            </Button>
-          {:else}
+      <div class="stale">
+        <InlineNotice tone="warning">
+          {t('ui.staleResults', { error: loadErrorText(issuesView) })}
+          {#snippet action()}
             <Button
-              variant="secondary"
+              variant="ghost"
+              size="sm"
               onclick={() =>
                 sessionStore.currentAppId &&
                 load(sessionStore.currentAppId, appliedSearch, list, true)}
             >
               {t('common.retry')}
             </Button>
-          {/if}
+          {/snippet}
+        </InlineNotice>
+      </div>
+    {/if}
+    {#if loading}
+      <Skeleton rows={6} />
+    {:else if fatalError && blockedFilterFields.length > 0}
+      <!-- Not a load failure, so not ErrorState, and not a Retry: the grant
+           will not change between clicks, so the only route back to a
+           rendered page is dropping the chip. -->
+      <EmptyState
+        title={t('issues.blocked.title')}
+        description={error ?? undefined}
+        icon="lock"
+      >
+        {#snippet action()}
+          <Button variant="secondary" onclick={dropBlockedFilters}>
+            {blockedFilterFields.length > 1
+              ? t('issues.blocked.removeMany', { filters: blockedFilterLabels })
+              : t('issues.blocked.removeOne', { filters: blockedFilterLabels })}
+          </Button>
         {/snippet}
       </EmptyState>
+    {:else if fatalError}
+      <ErrorState
+        title={t('issues.error.load')}
+        error={issuesView}
+        onretry={() =>
+          sessionStore.currentAppId &&
+          load(sessionStore.currentAppId, appliedSearch, list, true)}
+      />
     {:else if emptyPastFirstPage}
       <!--
         Deliberately not the copy below. That one answers "does anything match?"
@@ -711,13 +735,27 @@
         {/snippet}
       </EmptyState>
     {:else if issues.length === 0}
-      <EmptyState
-        title={t('issues.empty.title')}
-        description={isUnresolvedDefault
-          ? 'Nothing unresolved right now. Your app is behaving.'
-          : 'No issues match these filters.'}
-        icon="check"
-      />
+      {#if emptyKind === 'default'}
+        <EmptyState
+          title={t('issues.empty.unresolved')}
+          description={t('issues.empty.unresolvedBody')}
+          icon="check"
+        />
+      {:else if emptyKind === 'match'}
+        <EmptyState
+          title={t('common.empty.match', { things: t('issues.things') })}
+          description={t('common.empty.matchHint')}
+          icon="search"
+        />
+      {:else if emptyKind === 'yet'}
+        <EmptyState title={t('common.empty.yet', { things: t('issues.things') })} icon="check" />
+      {:else}
+        <EmptyState
+          title={t('common.empty.range', { things: t('issues.things') })}
+          description={t('common.empty.rangeHint')}
+          icon="check"
+        />
+      {/if}
     {:else}
       <DataTable>
         {#snippet head()}
@@ -779,71 +817,40 @@
         {onjump}
       />
     {/if}
-  </Card>
+  </div>
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
   /* Disclosure line under a header panel. `min-height` is the whole trick:
      the element is in the flow even when `panelScopeNote` returns null, so the
      caption appearing is a text swap and never a reflow. One line is enough —
      the longest sentence the model can build is ~60 characters, which fits a
      tile row at every width the grid wraps to. */
   .scope-note {
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 16px;
     min-height: 16px;
     color: var(--text-faint);
     margin: 8px 0 0;
-  }
-  /* Sits INSIDE the card, above the rows it qualifies, so the sentence and the
-     stale data it describes cannot be read separately. `padding: none` on the
-     Card means this supplies its own. */
-  .stale-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    padding: 10px 14px;
-    font-size: 12.5px;
-    line-height: 18px;
-    color: var(--text-muted);
-    background: var(--warning-soft);
-    border-bottom: 1px solid var(--border);
-  }
-  .stale-banner :global(svg) {
-    color: var(--warning);
-    flex: none;
-  }
-  .stale-banner span {
-    flex: 1;
-    min-width: 0;
   }
   /* Inside a Card the line sits under the panel's own content, so it needs the
      gap above it that the page-level one gets from its margin. */
   .scope-note.in-card {
     margin-top: 10px;
   }
-  /* Was 14px. The reserved line above already contributes the gap the tiles
-     used to get from this margin alone. */
+  /* The reserved line above already contributes the gap the tiles used to
+     get from this margin alone. */
   .occ {
-    margin: 6px 0 18px;
+    margin: 6px 0 var(--page-gap);
+  }
+  .stats-loading {
+    display: flex;
+    flex-direction: column;
+    gap: var(--page-gap);
+    margin-bottom: var(--page-gap);
+  }
+  /* The stale-rows notice sits above the rows it qualifies, not flush on them. */
+  .stale {
+    margin-bottom: 10px;
   }
   .col-title {
     min-width: 280px;
@@ -856,14 +863,14 @@
     max-width: 480px;
   }
   .issue-title {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .issue-sub {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     overflow: hidden;
     text-overflow: ellipsis;

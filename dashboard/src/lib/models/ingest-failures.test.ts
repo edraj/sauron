@@ -52,6 +52,11 @@ describe('describeRecovery', () => {
 });
 
 describe('describeKind', () => {
+  it('never resolves a server slug through Object.prototype', () => {
+    expect(describeKind('constructor')).toBe('constructor');
+    expect(describeKind('toString')).toBe('toString');
+  });
+
   it('labels the known slugs', () => {
     expect(describeKind('decode')).toBe('Malformed payload');
     expect(describeKind('db_fk_violation')).toBe('Unknown reference');
