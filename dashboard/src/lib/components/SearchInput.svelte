@@ -36,7 +36,7 @@
 
   let {
     value = $bindable(''),
-    placeholder = 'Search…',
+    placeholder = undefined,
     oninput,
     onsearch,
     width = undefined,
@@ -77,7 +77,7 @@
   <span class="ic" aria-hidden="true"><Icon name="search" size={15} /></span>
   <input
     type="search"
-    {placeholder}
+    placeholder={placeholder ?? t('search.placeholder')}
     {value}
     oninput={handle}
     onkeydown={handleKeyDown}
@@ -106,6 +106,8 @@
 </div>
 
 <style>
+  /* `Input`'s shell exactly: the control surface, a `--border-strong` edge,
+     the accent only on focus. */
   .search {
     display: inline-flex;
     align-items: center;
@@ -113,16 +115,16 @@
     height: var(--control-h);
     max-width: 100%;
     padding-inline: 10px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    transition: border-color 0.13s ease, box-shadow 0.13s ease;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
   .search.has-go {
     padding-inline-end: 3px;
   }
   .search:focus-within {
-    border-color: var(--primary-border);
+    border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-soft);
   }
   .ic {
@@ -139,7 +141,7 @@
     background: none;
     border: none;
     color: var(--text);
-    font-size: 13px;
+    font-size: var(--text-sm);
     outline: none;
   }
   input::placeholder {
@@ -163,28 +165,30 @@
   .clear:hover {
     color: var(--text);
   }
+  /* A segment inside the shell, on the same 3px inset as `SegmentedControl`. */
   .go {
     flex-shrink: 0;
-    height: 28px;
-    padding: 0 11px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    height: calc(var(--control-h) - 8px);
+    padding: 0 10px;
+    background: var(--surface-2);
+    border: none;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    transition: color 0.13s ease, border-color 0.13s ease, background 0.13s ease;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    transition: color 0.12s ease, background-color 0.12s ease;
   }
   .go:hover {
     color: var(--text);
-    border-color: var(--border-strong);
+    background: var(--surface-3);
   }
+  /* The solid fills: white text on dark-theme `--primary` is 3.26:1, and
+     2.74:1 on `--primary-hover`. */
   .go.pending {
-    background: var(--primary);
-    border-color: transparent;
+    background: var(--primary-solid);
     color: var(--primary-contrast);
   }
   .go.pending:hover {
-    background: var(--primary-hover);
+    background: var(--primary-solid-hover);
   }
 </style>

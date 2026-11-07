@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
+  import { opLabel, spanStatusLabel } from '../lib/models/perf-ops';
   import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
@@ -8,6 +10,9 @@
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -58,9 +63,16 @@
    * exactly the case where a span's `occurred_at` is the untrustworthy one.
    */
   const TIME_FIELDS: TimeField[] = [
-    { key: 'occurred_at', label: 'Occurred' },
-    { key: 'received_at', label: 'Received' },
+    { key: 'occurred_at', label: 'occurred_at' },
+    { key: 'received_at', label: 'received_at' },
   ];
+  // The same two columns with their visible names. Kept apart from
+  // `TIME_FIELDS`, which is read once at init to parse the URL and needs only
+  // the keys, so the labels can follow a locale switch.
+  const timeFieldOptions = $derived<TimeField[]>([
+    { key: 'occurred_at', label: t('transactions.timeField.occurred') },
+    { key: 'received_at', label: t('transactions.timeField.received') },
+  ]);
   const DEFAULT_TIME_FIELD = 'occurred_at';
 
   // Hydrate from the URL once, at init — not inside an effect, so this never
@@ -186,6 +198,10 @@
 
   const staleError = $derived(error !== null && rows.length > 0);
   const fatalError = $derived(error !== null && rows.length === 0);
+  /** A chip or a search narrows the rows: the empty state says "match", not "range". */
+  const filtered = $derived(filters.length > 0 || appliedSearch.trim() !== '');
+
+
 
   /**
    * Prev/Next/sort load IMPERATIVELY rather than by writing state the reload
@@ -305,17 +321,22 @@
   });
 </script>
 
-  <div class="head">
-    <div>
-      <h1>{t('transactions.title')}</h1>
-      <p class="sub muted">
+  <PageHeader title={t('transactions.title')}>
+    {#snippet meta()}
+      <!-- A subtitle with a link in it, so it rides the meta line: the
+           subtitle prop is plain text. -->
+      <span class="lede">
         {t('transactions.subtitle')}
         <a href="#/performance">{t('perf.title')}</a> {t('transactions.aggregatedBy')}
-      </p>
-    </div>
-    <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-    <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
-  </div>
+      </span>
+    {/snippet}
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+  </PageHeader>
 
   <FilterBar
     fields={TRANSACTION_FIELDS}
@@ -330,45 +351,52 @@
   />
   <SearchDisclosure {clamped} />
 
-  <Card padding="none" title={t('transactions.card.spans')}>
+  <Card title={t('transactions.card.spans')}>
     {#snippet actions()}
-      <TimeFilter fields={TIME_FIELDS} value={window_} onchange={(v) => (window_ = v)} />
+      <TimeFilter fields={timeFieldOptions} value={window_} onchange={(v) => (window_ = v)} />
     {/snippet}
 
     <!--
       A refresh or retry of THESE rows failed. They stay, and so does the pager
       — losing page 4 of a walk to one bad poll is a worse outcome than rows a
-      minute old. `role="status"`, not `alert`: nothing on screen is broken.
+      minute old. A warning, not an error: nothing on screen is broken.
     -->
     {#if staleError}
-      <p class="stale-banner" role="status">
-        <Icon name="triangle-alert" size={14} />
-        <span>Showing the last results that loaded — refreshing failed: {error}</span>
-        <Button variant="ghost" size="sm" onclick={refresher.run}>{t('ui.tryAgain')}</Button>
-      </p>
+      <div class="stale">
+        <InlineNotice tone="warning">
+          {t('ui.staleResults', { error: loadErrorText(view) })}
+          {#snippet action()}
+            <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+          {/snippet}
+        </InlineNotice>
+      </div>
     {/if}
 
     {#if loading && rows.length === 0}
       <Skeleton rows={6} />
     {:else if fatalError}
-      <EmptyState title={t('transactions.error.load')} description={error ?? undefined} icon="triangle-alert">
-        {#snippet action()}
-          <Button onclick={refresher.run}>{t('ui.tryAgain')}</Button>
-        {/snippet}
-      </EmptyState>
+      <ErrorState title={t('transactions.error.load')} error={view} onretry={refresher.run} size="section" />
     {:else if rows.length === 0}
-      <EmptyState
-        title={t('transactions.empty.title')}
-        description={t('transactions.empty.body')}
-        icon="timer"
-      />
+      {#if filtered}
+        <EmptyState
+          size="section"
+          title={t('common.empty.match', { things: t('transactions.noun') })}
+          description={t('common.empty.matchHint')}
+        />
+      {:else}
+        <EmptyState
+          size="section"
+          title={t('common.empty.range', { things: t('transactions.noun') })}
+          description={t('common.empty.rangeHint')}
+        />
+      {/if}
     {:else}
       <DataTable>
         {#snippet head()}
           <tr>
             <th class="chev" aria-label={t('ui.opModal.expand')}></th>
             <SortableTh key="name" columnDefault="asc" sort={list.sort} {onsort}>{t('common.name')}</SortableTh>
-            <SortableTh key="op" columnDefault="asc" sort={list.sort} {onsort}>Op</SortableTh>
+            <SortableTh key="op" columnDefault="asc" sort={list.sort} {onsort}>{t('perf.column.op')}</SortableTh>
             <SortableTh key="duration_ms" class="num" sort={list.sort} {onsort}>{t('explore.column.duration')}</SortableTh>
             <th>{t('common.status')}</th>
             <th>HTTP</th>
@@ -396,7 +424,7 @@
                 <button
                   class="chev-btn"
                   aria-expanded={expanded.has(tx.id)}
-                  aria-label={expanded.has(tx.id) ? 'Hide details' : 'Show details'}
+                  aria-label={expanded.has(tx.id) ? t('transactions.hideDetails') : t('transactions.showDetails')}
                   onclick={() => toggle(tx.id)}
                 >
                   <Icon name={expanded.has(tx.id) ? 'chevron-down' : 'chevron-right'} size={14} />
@@ -408,11 +436,11 @@
                   <span class="url muted truncate" title={tx.url}>{tx.url}</span>
                 {/if}
               </td>
-              <td><Badge tone="neutral" size="sm">{tx.op.replace('_', ' ')}</Badge></td>
+              <td><Badge tone="neutral" size="sm">{opLabel(tx.op)}</Badge></td>
               <td class="num"><LatencyBadge ms={tx.duration_ms} size="sm" /></td>
               <td>
                 {#if tx.status}
-                  <Badge tone={tx.status === 'ok' ? 'success' : 'warning'} size="sm">{tx.status}</Badge>
+                  <Badge tone={tx.status === 'ok' ? 'success' : 'warning'} size="sm">{spanStatusLabel(tx.status)}</Badge>
                 {:else}
                   <span class="muted">—</span>
                 {/if}
@@ -473,27 +501,14 @@
   </Card>
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
+  /* The meta line is a caption; this one is the page's subtitle, so it reads
+     at subtitle size. */
+  .lede {
+    font-size: var(--text-sm);
+    max-width: 72ch;
   }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .stale-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    padding: 8px 14px;
-    font-size: 12.5px;
-    background: var(--warning-soft);
-    color: var(--warning);
+  .stale {
+    margin-bottom: 12px;
   }
   .name {
     display: block;
@@ -502,7 +517,7 @@
   .url {
     display: block;
     max-width: 380px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   /* Fixed width so the chevron column does not resize between a page whose
      rows all carry metadata and one where none do. */
@@ -520,7 +535,7 @@
     border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--muted);
+    color: var(--text-muted);
     cursor: pointer;
   }
   .chev-btn:hover {

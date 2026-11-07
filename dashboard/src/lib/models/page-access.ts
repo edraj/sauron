@@ -1,5 +1,6 @@
 import type { Permission } from './index';
-import { PERMISSION_LABELS } from './permissions';
+import { permissionLabel } from './permissions';
+import { t, type MessageKey } from '../i18n';
 import { sessionStore, type CanScope } from '../stores/session.svelte';
 
 /**
@@ -21,7 +22,13 @@ export interface PageAccess {
    * (`Reach` in rbac.rs) instead of authorizing at one fixed scope.
    */
   level: 'org' | 'project' | 'app' | 'reach';
-  title: string;
+  /**
+   * Catalog key for the page's name, translated where it renders
+   * (`PermissionDenied`). A key rather than a string because this table is a
+   * module-level constant: a `t()` call here would freeze the language at
+   * import time. Reuses the nav label wherever the page has one.
+   */
+  titleKey: MessageKey;
   /**
    * Set when this page's list endpoint takes `sauron-auth`'s ENV-AWARE read
    * path (`authorized_read_scope` → `authorize_env_read`) rather than the
@@ -54,27 +61,27 @@ export interface PageAccess {
  */
 export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // --- Monitor -------------------------------------------------------------
-  '/overview': { perm: 'event:read', level: 'app', title: 'Overview', envAware: true },
-  '/issues': { perm: 'issue:read', level: 'app', title: 'Exceptions', envAware: true },
-  '/performance': { perm: 'event:read', level: 'app', title: 'Performance', envAware: true },
+  '/overview': { perm: 'event:read', level: 'app', titleKey: 'nav.overview', envAware: true },
+  '/issues': { perm: 'issue:read', level: 'app', titleKey: 'nav.issues', envAware: true },
+  '/performance': { perm: 'event:read', level: 'app', titleKey: 'nav.performance', envAware: true },
 
   // --- Explore -------------------------------------------------------------
-  '/events': { perm: 'event:read', level: 'app', title: 'Events', envAware: true },
+  '/events': { perm: 'event:read', level: 'app', titleKey: 'nav.events', envAware: true },
   // `routes/transactions.rs:list` authorizes on `event:read` at the app scope,
   // and the same permission gates the `tags`/`extra` body via
   // `symbolicate::gate_transaction_body`.
-  '/transactions': { perm: 'event:read', level: 'app', title: 'Transactions', envAware: true },
-  '/sessions': { perm: 'event:read', level: 'app', title: 'Sessions', envAware: true },
-  '/users': { perm: 'event:read', level: 'app', title: 'Users', envAware: true },
-  '/persons': { perm: 'event:read', level: 'app', title: 'Users', envAware: true },
-  '/devices': { perm: 'event:read', level: 'app', title: 'Devices', envAware: true },
-  '/screens': { perm: 'event:read', level: 'app', title: 'Screens', envAware: true },
-  '/workflows': { perm: 'event:read', level: 'app', title: 'Workflows', envAware: true },
+  '/transactions': { perm: 'event:read', level: 'app', titleKey: 'nav.transactions', envAware: true },
+  '/sessions': { perm: 'event:read', level: 'app', titleKey: 'nav.sessions', envAware: true },
+  '/users': { perm: 'event:read', level: 'app', titleKey: 'nav.users', envAware: true },
+  '/persons': { perm: 'event:read', level: 'app', titleKey: 'nav.users', envAware: true },
+  '/devices': { perm: 'event:read', level: 'app', titleKey: 'nav.devices', envAware: true },
+  '/screens': { perm: 'event:read', level: 'app', titleKey: 'nav.screens', envAware: true },
+  '/workflows': { perm: 'event:read', level: 'app', titleKey: 'nav.workflows', envAware: true },
 
   // --- Analyze -------------------------------------------------------------
   // Project-level: active_users.rs:525 resolves reach across every app in the
   // project rather than authorizing one app.
-  '/active-users': { perm: 'event:read', level: 'project', title: 'Active users', envAware: true },
+  '/active-users': { perm: 'event:read', level: 'project', titleKey: 'nav.activeUsers', envAware: true },
   // NOT envAware, unlike its Explore/Analyze neighbours. `funnels::compute`
   // (the live counts) is environment-aware, but the page LOADS through
   // `funnels::list_saved`, and `/v1/apps/{id}/funnels` sits in
@@ -83,15 +90,15 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // `environment_id` outright and authorizes at the app. Marking this page
   // envAware would admit an environment-scoped member to a page whose first
   // request 403s.
-  '/funnels': { perm: 'event:read', level: 'app', title: 'Funnels' },
-  '/journeys': { perm: 'event:read', level: 'app', title: 'Journeys', envAware: true },
+  '/funnels': { perm: 'event:read', level: 'app', titleKey: 'nav.funnels' },
+  '/journeys': { perm: 'event:read', level: 'app', titleKey: 'nav.journeys', envAware: true },
   // `routes/retention.rs` authorizes through `scope::authorized_read_scope`
   // on `event:read` — the ENV-AWARE read path, hence `envAware`.
-  '/retention': { perm: 'event:read', level: 'app', title: 'Retention', envAware: true },
+  '/retention': { perm: 'event:read', level: 'app', titleKey: 'nav.retention', envAware: true },
 
   // --- Uptime --------------------------------------------------------------
   // monitors.rs:67 authorizes at the project.
-  '/monitors': { perm: 'monitor:read', level: 'project', title: 'Monitors' },
+  '/monitors': { perm: 'monitor:read', level: 'project', titleKey: 'nav.monitors' },
 
   // --- Admin ---------------------------------------------------------------
   // '/admin' itself is ungated: no single permission expresses "can reach at
@@ -101,13 +108,13 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   '/admin': null,
   // orgs.rs:160 uses authorize_org — a project- or app-scoped member:read
   // grant genuinely cannot list members.
-  '/admin/members': { perm: 'member:read', level: 'org', title: 'Members' },
+  '/admin/members': { perm: 'member:read', level: 'org', titleKey: 'admin.nav.members' },
   // orgs.rs:1380 gates list_roles on member:read, not role:manage — reading
   // the catalogue is not the same as editing it.
-  '/admin/roles': { perm: 'member:read', level: 'org', title: 'Roles' },
+  '/admin/roles': { perm: 'member:read', level: 'org', titleKey: 'admin.nav.roles' },
   // projects.rs:49 is reach-based: an app-scoped member receives a filtered
   // list rather than a 403, so this is the widest level rather than 'project'.
-  '/admin/projects': { perm: 'project:read', level: 'app', title: 'Projects' },
+  '/admin/projects': { perm: 'project:read', level: 'app', titleKey: 'admin.nav.projects' },
   // Widest level rather than 'project' — same reasoning as '/admin/projects'
   // above. list_project_environments (environments.rs:196) authorizes the
   // CATALOGUE at the project via authorize_project (not reach-based), but
@@ -119,38 +126,38 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
   // `can()` level (keeps org, project AND app scope ids), so it admits that
   // member; Environments.svelte then degrades the catalogue-only parts of the
   // page when the project-wide read 403s.
-  '/admin/environments': { perm: 'env:read', level: 'app', title: 'Environments' },
-  '/admin/settings': { perm: 'app:read', level: 'app', title: 'App settings' },
+  '/admin/environments': { perm: 'env:read', level: 'app', titleKey: 'admin.nav.environments' },
+  '/admin/settings': { perm: 'app:read', level: 'app', titleKey: 'admin.nav.settings' },
   // artifacts.rs:396 lists on issue:read; only upload (:181) and delete (:429)
   // need artifact:write. Gating the PAGE on the write permission replaced a
   // readable page with a wall for everyone who could read it — SourceMaps.svelte
   // already computes a `writeLock` and applies it to all three write controls,
   // so the page was built to degrade and only this row disagreed.
-  '/admin/source-maps': { perm: 'issue:read', level: 'app', title: 'Source Maps' },
+  '/admin/source-maps': { perm: 'issue:read', level: 'app', titleKey: 'admin.nav.sourceMaps' },
   // Every READ in notifications.rs goes through `alert_read_reach`: a member
   // holding alert:read on one project or app gets the rules narrowed to it and
   // the channels those rules deliver to. Writes stay on authorize_org, which
   // Alerts.svelte's `writeLock` mirrors — so a scoped member reads the page
   // and finds its write controls locked. `page-access.test.ts` reads the
   // handlers, so this row cannot outlive the helper it was derived from.
-  '/admin/alerts': { perm: 'alert:read', level: 'reach', title: 'Alerts' },
+  '/admin/alerts': { perm: 'alert:read', level: 'reach', titleKey: 'admin.nav.alerts' },
   // admin.rs:30 uses require_deployment_admin, which accepts org:manage OR
   // role:manage. Gate on role:manage so both Owner and Admin see the page.
-  '/admin/storage': { perm: 'role:manage', level: 'org', title: 'Storage' },
-  '/admin/privacy': { perm: 'pii:read', level: 'app', title: 'Privacy' },
+  '/admin/storage': { perm: 'role:manage', level: 'org', titleKey: 'admin.nav.storage' },
+  '/admin/privacy': { perm: 'pii:read', level: 'app', titleKey: 'admin.nav.privacy' },
   // audit.rs's `list` calls authorize_org with ORG_MANAGE. Org-level, and
   // deliberately the same gate as '/admin/storage': the people who may read
   // who did what are the people who administer the org. No new permission
   // was introduced for this page.
-  '/admin/wall-of-shame': { perm: 'role:manage', level: 'org', title: 'Wall of Shame' },
+  '/admin/wall-of-shame': { perm: 'role:manage', level: 'org', titleKey: 'admin.nav.wallOfShame' },
   // Same gate as Storage and the tier routes. The backend accepts org:manage
   // OR role:manage (require_deployment_admin). Gate on role:manage so both
   // Owner and Admin see the page.
-  '/admin/ingest-failures': { perm: 'role:manage', level: 'org', title: 'Ingest failures' },
+  '/admin/ingest-failures': { perm: 'role:manage', level: 'org', titleKey: 'admin.nav.ingestFailures' },
   // Same gate as Storage / Wall of Shame / Ingest failures. The backend
   // accepts org:manage OR role:manage (require_deployment_admin). Gate on
   // role:manage so both Owner and Admin see the page.
-  '/admin/purge': { perm: 'role:manage', level: 'org', title: 'Purge data' },
+  '/admin/purge': { perm: 'role:manage', level: 'org', titleKey: 'admin.nav.purge' },
 
   // --- Self-service --------------------------------------------------------
   // Self-scoped (/v1/me/*). Always reachable — see the fallback note on
@@ -159,7 +166,7 @@ export const PAGE_ACCESS: Record<string, PageAccess | null> = {
 
   // --- Other ---------------------------------------------------------------
   // projects.rs:102 authorizes project creation at the org.
-  '/onboarding': { perm: 'project:create', level: 'org', title: 'Onboarding' },
+  '/onboarding': { perm: 'project:create', level: 'org', titleKey: 'access.page.onboarding' },
   // Integration guides — static content, no data. Always reachable.
   '/docs': null,
 };
@@ -251,9 +258,9 @@ export type LockLevel = 'org' | 'project';
  */
 export type LockReason = Permission | `${Permission}@${LockLevel}`;
 
-const LOCK_LEVEL_LABELS: Record<LockLevel, string> = {
-  org: 'organization',
-  project: 'project',
+const LOCK_LEVEL_KEYS: Record<LockLevel, MessageKey> = {
+  org: 'access.level.org',
+  project: 'access.level.project',
 };
 
 function lockReason(perm: Permission, level: PageAccess['level'] | CanScope['level']): LockReason {
@@ -290,12 +297,21 @@ export function pageLockReason(access: PageAccess): LockReason {
   return lockReason(access.perm, access.level);
 }
 
-/** Tooltip text for a locked control that cannot take a `Button` prop. */
+/**
+ * Tooltip text for a locked control that cannot take a `Button` prop.
+ *
+ * Translated on every call, so callers must call it at render time (markup,
+ * `$derived`, or — as `lockTip` does — when the tooltip is shown) rather than
+ * caching the string. The raw permission id stays Latin in every locale: it is
+ * what the role editor and the server name, and what an admin searches for.
+ */
 export function lockTitle(reason: LockReason): string {
   const at = reason.lastIndexOf('@');
   const perm = (at === -1 ? reason : reason.slice(0, at)) as Permission;
   const level = at === -1 ? null : (reason.slice(at + 1) as LockLevel);
-  const label = PERMISSION_LABELS[perm];
+  const label = permissionLabel(perm);
   const what = label ? `${label} (${perm})` : perm;
-  return level ? `Requires: ${what} at ${LOCK_LEVEL_LABELS[level]} level` : `Requires: ${what}`;
+  return level
+    ? t('access.requiresAt', { what, level: t(LOCK_LEVEL_KEYS[level]) })
+    : t('access.requires', { what });
 }

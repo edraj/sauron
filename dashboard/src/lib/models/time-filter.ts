@@ -15,6 +15,8 @@
  * would reject, not to re-decide the semantics.
  */
 
+import { t } from '../i18n';
+
 /** The route's ceiling on a window's total span. Mirrors `max_days`. */
 export const MAX_DAYS = 365;
 
@@ -158,22 +160,22 @@ export function validate(tf: TimeFilterState): string | null {
       // input is typed `any` by svelte, so a string reaches here despite the
       // `number` annotation, and `'30' > 0` is `true` — the comparison alone
       // would wave it through and the server would then reject the request.
-      if (typeof n !== 'number' || !Number.isInteger(n)) return 'Enter a whole number of days';
-      if (n < 1) return 'The window must be at least 1 day';
-      if (n > MAX_DAYS) return `This list looks back at most ${MAX_DAYS} days`;
+      if (typeof n !== 'number' || !Number.isInteger(n)) return t('timeFilter.error.wholeDays');
+      if (n < 1) return t('timeFilter.error.minDays');
+      if (n > MAX_DAYS) return t('timeFilter.error.maxDays', { max: MAX_DAYS });
       return null;
     }
     case 'after':
-      return tf.from ? null : 'Choose a start date';
+      return tf.from ? null : t('timeFilter.error.chooseStart');
     case 'before':
-      return tf.to ? null : 'Choose an end date';
+      return tf.to ? null : t('timeFilter.error.chooseEnd');
     case 'between': {
-      if (!tf.from) return 'Choose a start date';
-      if (!tf.to) return 'Choose an end date';
+      if (!tf.from) return t('timeFilter.error.chooseStart');
+      if (!tf.to) return t('timeFilter.error.chooseEnd');
       // `>=`, not `>`: the interval is half-open, so equal bounds select
       // nothing at all. Rejecting it beats returning a confidently empty table.
       if (new Date(tf.from).getTime() >= new Date(tf.to).getTime()) {
-        return 'The start must be earlier than the end';
+        return t('timeFilter.error.order');
       }
       return null;
     }

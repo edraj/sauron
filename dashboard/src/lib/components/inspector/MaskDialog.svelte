@@ -15,6 +15,7 @@
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
   import Badge from '../ui/Badge.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import Spinner from '../ui/Spinner.svelte';
   import * as inspectorApi from '../../api/inspector';
   import { errorMessage } from '../../api/client';
@@ -159,9 +160,7 @@
     submitting = true;
     try {
       await inspectorApi.confirmMask(action.id, typed.trim());
-      toastStore.success(
-        `Mask queued. New events are masked within about ${latencySecs} seconds.`,
-      );
+      toastStore.success(t('mask.toast.queued', { n: latencySecs }));
       ondone();
     } catch (e) {
       error = errorMessage(e);
@@ -176,7 +175,7 @@
      finding is selected, so open is a constant here. -->
 <Modal open size="md" title={t('mask.title')} {onclose}>
   {#if error}
-    <p class="err">{error}</p>
+    <InlineNotice tone="error">{error}</InlineNotice>
   {/if}
 
   <h4>{t('mask.willRewrite')}</h4>
@@ -186,13 +185,12 @@
     {/each}
   </ul>
   <p class="note">
-    {t('mask.becomesJson')} <code>"****"</code> and the key is kept. The TYPE changes, so
-    arithmetic, containment filters and range comparisons stop working for masked rows.
+    {t('mask.becomesJson')} <code>"****"</code> {t('mask.typeChanges')}
   </p>
   {#if touchesEventUser}
     <p class="warn">
-      {t('mask.thisMasks')} <code>event_user</code>, which backs the <code>user.email:</code> search dimension.
-      Masked rows will silently stop matching those queries.
+      {t('mask.thisMasks')} <code>event_user</code>{t('mask.eventUserA')} <code>user.email:</code>
+      {t('mask.eventUserB')}
     </p>
   {/if}
 
@@ -201,16 +199,16 @@
     <p><Spinner size={14} /> {t('mask.counting')}</p>
   {:else if action.status === 'previewed'}
     <p class="counts">
-      <Badge>{formatNumber(action.estimated_rows)} rows</Badge>
-      <Badge tone="neutral"
-        >{formatNumber(action.cold_rows_skipped)} row(s) already in cold storage, skipped</Badge
+      <Badge size="sm">{t('mask.rows', { n: formatNumber(action.estimated_rows) })}</Badge>
+      <Badge tone="neutral" size="sm"
+        >{t('mask.coldSkipped', { n: formatNumber(action.cold_rows_skipped) })}</Badge
       >
     </p>
     <p class="note">
       {t('prose.mask.countDrift')}
     </p>
   {:else}
-    <p class="err">The preview did not complete: {action.error || action.status}</p>
+    <p class="err">{t('mask.previewIncomplete', { reason: action.error || action.status })}</p>
   {/if}
 
   <h4>{t('mask.doesNotReach')}</h4>
@@ -221,11 +219,11 @@
           <!-- The headline's `what` IS the sentence that must never be
                softened into "permanently removed"; rendering only `why` left it
                dangling without its subject. -->
-          <strong>{r.what}</strong>
-          {r.why}
+          <strong>{t(r.whatKey)}</strong>
+          {t(r.whyKey)}
         {:else}
-          <strong>{r.what}</strong> — {r.why}
-          <span class="bounded">Bounded by: {r.bounded}</span>
+          <strong>{t(r.whatKey)}</strong> — {t(r.whyKey)}
+          <span class="bounded">{t('mask.boundedBy', { what: t(r.boundedKey) })}</span>
         {/if}
       </p>
     {/each}
@@ -248,53 +246,47 @@
   </div>
   <p class="note">{t('mask.irreversible')}</p>
 
-  <label for="mask-confirm">Type the app slug ({slug}) to confirm</label>
+  <label for="mask-confirm">{t('mask.typeSlug', { slug })}</label>
   <Input id="mask-confirm" bind:value={typed} placeholder={slug} autocomplete="off" />
   {#if expired}
-    <p class="warn">
-      This preview is older than {ttlSecs} seconds and no longer counts as fresh. Close this dialog
-      and start again — the count would be stale for a decision that cannot be undone.
-    </p>
+    <p class="warn">{t('mask.expired', { n: ttlSecs })}</p>
   {/if}
 
   {#snippet footer()}
-    <Button onclick={onclose}>{t('common.cancel')}</Button>
+    <Button variant="secondary" onclick={onclose}>{t('common.cancel')}</Button>
     <Button
       variant="danger"
-      disabled={!ready || submitting}
+      loading={submitting}
+      disabled={!ready}
       lockedReason={manageLock}
       onclick={confirm}
     >
-      {submitting ? 'Queuing…' : 'Mask permanently in hot Postgres'}
+      {t('mask.confirmAction')}
     </Button>
   {/snippet}
 </Modal>
 
 <style>
-  /* --danger is not defined in app.css; the theme name is --error. An undefined
-     custom property with no fallback invalidates the whole declaration, so the
-     failure text would silently inherit body colour and stop reading as a
-     failure — which is exactly how a 403 on this dialog would go unnoticed. */
   .err {
     color: var(--error);
   }
   .warn {
     color: var(--warning);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .note {
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   h4 {
     margin-top: 14px;
-    font-size: 13px;
-    font-weight: 620;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
   }
   ul {
     margin: 6px 0;
     padding-inline-start: 18px;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .counts {
     display: flex;
@@ -306,16 +298,16 @@
     max-height: 260px;
     overflow-y: auto;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius);
     padding: 8px 10px;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     display: flex;
     flex-direction: column;
     gap: 8px;
   }
   .unreachable .headline {
-    font-weight: 600;
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .unreachable .readFirst,
@@ -330,7 +322,9 @@
   label {
     display: block;
     margin-top: 12px;
-    font-size: 13px;
-    font-weight: 550;
+    margin-bottom: 6px;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    color: var(--text-muted);
   }
 </style>

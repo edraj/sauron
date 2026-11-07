@@ -1,4 +1,4 @@
-import { formatNumber } from '../i18n';
+import { formatNumber, labelFor, t, tn, type MessageKey } from '../i18n';
 import type { IngestFailure } from '../api/ingest-failures';
 
 /**
@@ -7,19 +7,23 @@ import type { IngestFailure } from '../api/ingest-failures';
  * tested without rendering.
  */
 
-/** Human labels for the backend's `error_kind` slugs (classify.rs's `kind`). */
-export const KIND_LABELS: Record<string, string> = {
-  decode: 'Malformed payload',
-  db_contention: 'Database contention',
-  db_unavailable: 'Database unavailable',
-  db_fk_violation: 'Unknown reference',
-  db_constraint: 'Constraint violation',
-  redis: 'Redis error',
-  unknown: 'Unclassified',
+/**
+ * Catalog keys for the backend's `error_kind` slugs (classify.rs's `kind`).
+ * Keys rather than strings so the label follows the active language.
+ */
+export const KIND_LABELS: Record<string, MessageKey> = {
+  decode: 'failures.kind.decode',
+  db_contention: 'failures.kind.dbContention',
+  db_unavailable: 'failures.kind.dbUnavailable',
+  db_fk_violation: 'failures.kind.dbFkViolation',
+  db_constraint: 'failures.kind.dbConstraint',
+  redis: 'failures.kind.redis',
+  unknown: 'failures.kind.unknown',
 };
 
+/** Human label for a kind; an unknown slug prints as sent. Call at render time. */
 export function describeKind(kind: string): string {
-  return KIND_LABELS[kind] ?? kind;
+  return labelFor(KIND_LABELS, kind);
 }
 
 /**
@@ -52,26 +56,32 @@ export interface Recovery {
  * columns.
  */
 export function describeRecovery(f: Pick<IngestFailure, 'occurrences' | 'retained' | 'dropped'>): Recovery {
+  // Counts go through `tn`, so "1 event" / "3 events" agree in number in
+  // English and take the right one of Arabic's six forms.
   if (f.retained === 0) {
     return {
       level: 'none',
       summary:
         f.occurrences === 0
-          ? 'Nothing retained.'
-          : `None of ${fmt(f.occurrences)} occurrences were retained — nothing can be replayed.`,
+          ? t('failures.recovery.nothing')
+          : t('failures.recovery.none', {
+              occurrences: tn('common.plural.occurrence', f.occurrences),
+            }),
     };
   }
   if (f.dropped <= 0) {
     return {
       level: 'full',
-      summary: `All ${fmt(f.retained)} ${plural(f.retained, 'event')} can be replayed.`,
+      summary: t('failures.recovery.full', { events: tn('common.plural.event', f.retained) }),
     };
   }
   return {
     level: 'partial',
-    summary:
-      `${fmt(f.retained)} of ${fmt(f.occurrences)} retained — ` +
-      `${fmt(f.dropped)} ${plural(f.dropped, 'event')} cannot be recovered.`,
+    summary: t('failures.recovery.partial', {
+      retained: fmt(f.retained),
+      occurrences: fmt(f.occurrences),
+      dropped: tn('common.plural.event', f.dropped),
+    }),
   };
 }
 
@@ -98,10 +108,6 @@ export function statusTone(status: string): 'error' | 'warning' | 'success' | 'n
 /** Thousands separators, so six-figure occurrence counts stay readable. */
 export function fmt(n: number): string {
   return formatNumber(n);
-}
-
-function plural(n: number, word: string): string {
-  return n === 1 ? word : `${word}s`;
 }
 
 /**

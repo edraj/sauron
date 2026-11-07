@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { opLabel, spanStatusLabel } from '../models/perf-ops';
   import { t, formatNumber } from '../i18n';
   /**
    * The individual spans behind one row of the Performance "Operations" table.
@@ -20,6 +21,8 @@
   import Icon from './ui/Icon.svelte';
   import Skeleton from './ui/Skeleton.svelte';
   import EmptyState from './ui/EmptyState.svelte';
+  import ErrorState from './ui/ErrorState.svelte';
+  import SegmentedControl from './ui/SegmentedControl.svelte';
   import DataTable from './DataTable.svelte';
   import TimeValue from './TimeValue.svelte';
   import LatencyBadge from './LatencyBadge.svelte';
@@ -29,7 +32,6 @@
   import { rangeKey, toParams, toPredicate, type DateRangeValue } from '../models/date-range';
   import { listTransactions } from '../api/transactions';
   import type { SearchEnvelope } from '../api/search';
-  import { errorMessage } from '../api/client';
   import { httpStatusTone } from '../models/timeline-row';
   import type { PerfSummaryRow, Transaction } from '../models';
 
@@ -62,7 +64,8 @@
 
   let page = $state.raw<SearchEnvelope<Transaction> | null>(null);
   let loading = $state(false);
-  let error = $state<string | null>(null);
+  /** The caught failure itself, so `ErrorState` can pick the human sentence. */
+  let error = $state<unknown>(null);
   let expanded = $state(new Set<string>());
 
   const rows = $derived(page?.data ?? []);
@@ -115,7 +118,7 @@
       page = envelope;
     } catch (err) {
       if (myGen !== gen) return;
-      error = errorMessage(err);
+      error = err;
       page = null;
     } finally {
       if (myGen === gen) loading = false;
@@ -159,12 +162,15 @@
     expanded = next;
   }
 
-  function opLabel(o: string): string {
-    return o.replace('_', ' ');
-  }
+
+
+  const sortOptions = $derived([
+    { value: 'duration_ms', label: t('ui.opModal.slowest') },
+    { value: 'occurred_at', label: t('ui.opModal.mostRecent') },
+  ]);
 </script>
 
-<Modal bind:open size="xl" {onclose} title={row ? row.name : 'Transactions'}>
+<Modal bind:open size="xl" {onclose} title={row ? row.name : t('nav.transactions')}>
   {#if row}
     <div class="bar">
       <div class="ctx">
@@ -172,40 +178,28 @@
         <span class="stat">p95 <strong><LatencyBadge ms={row.p95} size="sm" /></strong></span>
         <span class="stat">
           {#if loading && rows.length === 0}
-            Loading…
+            {t('common.loading')}
           {:else if rows.length > 0}
-            Showing {rows.length} of {formatNumber(total)}{totalCapped ? '+' : ''}
+            {t('opModal.showing', {
+              n: formatNumber(rows.length),
+              total: `${formatNumber(total)}${totalCapped ? '+' : ''}`,
+            })}
           {/if}
         </span>
       </div>
-      <div class="modes" role="tablist" aria-label={t('ui.opModal.order')}>
-        <button
-          class="mode"
-          class:active={sortMode === 'duration_ms'}
-          type="button"
-          role="tab"
-          aria-selected={sortMode === 'duration_ms'}
-          onclick={() => (sortMode = 'duration_ms')}
-        >{t('ui.opModal.slowest')}</button>
-        <button
-          class="mode"
-          class:active={sortMode === 'occurred_at'}
-          type="button"
-          role="tab"
-          aria-selected={sortMode === 'occurred_at'}
-          onclick={() => (sortMode = 'occurred_at')}
-        >{t('ui.opModal.mostRecent')}</button>
-      </div>
+      <SegmentedControl
+        size="sm"
+        ariaLabel={t('ui.opModal.order')}
+        options={sortOptions}
+        value={sortMode}
+        onchange={(v) => (sortMode = v as SortMode)}
+      />
     </div>
 
     {#if loading && rows.length === 0}
       <Skeleton rows={5} />
     {:else if error}
-      <EmptyState title={t('ui.opModal.loadError')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button variant="secondary" onclick={load}>{t('ui.tryAgain')}</Button>
-        {/snippet}
-      </EmptyState>
+      <ErrorState title={t('ui.opModal.loadError')} {error} onretry={load} />
     {:else if rows.length === 0}
       <EmptyState
         title={t('ui.opModal.emptyTitle')}
@@ -237,7 +231,7 @@
                   class="chev-btn"
                   type="button"
                   aria-expanded={expanded.has(tx.id)}
-                  aria-label={expanded.has(tx.id) ? 'Hide details' : 'Show details'}
+                  aria-label={expanded.has(tx.id) ? t('opModal.hideDetails') : t('opModal.showDetails')}
                   onclick={(e) => { e.stopPropagation(); toggle(tx.id); }}
                 >
                   <Icon name={expanded.has(tx.id) ? 'chevron-down' : 'chevron-right'} size={14} />
@@ -246,7 +240,7 @@
               <td class="num"><LatencyBadge ms={tx.duration_ms} size="sm" /></td>
               <td>
                 {#if tx.status}
-                  <Badge tone={tx.status === 'ok' ? 'success' : 'warning'} size="sm">{tx.status}</Badge>
+                  <Badge tone={tx.status === 'ok' ? 'success' : 'warning'} size="sm">{spanStatusLabel(tx.status)}</Badge>
                 {:else}
                   <span class="muted">—</span>
                 {/if}
@@ -320,35 +314,8 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
-  }
-  .modes {
-    display: inline-flex;
-    gap: 2px;
-    padding: 3px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .mode {
-    padding: 4px 10px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 560;
-    border-radius: var(--radius-sm);
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .mode:hover {
-    color: var(--text);
-  }
-  .mode.active {
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow-sm);
   }
   .chev {
     width: 28px;
@@ -364,7 +331,7 @@
     border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--muted);
+    color: var(--text-muted);
     cursor: pointer;
   }
   .chev-btn:hover {
@@ -385,8 +352,8 @@
     align-items: center;
     gap: 6px;
     margin-inline-end: auto;
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
   }
   .all-link:hover {

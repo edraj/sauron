@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import Card from '../lib/components/ui/Card.svelte';
@@ -6,6 +7,10 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -32,11 +37,13 @@
   } from '../lib/models/active-users';
   import type { ActiveUsersReport } from '../lib/models';
 
-  const RANGES = [
-    { days: 7, label: '7d' },
-    { days: 30, label: '30d' },
-    { days: 90, label: '90d' },
-  ];
+  // The same compact labels as `DateRange`'s presets, with the spelled-out
+  // window in the tooltip.
+  const rangeOptions = $derived([
+    { value: '7', label: '7d', title: t('time.range.last7d') },
+    { value: '30', label: '30d', title: t('time.range.last30d') },
+    { value: '90', label: '90d', title: t('time.range.last90d') },
+  ]);
 
   // Hydrate from the URL ONCE, at init — not inside an effect, so this never
   // re-runs and never fights the sync effect below. House pattern from
@@ -200,7 +207,7 @@
         { from, to, selection: encodeSelection(selection) },
         rep.effective,
       );
-      toastStore.success('Export downloaded.');
+      toastStore.success(t('activeUsers.exported'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -238,8 +245,8 @@
       bucket: p.day,
       count: p.active_total,
       segments: [
-        { count: p.active_guest, color: 'color-mix(in srgb, var(--primary) 35%, transparent)', label: 'Guests' },
-        { count: p.active_identified, color: 'var(--primary)', label: 'Identified' }
+        { count: p.active_guest, color: 'var(--chart-2)', label: t('activeUsers.stat.guests') },
+        { count: p.active_identified, color: 'var(--chart-1)', label: t('activeUsers.stat.identified') }
       ]
     })),
   );
@@ -258,96 +265,90 @@
   }
 </script>
 
+  <PageHeader title={t('activeUsers.title')} subtitle={t('activeUsers.subtitle')}>
+    {#snippet freshness()}
+      <Freshness
+        computedAt={envelope?.computed_at ?? null}
+        fetchedAt={view.fetchedAt}
+        revalidating={view.revalidating || computing}
+      />
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached numbers, fetching fresh" hint.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+    {#snippet actions()}
+      <Button
+        variant="secondary"
+        onclick={exportCsv}
+        loading={exporting}
+        disabled={!report || !selectionValid.ok}
+      >
+        <Icon name="download" size={15} />
+        {t('explore.exportCsv')}
+      </Button>
+    {/snippet}
+  </PageHeader>
+
   <div class="active-users">
-    <header class="head">
-      <div>
-        <h1 class="page-title">{t('activeUsers.title')}</h1>
-        <!-- The caveat that qualifies the identified number belongs beside the
-             number too (see the Identified tile) — a caveat one scroll away
-             gets read after the figure has already been believed. -->
-        <p class="sub muted">
-          {t('activeUsers.subtitle')}
-        </p>
-      </div>
-      <div class="controls">
-        <div class="ranges">
-          {#each RANGES as r (r.days)}
-            <button
-              class="range"
-              class:active={rangeDays === r.days}
-              onclick={() => setRange(r.days)}
-            >
-              {r.label}
-            </button>
-          {/each}
-        </div>
-        <!--
-          Spins for a background revalidate too, not just an explicit click: that
-          spinner IS the "showing cached numbers, fetching fresh" hint.
-        -->
-        <Freshness
-            computedAt={envelope?.computed_at ?? null}
-            fetchedAt={view.fetchedAt}
-            revalidating={view.revalidating || computing}
-          />
-        <RefreshButton
-          onclick={refresher.run}
-          loading={refresher.busy || refreshing || revalidating}
-          title={revalidating ? 'Refreshing…' : 'Refresh'}
-        />
-        <Button
-          variant="secondary"
-          onclick={exportCsv}
-          loading={exporting}
-          disabled={!report || !selectionValid.ok}
-        >
-          <Icon name="download" size={15} />
-          {t('explore.exportCsv')}
-        </Button>
-      </div>
-    </header>
+    <div class="filters">
+      <SegmentedControl
+        value={String(rangeDays)}
+        options={rangeOptions}
+        ariaLabel={t('ui.time.range')}
+        onchange={(v) => setRange(Number(v))}
+      />
+    </div>
 
     {#if report?.truncated && report.truncation_reason}
       <!-- A persistent property of the displayed data, not a transient event,
-           so a banner rather than a toast. On shipped defaults (TIER_HOT_DAYS
+           so a notice rather than a toast. On shipped defaults (TIER_HOT_DAYS
            30, sauron-tier on in both topologies) this fires for essentially
            every operator asking for 90 days. -->
-      <div class="info-banner" role="status">
-        <Icon name="info" size={15} />
-        <span>{report.truncation_reason}</span>
-      </div>
+      <InlineNotice tone="info">{report.truncation_reason}</InlineNotice>
     {/if}
 
-    {#if error}
-      <div class="err-banner" role="alert">
-        <Icon name="triangle-alert" size={15} />
-        <span>{error}</span>
-      </div>
+    {#if error && report}
+      <!-- The numbers below are the last ones that loaded; say so, and offer
+           the way back to fresh ones. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view.error ? view : error) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     {/if}
 
-    {#if loading && !report}
+    {#if error && !report}
+      <ErrorState title={t('activeUsers.error.load')} error={view.error ? view : error} onretry={refresher.run} />
+    {:else if loading && !report}
       <Skeleton rows={6} />
     {:else if !selectionValid.ok}
-      <Card>
-        <EmptyState
-          title={t('activeUsers.empty.pickApp')}
-          description={t('activeUsers.empty.pickAppBody')}
-          icon="users"
-        />
-      </Card>
+      <EmptyState
+        title={t('activeUsers.empty.pickApp')}
+        description={t('activeUsers.empty.pickAppBody')}
+        icon="users"
+      />
     {:else if report}
       {@const rep = report}
       <StatTiles min={150}>
         <StatTile
           label={t('activeUsers.title')}
           value={rep.latest ? compactNumber(rep.latest.active_total) : '—'}
-          tone="primary"
-          sub={rep.latest ? `${rep.latest.day} · ${compactNumber(rep.latest.active_identified)} identified / ${compactNumber(rep.latest.active_guest)} guests` : 'no complete day yet'}
+          sub={rep.latest
+            ? `${rep.latest.day} · ${t('activeUsers.split', {
+                identified: compactNumber(rep.latest.active_identified),
+                guests: compactNumber(rep.latest.active_guest),
+              })}`
+            : t('activeUsers.noCompleteDay')}
         />
         <StatTile
           label={t('activeUsers.stat.identified')}
           value={rep.latest ? compactNumber(rep.latest.active_identified) : '—'}
-          sub="matched by distinct ID"
+          sub={t('activeUsers.stat.identifiedSub')}
         >
           {#snippet visual()}
             <Sparkline data={identifiedSeries} />
@@ -356,7 +357,7 @@
         <StatTile
           label={t('activeUsers.stat.guests')}
           value={rep.latest ? compactNumber(rep.latest.active_guest) : '—'}
-          sub="anonymous distinct IDs"
+          sub={t('activeUsers.stat.guestsSub')}
         >
           {#snippet visual()}
             <Sparkline data={guestSeries} />
@@ -365,16 +366,21 @@
         <StatTile
           label={t('activeUsers.stat.peak')}
           value={peak === null ? '—' : compactNumber(peak)}
-          sub={peakDay ? `${rangeLabel()} · ${compactNumber(peakDay.active_identified)} identified / ${compactNumber(peakDay.active_guest)} guests` : rangeLabel()}
+          sub={peakDay
+            ? `${rangeLabel()} · ${t('activeUsers.split', {
+                identified: compactNumber(peakDay.active_identified),
+                guests: compactNumber(peakDay.active_guest),
+              })}`
+            : rangeLabel()}
         />
       </StatTiles>
 
       <Card title={t('activeUsers.card.perDay')}>
         {#if chartData.length === 0}
           <EmptyState
+            size="section"
             title={t('activeUsers.empty.noDays')}
             description={t('activeUsers.empty.noDaysBody')}
-            icon="chart-column"
           />
         {:else}
           <!-- `utcDayLabel`, not the default: the buckets are pure UTC calendar
@@ -392,62 +398,12 @@
   .active-users {
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: var(--page-gap);
   }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-    max-width: 62ch;
-  }
-  .controls {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .ranges {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
-  }
-  .range {
-    font: inherit;
-    font-size: 12.5px;
-    padding: 5px 10px;
-    color: var(--text-muted);
-    background: var(--surface);
-    border: 0;
-    cursor: pointer;
-  }
-  .range.active {
-    color: var(--text);
-    background: var(--surface-3);
-  }
-  .info-banner,
-  .err-banner {
+  .filters {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 14px;
-    font-size: 13px;
-    border-radius: var(--radius);
-  }
-  .info-banner {
-    color: var(--info);
-    background: color-mix(in srgb, var(--info) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--info) 38%, transparent);
-  }
-  .err-banner {
-    color: var(--error);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
+    flex-wrap: wrap;
   }
 </style>

@@ -168,13 +168,13 @@
                    deliver the tooltip that is the entire reason for showing it.
                    `lockTip` announces it and keeps it reachable. -->
               <button type="button" class="nav-item locked" use:lockTip={item.locked}>
-                <span class="ic"><Icon name={item.icon} size={17} /></span>
+                <span class="ic"><Icon name={item.icon} size={16} /></span>
                 <span class="lb">{item.label}</span>
                 <span class="lk" aria-hidden="true"><Icon name="lock" size={12} /></span>
               </button>
             {:else}
               <a class="nav-item" class:active={item.match($location)} href={item.href}>
-                <span class="ic"><Icon name={item.icon} size={17} /></span>
+                <span class="ic"><Icon name={item.icon} size={16} /></span>
                 <span class="lb">{item.label}</span>
               </a>
             {/if}
@@ -186,11 +186,11 @@
 
   <div class="bottom">
     <a class="nav-item" class:active={$location.startsWith('/account')} href="#/account">
-      <span class="ic"><Icon name="user" size={17} /></span>
+      <span class="ic"><Icon name="user" size={16} /></span>
       <span class="lb">{t('nav.account')}</span>
     </a>
     <a class="nav-item" class:active={$location.startsWith('/docs')} href="#/docs">
-      <span class="ic"><Icon name="book-open" size={17} /></span>
+      <span class="ic"><Icon name="book-open" size={16} /></span>
       <span class="lb">{t('nav.docs')}</span>
     </a>
     <div class="foot">
@@ -205,9 +205,9 @@
     width: var(--sidebar-w);
     display: flex;
     flex-direction: column;
-    background: color-mix(in srgb, var(--surface) 60%, var(--bg));
+    background: var(--bg);
     border-inline-end: 1px solid var(--border);
-    padding: 16px 12px;
+    padding: 12px 10px;
     /* The window is the scroll container (`.shell` is `min-height: 100vh`), so
        without this the nav scrolls off the top of a long page.
        `align-self: start` is load-bearing: as a grid item spanning both rows
@@ -225,19 +225,17 @@
   .brand {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 6px 8px 16px;
+    gap: 9px;
+    padding: 4px 8px 12px;
   }
   .wordmark {
-    font-size: 17px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
   }
   .nav {
     display: flex;
     flex-direction: column;
-    gap: 14px;
-    margin-top: 4px;
+    gap: 10px;
   }
   .group {
     display: flex;
@@ -247,7 +245,7 @@
   .items {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
   }
   .group.collapsed .items {
     display: none;
@@ -260,14 +258,12 @@
     background: none;
     border: 0;
     text-align: start;
-    font-size: 10px;
-    font-weight: 650;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-faint);
-    padding: 2px 11px 5px;
+    padding: 4px 8px;
     border-radius: var(--radius);
-    transition: color 0.13s ease;
+    transition: color 0.12s ease;
   }
   .group-label:hover {
     color: var(--text-muted);
@@ -282,22 +278,30 @@
     transform: rotate(-90deg);
   }
   .nav-item {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 11px;
-    padding: 8px 11px;
+    gap: 10px;
+    min-height: 30px;
+    padding: 0 8px;
     border-radius: var(--radius);
     color: var(--text-muted);
-    font-weight: 520;
-    font-size: 13.5px;
-    transition: background 0.13s ease, color 0.13s ease;
+    font-weight: var(--weight-regular);
+    font-size: var(--text-sm);
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .nav-item:hover {
-    background: var(--surface-2);
+    background: var(--surface);
     color: var(--text);
   }
+  /* The active item is a quiet fill and full-contrast text; the accent is
+     only the icon, so the sidebar never out-shouts the page. */
   .nav-item.active {
-    background: var(--primary-soft);
+    background: var(--surface-2);
+    color: var(--text);
+    font-weight: var(--weight-medium);
+  }
+  .nav-item.active .ic {
     color: var(--primary);
   }
   /* A locked item is a <button>, so it needs the reset an <a> does not: the
@@ -308,8 +312,8 @@
     border: 0;
     background: none;
     font: inherit;
-    font-weight: 520;
-    font-size: 13.5px;
+    font-weight: var(--weight-regular);
+    font-size: var(--text-sm);
     text-align: start;
     cursor: not-allowed;
     opacity: 0.5;
@@ -347,7 +351,7 @@
     padding: 12px 10px 4px;
   }
   .foot-label {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     line-height: 1.4;
     display: block;

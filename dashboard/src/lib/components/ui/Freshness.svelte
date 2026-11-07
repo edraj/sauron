@@ -49,7 +49,7 @@
 
 <style>
   .fresh {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;

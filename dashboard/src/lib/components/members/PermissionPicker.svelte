@@ -9,7 +9,7 @@
     receiveSelection,
     type GroupState,
   } from '../../models/permission-picker';
-  import { PERMISSION_GROUPS, PERMISSION_LABELS } from '../../models/permissions';
+  import { PERMISSION_GROUPS, permissionGroupLabel, permissionLabel } from '../../models/permissions';
   import type { Permission } from '../../models';
 
   interface Props {
@@ -193,7 +193,7 @@
       placeholder={t('roles.searchPermissions')}
       width="280px"
     />
-    <span class="count muted">{selectedSet.size} of {TOTAL} selected</span>
+    <span class="count muted">{t('access.picker.selectedCount', { n: selectedSet.size, total: TOTAL })}</span>
   </div>
 
   <div class="groups">
@@ -220,7 +220,7 @@
               type="button"
               class="twisty"
               aria-expanded={open}
-              aria-label={`${open ? 'Collapse' : 'Expand'} ${group.label}`}
+              aria-label={open ? t('members.tree.collapse', { name: permissionGroupLabel(group) }) : t('members.tree.expand', { name: permissionGroupLabel(group) })}
               disabled={searching}
               onclick={() => toggleGroupOpen(group.label)}
             >
@@ -229,7 +229,9 @@
             <label
               class="node"
               title={filtered
-                ? `Applies to the ${matches.length} shown permission${matches.length === 1 ? '' : 's'} only`
+                ? matches.length === 1
+                  ? t('roles.picker.appliesToOne')
+                  : t('roles.picker.appliesToMany', { n: matches.length })
                 : undefined}
             >
               <input
@@ -238,11 +240,15 @@
                 {disabled}
                 onclick={(e) => onGroupClick(e, matches, shownState)}
               />
-              <span class="g-name">{group.label}</span>
+              <span class="g-name">{permissionGroupLabel(group)}</span>
               <span class="g-hint">
                 {#if filtered}
-                  {shownChecked} of {matches.length} shown · {groupChecked} of {group.permissions
-                    .length} total
+                  {t('access.picker.groupCounts', {
+                    shown: shownChecked,
+                    matching: matches.length,
+                    checked: groupChecked,
+                    total: group.permissions.length,
+                  })}
                 {:else}
                   {groupChecked}/{group.permissions.length}
                 {/if}
@@ -261,7 +267,7 @@
                     onchange={() => toggle(permission)}
                   />
                   <span class="name mono">{permission}</span>
-                  <span class="description muted">{PERMISSION_LABELS[permission]}</span>
+                  <span class="description muted">{permissionLabel(permission)}</span>
                 </label>
               {/each}
             </div>
@@ -271,7 +277,7 @@
     {/each}
 
     {#if searching && !anyMatch}
-      <p class="empty">No permissions match "{query.trim()}".</p>
+      <p class="empty">{t('access.picker.noMatch', { q: query.trim() })}</p>
     {/if}
   </div>
 </div>
@@ -291,7 +297,7 @@
     flex-wrap: wrap;
   }
   .count {
-    font-size: 12px;
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
   .groups {
@@ -342,8 +348,8 @@
     gap: 8px;
     min-width: 0;
     flex: 1;
-    font-size: 13px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
     cursor: pointer;
     padding: 7px 0;
@@ -356,8 +362,8 @@
     flex-shrink: 0;
   }
   .g-hint {
-    font-size: 11.5px;
-    font-weight: 500;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-faint);
     margin-inline-start: auto;
     padding-inline-end: 4px;
@@ -373,7 +379,7 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     cursor: pointer;
   }
@@ -390,10 +396,10 @@
     white-space: nowrap;
   }
   .description {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   .empty {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     padding: 10px 2px;
   }

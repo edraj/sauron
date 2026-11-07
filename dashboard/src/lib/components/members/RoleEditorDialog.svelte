@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { t } from '../../i18n';
+  import { formatNumber, t } from '../../i18n';
   import Modal from '../ui/Modal.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
   import Badge from '../ui/Badge.svelte';
@@ -38,12 +39,12 @@
   const readOnly = $derived(role?.is_system === true);
   const title = $derived(
     readOnly
-      ? `Role: ${role?.name}`
+      ? t('roles.dialog.view', { name: role?.name ?? '' })
       : isEdit
-        ? `Edit ${role?.name}`
+        ? t('roles.dialog.edit', { name: role?.name ?? '' })
         : copyFrom
-          ? `New role from ${copyFrom.name}`
-          : 'New role',
+          ? t('roles.dialog.copy', { name: copyFrom.name })
+          : t('roles.new'),
   );
 
   // Repopulate whenever the dialog opens on a different role.
@@ -55,7 +56,7 @@
   $effect(() => {
     if (!open) return;
     const source = role ?? copyFrom;
-    name = role ? source?.name ?? '' : copyFrom ? `Copy of ${copyFrom.name}` : '';
+    name = role ? source?.name ?? '' : copyFrom ? t('roles.copyOf', { name: copyFrom.name }) : '';
     description = source?.description ?? '';
     permissions = [...(source?.permissions ?? [])];
     error = null;
@@ -89,7 +90,7 @@
 <Modal {open} {title} onclose={onclose}>
   {#if readOnly}
     <p class="lede">
-      <Badge tone="neutral" size="sm">system</Badge>
+      <Badge tone="neutral" size="sm">{t('roles.system')}</Badge>
       {t('roles.builtInNote')}
     </p>
   {:else}
@@ -98,10 +99,13 @@
       <Input label={t('roles.column.description')} bind:value={description} placeholder={t('roles.placeholder.description')} />
     </div>
     {#if isEdit && memberCount > 0}
-      <p class="warning">
-        {memberCount} {memberCount === 1 ? 'member holds' : 'members hold'} this role. Saving
-        changes their access immediately.
-      </p>
+      <div class="warning">
+        <InlineNotice tone="warning">
+          {memberCount === 1
+            ? t('roles.editImpactOne')
+            : t('roles.editImpactMany', { n: formatNumber(memberCount) })}
+        </InlineNotice>
+      </div>
     {/if}
   {/if}
 
@@ -112,15 +116,15 @@
     onchange={(next) => (permissions = next)}
   />
 
-  {#if error}<p class="err-msg">{error}</p>{/if}
+  {#if error}<p class="err-msg" role="alert">{error}</p>{/if}
 
   {#snippet footer()}
     <Button variant="secondary" onclick={onclose} disabled={saving}>
-      {readOnly ? 'Close' : 'Cancel'}
+      {readOnly ? t('common.close') : t('common.cancel')}
     </Button>
     {#if !readOnly}
       <Button variant="primary" disabled={!canSubmit} loading={saving} onclick={submit}>
-        {isEdit ? 'Save changes' : 'Create role'}
+        {isEdit ? t('roles.saveChanges') : t('roles.create')}
       </Button>
     {/if}
   {/snippet}
@@ -131,7 +135,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     margin-bottom: 14px;
   }
@@ -142,24 +146,18 @@
     margin-bottom: 12px;
   }
   .warning {
-    font-size: 12.5px;
-    color: var(--warning);
-    background: var(--warning-soft);
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-radius: var(--radius);
-    padding: 8px 12px;
     margin-bottom: 14px;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
     display: block;
     margin-bottom: 8px;
   }
   .err-msg {
     color: var(--error);
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin-top: 12px;
   }
 </style>

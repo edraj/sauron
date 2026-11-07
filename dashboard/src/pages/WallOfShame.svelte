@@ -1,15 +1,22 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
+  import { errorMessage } from '../lib/api/client';
   import { untrack } from 'svelte';
-  import { t } from '../lib/i18n';
+  import { t, type MessageKey } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
-  import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import FactList from '../lib/components/FactList.svelte';
+  import Fact from '../lib/components/Fact.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
@@ -39,6 +46,7 @@
     toApiFilters,
     withSelected,
     type FilterState,
+    type RangeKey,
   } from '../lib/models/audit';
 
   const EMPTY_FACETS: AuditFacets = {
@@ -91,11 +99,9 @@
   });
 
   let loadingMore = $state(false);
-  // A "Load more" failure surfaces in the SAME banner as a page-one failure, as
-  // it did before — it is a failure to read the log, not an export problem, and
-  // a `$derived` cannot be assigned to.
+  // A "Load more" failure is reported in a notice above the rows it failed to
+  // extend; only a page-one failure replaces the list (ErrorState).
   let moreError = $state<string | null>(null);
-  const error = $derived(moreError ?? view.error);
   let selected = $state<AuditEntry | null>(null);
   let exporting = $state(false);
   let exportError = $state<string | null>(null);
@@ -154,7 +160,7 @@
       appended = [...appended, ...page.entries];
       appendedCursor = page.next_cursor;
     } catch (e) {
-      moreError = e instanceof Error ? e.message : String(e);
+      moreError = errorMessage(e);
     } finally {
       loadingMore = false;
     }
@@ -217,7 +223,7 @@
     try {
       await downloadAuditCsv(orgId, toApiFilters(filters));
     } catch (e) {
-      exportError = e instanceof Error ? e.message : String(e);
+      exportError = errorMessage(e);
     } finally {
       exporting = false;
     }
@@ -242,6 +248,28 @@
     ).map((a) => ({ id: a.id, label: a.id ?? a.label })),
   );
 
+  // `Select` speaks strings, and these filters use `null` for "any". '' is the
+  // "any" option on the way in and becomes `null` again on the way out.
+  type FacetFilter = 'project_id' | 'app_id' | 'environment_id' | 'actor_id' | 'action';
+  function setFacet(field: FacetFilter, v: string) {
+    filters[field] = v === '' ? null : v;
+  }
+  const anyOption = (label: string) => ({ value: '', label });
+  const facetSelectOptions = (opts: Array<{ id: string | null; label: string }>) =>
+    opts.filter((o) => o.id !== null).map((o) => ({ value: o.id as string, label: o.label }));
+
+  const RANGE_LABELS: Record<RangeKey, MessageKey> = {
+    '24h': 'time.range.last24h',
+    '7d': 'time.range.last7d',
+    '30d': 'time.range.last30d',
+    '90d': 'time.range.last90d',
+    all: 'purge.allTime',
+  };
+  const rangeOptions = $derived(RANGES.map((r) => ({ value: r.key, label: t(RANGE_LABELS[r.key]) })));
+
+  /** A narrowing filter other than the time range. */
+  const facetFiltered = $derived(!isDefaultFilter({ ...filters, range: EMPTY_FILTERS.range }));
+
   /** Diff rows for the drawer, in a stable order. */
   function diffRows(entry: AuditEntry): Array<[string, unknown, unknown]> {
     return Object.entries(entry.changes ?? {})
@@ -251,89 +279,70 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1>{t('audit.title')}</h1>
-      <p class="sub">
-        {t('prose.audit.lede')}
-        <strong>{sessionStore.currentOrg?.name ?? 'this organization'}</strong>{t('prose.audit.newestFirst')}
-      </p>
-    </div>
-    <div class="actions">
+  <PageHeader
+    title={t('admin.nav.wallOfShame')}
+    subtitle={`${t('prose.audit.lede')} ${sessionStore.currentOrg?.name ?? t('members.thisOrganization')}${t('prose.audit.newestFirst')}`}
+  >
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
+    {/snippet}
+    {#snippet actions()}
       <Button
         variant="secondary"
         onclick={exportCsv}
-        disabled={exporting || loading || entries.length === 0}
-        title={entries.length === 0 ? 'Nothing to export with these filters' : 'Download this view as CSV'}
+        loading={exporting}
+        disabled={loading || entries.length === 0}
+        title={entries.length === 0 ? t('audit.exportNothing') : t('audit.exportTitle')}
       >
-        {exporting ? 'Preparing…' : 'Export CSV'}
+        {t('explore.exportCsv')}
       </Button>
-      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   <div class="content">
-    <Card>
-      <div class="filters">
-        <label>
-        <span>{t('journeys.range')}</span>
-        <select bind:value={filters.range}>
-          {#each RANGES as r (r.key)}
-            <option value={r.key}>{r.label}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label>
-        <span>{t('storage.column.project')}</span>
-        <select bind:value={filters.project_id}>
-          <option value={null}>{t('audit.filter.allProjects')}</option>
-          {#each projectOptions as p (p.id)}
-            <option value={p.id}>{p.label}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label>
-        <span>{t('nav.selectApp')}</span>
-        <select bind:value={filters.app_id}>
-          <option value={null}>{t('audit.filter.allApps')}</option>
-          {#each appOptions as a (a.id)}
-            <option value={a.id}>{a.label}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label>
-        <span>{t('nav.env')}</span>
-        <select bind:value={filters.environment_id}>
-          <option value={null}>{t('audit.filter.allEnvironments')}</option>
-          {#each envOptions as e (e.id)}
-            <option value={e.id}>{e.label}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label>
-        <span>{t('audit.column.who')}</span>
-        <select bind:value={filters.actor_id}>
-          <option value={null}>{t('audit.filter.everyone')}</option>
-          {#each actorOptions as a (a.id)}
-            <option value={a.id}>{a.label}</option>
-          {/each}
-        </select>
-      </label>
-
-      <label>
-        <span>{t('audit.column.action')}</span>
-        <select bind:value={filters.action}>
-          <option value={null}>{t('audit.filter.allActions')}</option>
-          {#each actionOptions as a (a.label)}
-            <option value={a.label}>{describeAction(a.label).label}</option>
-          {/each}
-        </select>
-      </label>
+    <div class="filters">
+      <Select
+        label={t('journeys.range')}
+        value={filters.range}
+        options={rangeOptions}
+        onchange={(v) => (filters.range = v as RangeKey)}
+      />
+      <Select
+        label={t('storage.column.project')}
+        value={filters.project_id ?? ''}
+        options={[anyOption(t('audit.filter.allProjects')), ...facetSelectOptions(projectOptions)]}
+        onchange={(v) => setFacet('project_id', v)}
+      />
+      <Select
+        label={t('nav.selectApp')}
+        value={filters.app_id ?? ''}
+        options={[anyOption(t('audit.filter.allApps')), ...facetSelectOptions(appOptions)]}
+        onchange={(v) => setFacet('app_id', v)}
+      />
+      <Select
+        label={t('nav.env')}
+        value={filters.environment_id ?? ''}
+        options={[anyOption(t('audit.filter.allEnvironments')), ...facetSelectOptions(envOptions)]}
+        onchange={(v) => setFacet('environment_id', v)}
+      />
+      <Select
+        label={t('audit.column.who')}
+        value={filters.actor_id ?? ''}
+        options={[anyOption(t('audit.filter.everyone')), ...facetSelectOptions(actorOptions)]}
+        onchange={(v) => setFacet('actor_id', v)}
+      />
+      <Select
+        label={t('audit.column.action')}
+        value={filters.action ?? ''}
+        options={[
+          anyOption(t('audit.filter.allActions')),
+          ...actionOptions.map((a) => ({ value: a.label, label: describeAction(a.label).label })),
+        ]}
+        onchange={(v) => setFacet('action', v)}
+      />
 
       <!--
         A toggle rather than another dropdown: sign-in activity is a separate
@@ -350,82 +359,102 @@
         <Button variant="ghost" onclick={clearFilters}>{t('common.clear')}</Button>
       {/if}
     </div>
-  </Card>
 
-  {#if exportError}
-    <p class="export-error"><Icon name="triangle-alert" size={14} /> Export failed: {exportError}</p>
-  {/if}
-
-  {#if loading}
-    <Skeleton rows={8} />
-  {:else if error}
-    <EmptyState
-      title={t('audit.error.load')}
-      description={error}
-      icon="triangle-alert"
-    />
-  {:else if entries.length === 0}
-    <!--
-      Two genuinely different empty states. "No results" after filtering is a
-      dead end unless it offers the way out; "nothing yet" must say WHEN
-      recording started, or a blank page reads as data loss rather than as a
-      young log.
-    -->
-    {#if isDefaultFilter(filters)}
-      <EmptyState
-        title={t('audit.empty.title')}
-        description={t('audit.empty.body')}
-        icon="scroll-text"
-      />
-    {:else}
-      <EmptyState
-        title={t('audit.empty.filtered.title')}
-        description={t('audit.empty.filtered.body')}
-        icon="search"
-      >
-        {#snippet action()}
-          <Button variant="secondary" onclick={clearFilters}>{t('audit.filter.clear')}</Button>
-        {/snippet}
-      </EmptyState>
+    {#if exportError}
+      <InlineNotice tone="error">{t('audit.exportFailed', { error: exportError })}</InlineNotice>
     {/if}
-  {:else}
-    <DataTable>
-      {#snippet head()}
-        <tr>
-          <th>{t('ui.opModal.when')}</th>
-          <th>{t('audit.column.who')}</th>
-          <th>{t('audit.column.action')}</th>
-          <th>{t('audit.column.target')}</th>
-          <th>{t('audit.column.where')}</th>
-        </tr>
-      {/snippet}
-      {#snippet children()}
-        {#each entries as entry (entry.id)}
-          {@const described = describeAction(entry.action)}
-          <tr class="clickable" onclick={() => (selected = entry)}>
-            <td><TimeValue value={entry.created_at} muted /></td>
-            <td class="who">{entry.actor_email || '—'}</td>
-            <td>
-              <span class="action tone-{described.tone}">{described.label}</span>
-              {#if entry.source === 'inspector'}
-                <Badge tone="neutral" size="sm">privacy</Badge>
-              {/if}
-            </td>
-            <td class="target">{entry.entity_name || '—'}</td>
-            <td class="scope">{describeScope(entry) || '—'}</td>
-          </tr>
-        {/each}
-      {/snippet}
-    </DataTable>
+    {#if moreError}
+      <InlineNotice tone="error">{moreError}</InlineNotice>
+    {/if}
+    {#if view.error && view.data !== undefined}
+      <!-- A forced Refresh failed over rows we already had: they stay. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
+    {/if}
 
-    {#if nextCursor}
-      <div class="centered">
-        <Button variant="secondary" onclick={loadMore} disabled={loadingMore}>
-          {loadingMore ? 'Loading…' : 'Load more'}
-        </Button>
+    {#if loading}
+      <Skeleton rows={8} />
+    {:else if view.error && view.data === undefined}
+      <ErrorState
+        title={t('common.couldntLoad', { thing: t('audit.thing') })}
+        error={view}
+        onretry={refresher.run}
+      />
+    {:else if entries.length === 0}
+      <!--
+        Three empty states, by what the page actually knows. A narrowing filter
+        is a dead end unless it offers the way out; a time window cannot claim
+        nothing ever happened; and only over all time does "nothing yet" hold —
+        where it must say WHEN recording started, or a blank page reads as data
+        loss rather than as a young log.
+      -->
+      {#if facetFiltered}
+        <EmptyState
+          title={t('audit.empty.filtered.title')}
+          description={t('audit.empty.filtered.body')}
+          icon="search"
+        >
+          {#snippet action()}
+            <Button variant="secondary" onclick={clearFilters}>{t('audit.filter.clear')}</Button>
+          {/snippet}
+        </EmptyState>
+      {:else if filters.range !== 'all'}
+        <EmptyState
+          title={t('common.empty.range', { things: t('audit.things') })}
+          description={t('common.empty.rangeHint')}
+          icon="scroll-text"
+        />
+      {:else}
+        <EmptyState
+          title={t('audit.empty.title')}
+          description={t('audit.empty.body')}
+          icon="scroll-text"
+        />
+      {/if}
+    {:else}
+      <div>
+        <DataTable>
+          {#snippet head()}
+            <tr>
+              <th>{t('ui.opModal.when')}</th>
+              <th>{t('audit.column.who')}</th>
+              <th>{t('audit.column.action')}</th>
+              <th>{t('audit.column.target')}</th>
+              <th>{t('audit.column.where')}</th>
+            </tr>
+          {/snippet}
+          {#snippet children()}
+            {#each entries as entry (entry.id)}
+              {@const described = describeAction(entry.action)}
+              <tr class="clickable" onclick={() => (selected = entry)}>
+                <td><TimeValue value={entry.created_at} muted /></td>
+                <td class="who">{entry.actor_email || '—'}</td>
+                <td>
+                  <span class="action tone-{described.tone}">{described.label}</span>
+                  {#if entry.source === 'inspector'}
+                    <Badge tone="neutral" size="sm">{t('audit.privacy')}</Badge>
+                  {/if}
+                </td>
+                <td class="target">{entry.entity_name || '—'}</td>
+                <td class="scope">{describeScope(entry) || '—'}</td>
+              </tr>
+            {/each}
+          {/snippet}
+        </DataTable>
+
+        {#if nextCursor}
+          <div class="centered">
+            <Button variant="secondary" onclick={loadMore} loading={loadingMore}>
+              {t('failures.loadMore')}
+            </Button>
+          </div>
+        {/if}
       </div>
     {/if}
-  {/if}
   </div>
 </AdminShell>
 
@@ -433,28 +462,21 @@
   {@const entry = selected}
   {@const described = describeAction(entry.action)}
   <Modal open title={described.label} onclose={() => (selected = null)}>
-    <dl class="detail">
-      <dt>{t('ui.opModal.when')}</dt>
-      <dd><TimeValue value={entry.created_at} asText /></dd>
-
-      <dt>{t('audit.column.who')}</dt>
-      <dd>{entry.actor_email || 'unknown'}</dd>
-
-      <dt>{t('audit.column.action')}</dt>
-      <dd><code>{entry.action}</code></dd>
-
-      <dt>{t('audit.column.target')}</dt>
-      <dd>{entry.entity_name || '—'}</dd>
-
-      {#if describeScope(entry)}
-        <dt>{t('audit.column.where')}</dt>
-        <dd>{describeScope(entry)}</dd>
-      {/if}
-    </dl>
+    <div class="detail">
+      <FactList>
+        <Fact label={t('ui.opModal.when')}><TimeValue value={entry.created_at} asText /></Fact>
+        <Fact label={t('audit.column.who')}>{entry.actor_email || t('common.unknown')}</Fact>
+        <Fact label={t('audit.column.action')} mono>{entry.action}</Fact>
+        <Fact label={t('audit.column.target')}>{entry.entity_name || '—'}</Fact>
+        {#if describeScope(entry)}
+          <Fact label={t('audit.column.where')}>{describeScope(entry)}</Fact>
+        {/if}
+      </FactList>
+    </div>
 
     {#if diffRows(entry).length > 0}
-      <h3>
-        {entry.source === 'inspector' ? 'Details' : 'What changed'}
+      <h3 class="section-label diff-label">
+        {entry.source === 'inspector' ? t('common.details') : t('audit.whatChanged')}
       </h3>
       <DataTable>
         {#snippet head()}
@@ -478,11 +500,9 @@
       <p class="no-diff">
         <Icon name="info" size={14} />
         {#if entry.source === 'inspector'}
-          Recorded by the PII inspector. The Privacy page has the full detail.
+          {t('audit.noDiffInspector')}
         {:else}
-          This action has no before/after values — either nothing comparable
-          changed, or the values are credentials that are deliberately never
-          recorded.
+          {t('audit.noDiff')}
         {/if}
       </p>
     {/if}
@@ -495,75 +515,31 @@
     flex-direction: column;
     gap: 16px;
   }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 1rem;
-  }
-  h1 {
-    margin: 0;
-    font-size: 1.35rem;
-  }
-  .sub {
-    margin: 0.25rem 0 0;
-    color: var(--text-muted);
-    font-size: 0.9rem;
-  }
 
   .filters {
     display: flex;
     flex-wrap: wrap;
     align-items: flex-end;
-    gap: 0.75rem;
+    gap: 12px;
   }
-  .filters label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-  }
-  .filters select {
-    min-width: 10rem;
-    padding: 0.4rem 0.5rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface);
-    color: var(--text);
-    font-size: 0.85rem;
+  .filters :global(.field) {
+    min-width: 160px;
   }
 
-  .actions {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .filters label.toggle {
+  .toggle {
     display: flex;
     flex-direction: row;
     align-items: center;
-    gap: 0.4rem;
-    font-size: 0.8rem;
+    gap: 6px;
+    font-size: var(--text-sm);
     color: var(--text);
-    padding-bottom: 0.4rem;
-  }
-
-  .export-error {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    color: var(--danger);
-    font-size: 0.85rem;
-    margin: 0.75rem 0 0;
+    height: var(--control-h);
   }
 
   .centered {
     display: flex;
     justify-content: center;
-    padding: 1.5rem 0;
+    padding: 24px 0;
   }
 
   /* .clickable handles hover in DataTable now, so .row is gone */
@@ -574,7 +550,7 @@
   }
   .scope {
     color: var(--text-muted);
-    font-size: 0.85rem;
+    font-size: var(--text-sm);
   }
 
   /*
@@ -582,31 +558,20 @@
     deletion and a rename must not look identical.
   */
   .action.tone-destructive {
-    color: var(--danger);
-    font-weight: 600;
+    color: var(--error);
+    font-weight: var(--weight-strong);
   }
   .action.tone-credential {
     color: var(--warning);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 
   .detail {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 0.4rem 1rem;
-    margin: 0 0 1rem;
-    font-size: 0.9rem;
-  }
-  .detail dt {
-    color: var(--text-muted);
-  }
-  .detail dd {
-    margin: 0;
+    margin: 0 0 16px;
   }
 
-  h3 {
-    margin: 1rem 0 0.5rem;
-    font-size: 0.95rem;
+  .diff-label {
+    margin: 16px 0 8px;
   }
 
   .before {
@@ -614,15 +579,15 @@
     text-decoration: line-through;
   }
   .after {
-    font-weight: 600;
+    font-weight: var(--weight-medium);
   }
 
   .no-diff {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: 6px;
     color: var(--text-muted);
-    font-size: 0.85rem;
-    margin: 0.5rem 0 0;
+    font-size: var(--text-sm);
+    margin: 8px 0 0;
   }
 </style>

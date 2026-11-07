@@ -14,6 +14,13 @@ import { ops } from './ops';
 import { prose } from './prose';
 import { docs } from './docs';
 import { docsProse } from './docs-prose';
+import { refreshA } from './refresh-lists';
+import { refreshA2 } from './refresh-analytics';
+import { refreshB } from './refresh-details';
+import { refreshC } from './refresh-admin';
+import { refreshD } from './refresh-auth';
+import { refreshInspector } from './refresh-inspector';
+import { refreshModels } from './refresh-models';
 
 /**
  * Every translatable string in the dashboard, composed from the per-domain
@@ -45,6 +52,13 @@ export const MESSAGES = {
   ...prose,
   ...docs,
   ...docsProse,
+  ...refreshA,
+  ...refreshA2,
+  ...refreshB,
+  ...refreshC,
+  ...refreshD,
+  ...refreshInspector,
+  ...refreshModels,
 } as const satisfies Record<string, Message>;
 
 /** Count-dependent strings, selected through `Intl.PluralRules`. */
@@ -77,6 +91,13 @@ export const DOMAINS: Record<string, Record<string, Message>> = {
   prose,
   docs,
   docsProse,
+  refreshA,
+  refreshA2,
+  refreshB,
+  refreshC,
+  refreshD,
+  refreshInspector,
+  refreshModels,
 };
 
 export const PLURAL_DOMAINS: Record<string, Record<string, PluralMessage>> = {

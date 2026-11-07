@@ -6,6 +6,8 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
@@ -120,7 +122,7 @@
    */
   const rangeCaption = $derived(
     range.kind === 'last'
-      ? `last ${spanDays(range)}d`
+      ? t('explore.range.last', { n: spanDays(range) })
       : formatAbsolute(range, intlTag(localeStore.locale)),
   );
   /**
@@ -367,6 +369,11 @@
     void replace(qs ? `/sessions?${qs}` : '/sessions');
   });
 
+  /** "Nothing here" wording: a chip or search first, then the window. */
+  const listFiltered = $derived(appliedSearch !== '' || filters.length > 0);
+
+
+
   function sessionPath(id: string): string {
     return '/sessions/' + encodeURIComponent(id);
   }
@@ -395,44 +402,74 @@
   }
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('explore.column.sessions')}</h1>
-      <p class="muted sub">{t('sessions.subtitle')}</p>
-    </div>
-  </div>
+  <PageHeader title={t('sessions.title')} subtitle={t('sessions.subtitle')}>
+    {#snippet freshness()}
+      <RollupChip />
+      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
+           watermark IS the data's age and this fetch-time chip would be a
+           second "Updated" beside it with a different time. -->
+      {#if !rollupState.ready}
+        <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
+      {/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+    {#snippet actions()}
+      <Button
+        variant="secondary"
+        disabled={sessions.length === 0}
+        onclick={downloadSessionsCsv}
+        title={t('sessions.exportTitle')}
+      >
+        <Icon name="download" size={15} />
+        {t('explore.exportCsv')}
+      </Button>
+    {/snippet}
+  </PageHeader>
 
-  <div class="analytics-head">
-    <h2 class="section-title">{t('sessions.card.engagement')}</h2>
-    <DateRange value={range} onchange={onRange} />
-  </div>
+  <!-- The engagement section runs its OWN window (the DateRange in its head):
+       the summary endpoint has no equivalent of the list's column choice, so
+       the two windows are deliberately separate controls. -->
+  <Card title={t('sessions.card.engagement')}>
+    {#snippet actions()}
+      <DateRange value={range} onchange={onRange} />
+    {/snippet}
+    {#if analytics}
+      <StatTiles min={160}>
+        <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} sub={rangeCaption} />
+        <StatTile label={t('sessions.stat.crashed')} value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
+        <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
+        <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
+      </StatTiles>
 
-  {#if analytics}
-    <StatTiles min={160}>
-      <StatTile label={t('explore.column.sessions')} value={compactNumber(analytics.stats.sessions)} tone="primary" sub={rangeCaption} />
-      <StatTile label={t('sessions.stat.crashed')} value={compactNumber(analytics.stats.crashed)} tone={analytics.stats.crashed > 0 ? 'warning' : 'neutral'} />
-      <StatTile label={t('sessions.stat.avg')} value={formatDuration(analytics.stats.avg_session_ms)} />
-      <StatTile label={t('sessions.stat.median')} value={approx(formatDuration(analytics.stats.median_session_ms), rollupState.ready)} />
-    </StatTiles>
+      <div class="session-charts">
+        <Card title={t('sessions.card.avgPerDay')}>
+          <TimeSeriesChart data={durationSeries} format={formatDuration} showTotal={false} />
+        </Card>
+        <Card title={t('sessions.card.distribution')}>
+          <DurationHistogram data={analytics.duration_histogram} />
+        </Card>
+      </div>
+    {:else if analyticsError}
+      <ErrorState
+        size="section"
+        title={t('sessions.error.engagement')}
+        error={analyticsView}
+        onretry={() => analyticsView.reload()}
+      />
+    {:else}
+      <Skeleton rows={2} height="70px" />
+    {/if}
+  </Card>
 
-    <div class="session-charts">
-      <Card title={t('sessions.card.avgPerDay')}>
-        <TimeSeriesChart data={durationSeries} format={formatDuration} showTotal={false} />
-      </Card>
-      <Card title={t('sessions.card.distribution')}>
-        <DurationHistogram data={analytics.duration_histogram} />
-      </Card>
-    </div>
-  {:else if analyticsError}
-    <Card><p class="muted">{analyticsError}</p></Card>
-  {/if}
-
-  <!-- Every control that narrows the TABLE sits in this one row, directly above
-       it: search, window, refresh, export. They used to live in the page
-       header, two sections up, where the search box read as if it filtered the
-       engagement charts — which run their own query and ignore it entirely. -->
+  <!-- The list section. Every control that narrows the TABLE sits in the one
+       toolbar directly above it: search, chips and the window. They used to
+       live in the page header, two sections up, where the search box read as
+       if it filtered the engagement charts — which run their own query and
+       ignore it entirely. -->
   <!--
-    `showRange={false}`: the page's window is the `<TimeFilter>` in `actions`,
+    `showRange={false}`: the list's window is the `<TimeFilter>` in `actions`,
     which also picks the timestamp COLUMN. The bar's own DateRange would be a
     second range picker connected to nothing — a control that reports a window
     the list is not using.
@@ -443,219 +480,160 @@
     so every query built from that hint came back a 400. The component derives
     its example from the schema it loaded.
   -->
-  <div class="list-head">
-    <FilterBar
-      fields={SESSION_FIELDS}
-      bind:filters
-      bind:search
-      bind:range
-      showRange={false}
-      appId={sessionStore.currentAppId ?? undefined}
-      context="sessions"
-      error={searchError}
-      {onSearch}
-      onchange={onFilters}
-    >
-      {#snippet actions()}
-        <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
-        <RollupChip />
-      <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
-           watermark IS the data's age and this fetch-time chip would be a
-           second "Updated" beside it with a different time. -->
-      {#if !rollupState.ready}
-        <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
+  <div class="list-section">
+    <Card>
+      <FilterBar
+        fields={SESSION_FIELDS}
+        bind:filters
+        bind:search
+        bind:range
+        showRange={false}
+        appId={sessionStore.currentAppId ?? undefined}
+        context="sessions"
+        error={searchError}
+        {onSearch}
+        onchange={onFilters}
+      >
+        {#snippet actions()}
+          <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
+        {/snippet}
+      </FilterBar>
+
+      <!-- Above the session rows, not above the engagement charts: it describes
+           what the LIST leaves out, and the charts run their own query. -->
+      <SearchDisclosure {clamped} />
+
+      {#if loading}
+        <Skeleton rows={6} />
+      {:else if error}
+        <ErrorState size="section" title={t('sessions.error.load')} error={sessionsView} onretry={() => sessionsView.reload()} />
+      {:else if sessions.length === 0}
+        <EmptyState
+          size="section"
+          title={listFiltered
+            ? t('common.empty.match', { things: t('sessions.things') })
+            : t('common.empty.range', { things: t('sessions.things') })}
+          description={listFiltered ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
+        />
+      {:else}
+        <DataTable>
+          {#snippet head()}
+            <tr>
+              <!-- Session stays a plain `<th>`: the endpoint's whitelist has no
+                   session-id column, and an unlisted `sort=` is a 400 rather
+                   than a silently ignored parameter. An unsorted column is
+                   honest; a header that 400s the page is not. -->
+              <th>{t('sessions.column.session')}</th>
+              <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
+                {t('sessions.column.user')}
+              </SortableTh>
+              <SortableTh key="device_key" columnDefault="asc" sort={list.sort} {onsort}>
+                {t('sessions.column.device')}
+              </SortableTh>
+              <SortableTh key="started_at" sort={list.sort} {onsort}>{t('explore.column.started')}</SortableTh>
+              <!-- No stored duration: the server orders by `last_event_at -
+                   started_at`, the same interval this column renders. A
+                   number, so it right-aligns with the counts beside it. -->
+              <SortableTh key="duration_ms" class="num" sort={list.sort} {onsort}>{t('explore.column.duration')}</SortableTh>
+              <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
+                {t('explore.column.events')}
+              </SortableTh>
+              <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
+                {t('explore.column.errors')}
+              </SortableTh>
+            </tr>
+          {/snippet}
+          {#snippet children()}
+            {#each sessions as s (s.id)}
+              {@const path = sessionPath(s.session_id)}
+              <tr
+                class="clickable"
+                onclick={(e) => rowNav(e, path)}
+                onauxclick={(e) => rowNav(e, path)}
+              >
+                <td>
+                  <a class="row-link mono sid" href={rowHref(path)} title={s.session_id}>
+                    {s.session_id}
+                  </a>
+                </td>
+                <td>
+                  {#if s.distinct_id}
+                    <a
+                      class="link mono trunc"
+                      href={`#/persons/${encodeURIComponent(s.distinct_id)}`}
+                      onclick={(e) => e.stopPropagation()}
+                      title={s.distinct_id}
+                    >
+                      {s.distinct_id}
+                    </a>
+                  {:else}
+                    <span class="muted">{t('session.meta.anonymous')}</span>
+                  {/if}
+                </td>
+                <td>
+                  {#if s.device_key}
+                    <a
+                      class="link mono trunc"
+                      href={`#/devices/${encodeURIComponent(s.device_key)}`}
+                      onclick={(e) => e.stopPropagation()}
+                      title={s.device_key}
+                    >
+                      {s.device_key}
+                    </a>
+                  {:else}
+                    <span class="faint">—</span>
+                  {/if}
+                </td>
+                <td><TimeValue value={s.started_at} muted /></td>
+                <td class="num">{formatDuration(durationBetween(s.started_at, s.last_event_at))}</td>
+                <td class="num">{formatNumber(s.events_count)}</td>
+                <td class="num">
+                  <span class:err={s.errors_count > 0}>{formatNumber(s.errors_count)}</span>
+                </td>
+              </tr>
+            {/each}
+          {/snippet}
+        </DataTable>
+        <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
+             inference from the row count: a final page of exactly `LIMIT` rows
+             used to offer a Next that led to an empty page.
+
+             `count` stays the FETCHED page size, not `filtered.length`: the
+             search box above filters this page in the browser only, so the
+             pager's range describes the page the server sent. -->
+        <Pagination
+          offset={list.offset}
+          limit={LIMIT}
+          count={sessions.length}
+          {hasNext}
+          {total}
+          totalIsCapped={sessionsView.data?.total_is_capped ?? false}
+          onchange={(o) => (list = setOffsetPage(list, o))}
+        />
       {/if}
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
-        <Button
-          variant="secondary"
-          disabled={sessions.length === 0}
-          onclick={downloadSessionsCsv}
-          title={t('sessions.exportTitle')}
-        >
-          <Icon name="download" size={15} />
-          {t('explore.exportCsv')}
-        </Button>
-      {/snippet}
-    </FilterBar>
+    </Card>
   </div>
 
-  <!-- Above the session rows, not above the engagement charts: it describes
-       what the LIST leaves out, and the charts run their own query. -->
-  <SearchDisclosure {clamped} />
-
-  <Card padding="none">
-    {#if loading}
-      <Skeleton rows={6} />
-    {:else if error}
-      <EmptyState title={t('sessions.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() =>
-              sessionStore.currentAppId &&
-              load(
-                sessionStore.currentAppId,
-                timeFilter,
-                sortParam(list.sort),
-                list.offset,
-                appliedSearch,
-                filters,
-                true,
-              )}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    {:else if sessions.length === 0}
-      <EmptyState
-        title={t('sessions.empty.noMatches')}
-        description={appliedSearch ? `No sessions match “${appliedSearch}”.` : "No sessions recorded in this range. Widen the date range or send activity from your SDK."}
-        icon="inbox"
-      />
-    {:else}
-      <DataTable>
-        {#snippet head()}
-          <tr>
-            <!-- Session stays a plain `<th>`: the endpoint's whitelist has no
-                 session-id column, and an unlisted `sort=` is a 400 rather
-                 than a silently ignored parameter. An unsorted column is
-                 honest; a header that 400s the page is not. -->
-            <th>{t('sessions.column.session')}</th>
-            <SortableTh key="distinct_id" columnDefault="asc" sort={list.sort} {onsort}>
-              {t('sessions.column.user')}
-            </SortableTh>
-            <SortableTh key="device_key" columnDefault="asc" sort={list.sort} {onsort}>
-              {t('sessions.column.device')}
-            </SortableTh>
-            <SortableTh key="started_at" sort={list.sort} {onsort}>{t('explore.column.started')}</SortableTh>
-            <!-- No stored duration: the server orders by `last_event_at -
-                 started_at`, the same interval this column renders. -->
-            <SortableTh key="duration_ms" sort={list.sort} {onsort}>{t('explore.column.duration')}</SortableTh>
-            <SortableTh key="events_count" class="num" sort={list.sort} {onsort}>
-              {t('explore.column.events')}
-            </SortableTh>
-            <SortableTh key="errors_count" class="num" sort={list.sort} {onsort}>
-              {t('explore.column.errors')}
-            </SortableTh>
-          </tr>
-        {/snippet}
-        {#snippet children()}
-          {#each sessions as s (s.id)}
-            {@const path = sessionPath(s.session_id)}
-            <tr
-              class="clickable"
-              onclick={(e) => rowNav(e, path)}
-              onauxclick={(e) => rowNav(e, path)}
-            >
-              <td>
-                <a class="row-link mono sid" href={rowHref(path)} title={s.session_id}>
-                  {s.session_id}
-                </a>
-              </td>
-              <td>
-                {#if s.distinct_id}
-                  <a
-                    class="link mono trunc"
-                    href={`#/persons/${encodeURIComponent(s.distinct_id)}`}
-                    onclick={(e) => e.stopPropagation()}
-                    title={s.distinct_id}
-                  >
-                    {s.distinct_id}
-                  </a>
-                {:else}
-                  <span class="muted">anonymous</span>
-                {/if}
-              </td>
-              <td>
-                {#if s.device_key}
-                  <a
-                    class="link mono trunc"
-                    href={`#/devices/${encodeURIComponent(s.device_key)}`}
-                    onclick={(e) => e.stopPropagation()}
-                    title={s.device_key}
-                  >
-                    {s.device_key}
-                  </a>
-                {:else}
-                  <span class="faint">—</span>
-                {/if}
-              </td>
-              <td><TimeValue value={s.started_at} /></td>
-              <td class="muted">{formatDuration(durationBetween(s.started_at, s.last_event_at))}</td>
-              <td class="num">{formatNumber(s.events_count)}</td>
-              <td class="num">
-                <span class:err={s.errors_count > 0}>{formatNumber(s.errors_count)}</span>
-              </td>
-            </tr>
-          {/each}
-        {/snippet}
-      </DataTable>
-      <!-- `hasNext` is the client's `limit + 1` over-fetch probe, not an
-           inference from the row count: a final page of exactly `LIMIT` rows
-           used to offer a Next that led to an empty page.
-
-           `count` stays the FETCHED page size, not `filtered.length`: the
-           search box above filters this page in the browser only, so the
-           pager's range describes the page the server sent. -->
-      <Pagination
-        offset={list.offset}
-        limit={LIMIT}
-        count={sessions.length}
-        {hasNext}
-        {total}
-        totalIsCapped={sessionsView.data?.total_is_capped ?? false}
-        onchange={(o) => (list = setOffsetPage(list, o))}
-      />
-    {/if}
-  </Card>
-
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
   .session-charts {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 18px;
+    gap: var(--page-gap);
     /* Deliberately NOT `align-items: start`: the duration chart and the
        histogram have different natural heights, and letting each size to its
-       own content leaves two cards of visibly different height sitting side by
-       side. Stretching makes the pair read as one row. */
-    margin: 16px 0;
+       own content leaves two charts of visibly different height sitting side
+       by side. Stretching makes the pair read as one row. */
+    margin-top: var(--page-gap);
   }
   @media (max-width: 900px) {
     .session-charts {
       grid-template-columns: 1fr;
     }
   }
-  .analytics-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin: 8px 0 12px;
-  }
-  /* Opens the list section the way `.analytics-head` opens the charts: the gap
-     above separates the engagement block from the table, and the FilterBar
-     carries its own 16px below. The bar wraps internally, so this only has to
-     own the section rhythm. */
-  .list-head {
-    margin-top: 28px;
-  }
-  .section-title {
-    font-size: 15px;
-    font-weight: 640;
-    margin: 0;
+  /* Section rhythm: the engagement section, then the list section, one
+     `--page-gap` apart — the same gap every page uses between sections. */
+  .list-section {
+    margin-top: var(--page-gap);
   }
   .sid {
     display: inline-block;
@@ -664,7 +642,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     vertical-align: middle;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .link {
     color: var(--text);
@@ -682,10 +660,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     vertical-align: middle;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .err {
     color: var(--error);
-    font-weight: 620;
+    font-weight: var(--weight-strong);
   }
 </style>

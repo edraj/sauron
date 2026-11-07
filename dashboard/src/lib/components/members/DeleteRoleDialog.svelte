@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { t } from '../../i18n';
+  import { formatNumber, t } from '../../i18n';
   import Modal from '../ui/Modal.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
   import { deleteRole } from '../../api/orgs';
@@ -49,23 +50,31 @@
   }
 </script>
 
-<Modal {open} title={`Delete ${role?.name ?? 'role'}`} onclose={onclose} dismissible={!busy}>
+<Modal
+  {open}
+  title={role ? t('roles.deleteTitle', { name: role.name }) : t('roles.delete')}
+  onclose={onclose}
+  dismissible={!busy}
+>
   {#if memberCount > 0}
-    <p class="warning">
-      {memberCount}
-      {memberCount === 1 ? 'member' : 'members'} will lose this access immediately. This cannot be undone.
-    </p>
+    <div class="warning">
+      <InlineNotice tone="warning">
+        {memberCount === 1
+          ? t('roles.deleteImpactOne')
+          : t('roles.deleteImpactMany', { n: formatNumber(memberCount) })}
+      </InlineNotice>
+    </div>
   {:else}
     <p class="lede">{t('roles.deleteSafe')}</p>
   {/if}
 
   <Input
-    label={`Type "${role?.name ?? ''}" to confirm`}
+    label={t('roles.typeToConfirm', { name: role?.name ?? '' })}
     bind:value={confirmName}
     placeholder={role?.name ?? ''}
   />
 
-  {#if error}<p class="err-msg">{error}</p>{/if}
+  {#if error}<p class="err-msg" role="alert">{error}</p>{/if}
 
   {#snippet footer()}
     <Button variant="secondary" onclick={onclose} disabled={busy}>{t('common.cancel')}</Button>
@@ -77,22 +86,16 @@
 
 <style>
   .lede {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     margin-bottom: 14px;
   }
   .warning {
-    font-size: 12.5px;
-    color: var(--warning);
-    background: var(--warning-soft);
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-radius: var(--radius);
-    padding: 8px 12px;
     margin-bottom: 14px;
   }
   .err-msg {
     color: var(--error);
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin-top: 12px;
   }
 </style>

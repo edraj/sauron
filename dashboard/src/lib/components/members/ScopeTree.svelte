@@ -3,6 +3,7 @@
   import Icon from '../ui/Icon.svelte';
   import Spinner from '../ui/Spinner.svelte';
   import {
+    countLabel,
     describeSelection,
     isImpliedByAncestor,
     projectCheckState,
@@ -222,7 +223,7 @@
             type="button"
             class="twisty"
             aria-expanded={open}
-            aria-label={`${open ? 'Collapse' : 'Expand'} ${project.name}`}
+            aria-label={open ? t('members.tree.collapse', { name: project.name }) : t('members.tree.expand', { name: project.name })}
             onclick={() => toggleOpenProject(project.id)}
           >
             <Icon name={open ? 'chevron-down' : 'chevron-right'} size={13} />
@@ -240,7 +241,9 @@
           />
           <span class="n-name">{project.name}</span>
           {#if apps.length}
-            <span class="n-hint">{apps.length} app{apps.length === 1 ? '' : 's'}</span>
+            <span class="n-hint"
+              >{countLabel(apps.length, 'scope.summary.appOne', 'scope.summary.appMany')}</span
+            >
           {/if}
         </label>
       </div>
@@ -264,7 +267,7 @@
                 type="button"
                 class="twisty"
                 aria-expanded={appOpen}
-                aria-label={`${appOpen ? 'Collapse' : 'Expand'} ${app.name}`}
+                aria-label={appOpen ? t('members.tree.collapse', { name: app.name }) : t('members.tree.expand', { name: app.name })}
                 onclick={() => toggleOpenApp(app.id)}
               >
                 {#if envsLoading}
@@ -288,7 +291,9 @@
               <!-- An env count under an app whose environments are not
                    selectable is a promise the tree does not keep. -->
               {#if allowEnv && envs.length}
-                <span class="n-hint">{envs.length} env{envs.length === 1 ? '' : 's'}</span>
+                <span class="n-hint"
+                  >{countLabel(envs.length, 'scope.summary.envOne', 'scope.summary.envMany')}</span
+                >
               {/if}
             </label>
           </div>
@@ -392,7 +397,7 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
     cursor: pointer;
   }
@@ -409,7 +414,7 @@
     white-space: nowrap;
   }
   .n-hint {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     white-space: nowrap;
   }
@@ -419,7 +424,7 @@
     gap: 6px;
   }
   .empty {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     padding: 4px 0 2px 14px;
   }
@@ -427,7 +432,7 @@
     padding: 2px 0 2px 54px;
   }
   .summary {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   /* Disclosure stays live while disabled so the admin can still read the tree. */

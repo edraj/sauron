@@ -42,7 +42,7 @@
   const PLOT_H = H - PAD_T - PAD_B;
 
   const LATENCY = 'var(--warning)';
-  const THROUGHPUT = 'var(--primary)';
+  const THROUGHPUT = 'var(--chart-1)';
 
   const secondary = $derived<Metric>(primary === 'latency' ? 'throughput' : 'latency');
 
@@ -235,13 +235,13 @@
     overflow: visible;
   }
   .grid {
-    stroke: var(--border);
+    stroke: var(--chart-grid);
     stroke-width: 1;
   }
   .tick,
   .hour {
     fill: var(--text-faint);
-    font-size: 11px;
+    font-size: var(--text-xs);
     dominant-baseline: middle;
     font-variant-numeric: tabular-nums;
   }
@@ -286,7 +286,7 @@
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow);
     padding: 7px 10px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     pointer-events: none;
     white-space: nowrap;
     min-width: 132px;
@@ -319,7 +319,7 @@
     color: var(--text-muted);
   }
   .tip-value {
-    font-weight: 600;
+    font-weight: var(--weight-strong);
     color: var(--text);
     font-variant-numeric: tabular-nums;
   }

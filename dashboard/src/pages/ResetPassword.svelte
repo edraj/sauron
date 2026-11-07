@@ -4,6 +4,7 @@
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import { resetPassword } from '../lib/api/auth';
   import { errorMessage, isNormalizedError } from '../lib/api/client';
   import { authStore } from '../lib/stores/auth.svelte';
@@ -33,7 +34,7 @@
     submitting = true;
     try {
       await resetPassword(token, newPassword);
-      toastStore.success('Password updated. Sign in with your new password.');
+      toastStore.success(t('auth.reset.toast.updated'));
       // These three statements, in this order. `replace('/login')` alone is a
       // no-op for the visitor this page most needs to handle: App.svelte pushes
       // `authStore.isAuthenticated` visitors to /issues, and `isAuthenticated`
@@ -64,14 +65,14 @@
     </div>
   {:else}
     <form onsubmit={submit} class="form">
-      {#if error}<div class="alert" role="alert">{error}</div>{/if}
+      {#if error}<InlineNotice tone="error">{error}</InlineNotice>{/if}
       <Input
         label={t('auth.password.new')}
         type="password"
         bind:value={newPassword}
         autocomplete="new-password"
-        hint={rules.tooShort ? undefined : 'At least 8 characters.'}
-        error={rules.tooShort ? 'Must be at least 8 characters.' : undefined}
+        hint={rules.tooShort ? undefined : t('auth.password.hint.minLength')}
+        error={rules.tooShort ? t('auth.password.error.tooShort') : undefined}
         required
       />
       <Input
@@ -79,7 +80,7 @@
         type="password"
         bind:value={confirmPassword}
         autocomplete="new-password"
-        error={rules.mismatch ? 'Passwords do not match.' : undefined}
+        error={rules.mismatch ? t('auth.password.error.mismatch') : undefined}
         required
       />
       <Button
@@ -110,15 +111,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    font-size: 14px;
+    font-size: var(--text-sm);
     line-height: 1.5;
-  }
-  .alert {
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-    color: var(--error);
-    font-size: 13px;
   }
 </style>

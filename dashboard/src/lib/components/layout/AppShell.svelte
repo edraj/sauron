@@ -185,14 +185,17 @@
   .content-inner {
     max-width: var(--content-max);
     margin: 0 auto;
-    padding: 28px 28px 64px;
-    animation: fade-in 0.22s ease;
+    padding: 24px 28px 64px;
+    animation: fade-in 0.16s ease;
   }
 
   @media (max-width: 860px) {
     .shell {
-      grid-template-columns: 1fr;
-      grid-template-rows: auto var(--topbar-h) 1fr;
+      /* `minmax(0, 1fr)` here too, for the reason given on the desktop rule:
+         a bare `1fr` lets a wide table's min-content widen the whole page.
+         Section cards no longer clip their content, so nothing else stops it. */
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto auto 1fr;
       grid-template-areas:
         'sidebar'
         'topbar'

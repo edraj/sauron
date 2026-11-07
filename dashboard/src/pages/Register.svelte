@@ -4,6 +4,7 @@
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { errorMessage } from '../lib/api/client';
@@ -39,7 +40,7 @@
 
 <AuthLayout title={t('auth.register.title')} subtitle={t('auth.register.subtitle')}>
   <form onsubmit={submit} class="form">
-    {#if error}<div class="alert" role="alert">{error}</div>{/if}
+    {#if error}<InlineNotice tone="error">{error}</InlineNotice>{/if}
     <Input label={t('common.name')} bind:value={name} placeholder={t('auth.placeholder.personName')} autocomplete="name" />
     <Input
       label={t('auth.register.workEmail')}
@@ -77,14 +78,6 @@
   .form {
     display: flex;
     flex-direction: column;
-    gap: 15px;
-  }
-  .alert {
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-    color: var(--error);
-    font-size: 13px;
+    gap: 16px;
   }
 </style>

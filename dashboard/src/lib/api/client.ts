@@ -246,9 +246,17 @@ export function normalizeError(error: unknown): NormalizedError {
       };
     }
     const envelope = response.data as ApiErrorEnvelope | undefined;
+    // No envelope AND no body at all is its own case: it is how the API's
+    // TimeoutLayer answers (an empty 503), as opposed to a reverse proxy's or
+    // load balancer's error PAGE in front of a dead API. `describeLoadError`
+    // tells "took too long" from "server problem" by this.
+    const emptyBody =
+      response.data === undefined ||
+      response.data === null ||
+      (typeof response.data === 'string' && response.data.trim() === '');
     return {
       status: response.status,
-      code: envelope?.error?.code ?? 'http_error',
+      code: envelope?.error?.code ?? (emptyBody ? 'empty_response' : 'http_error'),
       message: envelope?.error?.message ?? error.message ?? 'Request failed',
       isNetwork: false,
     };
@@ -271,10 +279,16 @@ export function isNormalizedError(value: unknown): value is NormalizedError {
   );
 }
 
-export function errorMessage(value: unknown): string {
-  if (isNormalizedError(value)) return value.message;
-  if (value instanceof Error) return value.message;
-  return 'Something went wrong';
+/**
+ * The text of a caught failure. Read errors with this, never with
+ * `instanceof Error`: the client rejects with a plain `NormalizedError`
+ * object, which is not an Error (error-text.test.ts guards the call sites).
+ * `fallback` is for a failure with no message of its own.
+ */
+export function errorMessage(value: unknown, fallback = 'Something went wrong'): string {
+  if (isNormalizedError(value) && value.message) return value.message;
+  if (value instanceof Error && value.message) return value.message;
+  return fallback;
 }
 
 /**

@@ -49,24 +49,26 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: var(--surface-2);
+    background: var(--surface);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    transition: all 0.14s ease;
+    font-weight: var(--weight-medium);
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .copy.md {
-    padding: 7px 11px;
-    font-size: 12.5px;
+    height: 28px;
+    padding: 0 10px;
+    font-size: var(--text-xs);
   }
   .copy.sm {
-    padding: 5px 9px;
-    font-size: 11.5px;
+    height: 22px;
+    padding: 0 7px;
+    font-size: var(--text-xs);
   }
   .copy:hover {
-    background: var(--surface-3);
+    background: var(--surface-2);
     color: var(--text);
-    border-color: var(--text-faint);
   }
   .copy.copied {
     color: var(--success);

@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { opLabel } from '../lib/models/perf-ops';
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
   import { rangeStore } from '../lib/stores/range.svelte';
@@ -164,9 +167,8 @@
     }
   }
 
-  function opLabel(o: string): string {
-    return o === 'All' ? 'All' : o.replace('_', ' ');
-  }
+
+  const opOptions = $derived(OPS.map((o) => ({ value: o, label: opLabel(o) })));
 
   // --- drill-down ------------------------------------------------------------
   //
@@ -244,39 +246,8 @@
   const refresher = pageRefresher(refresh);
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('perf.title')}</h1>
-      <p class="muted sub">
-        {t('perf.subtitle')}
-      </p>
-    </div>
-    <div class="controls">
-      <div class="ops" role="tablist" aria-label={t('perf.operationFilter')}>
-        {#each OPS as o (o)}
-          <button
-            class="op"
-            class:active={op === o}
-            onclick={() => (op = o)}
-            type="button"
-            role="tab"
-            aria-selected={op === o}
-          >
-            {opLabel(o)}
-          </button>
-        {/each}
-      </div>
-      <DateRange
-        value={range}
-        onchange={(v) => {
-          range = v;
-          rangeStore.set(v);
-        }}
-      />
-      <!--
-        Spins for a background revalidate too, not just an explicit click: that
-        spinner IS the "showing cached data, fetching fresh" hint.
-      -->
+  <PageHeader title={t('perf.title')} subtitle={t('perf.subtitle')}>
+    {#snippet freshness()}
       <RollupChip />
       <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
            watermark IS the data's age and this fetch-time chip would be a
@@ -284,32 +255,46 @@
       {#if !rollupState.ready}
         <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       {/if}
-      <RefreshButton
-        onclick={refresher.run}
-        loading={refresher.busy || refreshing || revalidating}
-        title={revalidating ? 'Refreshing…' : 'Refresh'}
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+  </PageHeader>
+
+  <div class="page">
+    <div class="filters">
+      <SegmentedControl bind:value={op} options={opOptions} ariaLabel={t('perf.operationFilter')} />
+      <DateRange
+        value={range}
+        onchange={(v) => {
+          range = v;
+          rangeStore.set(v);
+        }}
       />
     </div>
-  </div>
 
   {#if loading && rows.length === 0}
     <Skeleton rows={6} />
   {:else if error && rows.length === 0}
-    <Card>
-      <EmptyState title={t('perf.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('perf.error.load')} error={view} onretry={retry} />
   {:else if rows.length === 0}
-    <Card>
+    {#if op !== 'All'}
       <EmptyState
-        title={t('perf.empty.title')}
-        description={t('perf.empty.body')}
+        title={t('common.empty.match', { things: t('perf.noun') })}
+        description={t('common.empty.matchHint')}
         icon="zap"
       />
-    </Card>
+    {:else}
+      <EmptyState
+        title={t('common.empty.range', { things: t('perf.noun') })}
+        description={t('common.empty.rangeHint')}
+        icon="zap"
+      />
+    {/if}
   {:else}
     <!--
       No dim-and-disable while refreshing any more: under stale-while-revalidate
@@ -317,31 +302,27 @@
       it, and re-binding it to `revalidating` would grey the page out and swallow
       clicks on every background refresh. The button's spinner is the indicator.
     -->
-    <div class="body">
       <StatTiles min={170}>
-        <StatTile label={t('perf.stat.throughput')} value={compactNumber(throughput)} sub="transactions" />
-        <StatTile label={t('perf.card.operations')} value={rows.length} sub="tracked" />
+        <StatTile label={t('perf.stat.throughput')} value={compactNumber(throughput)} sub={t('perf.stat.throughputSub')} />
+        <StatTile label={t('perf.card.operations')} value={formatNumber(rows.length)} sub={t('perf.stat.operationsSub')} />
         <StatTile
           label={t('perf.stat.p95')}
           value={approx(formatMs(maxP95), rollupState.ready)}
-          sub="slowest operation"
+          sub={t('perf.stat.p95Sub')}
           tone={latencyTone(maxP95)}
         />
         <StatTile
           label={t('perf.stat.errorRate')}
           value={formatPercent(errorRate)}
-          sub="weighted by volume"
+          sub={t('perf.stat.errorRateSub')}
           tone={errorRate > 0.01 ? 'error' : 'success'}
         />
       </StatTiles>
 
       <div class="charts">
-        <Card>
-          {#snippet header()}
-            <div class="chart-head">
-              <h3 class="ch-title">{t('perf.card.latencyOverTime')}</h3>
-              <span class="caption">p95 latency (ms)</span>
-            </div>
+        <Card title={t('perf.card.latencyOverTime')}>
+          {#snippet actions()}
+            <span class="caption">{t('perf.caption.p95ms')}</span>
           {/snippet}
           <TimeSeriesChart
             data={latencyData}
@@ -351,28 +332,25 @@
           />
         </Card>
 
-        <Card>
-          {#snippet header()}
-            <div class="chart-head">
-              <h3 class="ch-title">{t('perf.card.throughputOverTime')}</h3>
-              <span class="caption">{t('prose.perf.perBucket')}</span>
-            </div>
+        <Card title={t('perf.card.throughputOverTime')}>
+          {#snippet actions()}
+            <span class="caption">{t('prose.perf.perBucket')}</span>
           {/snippet}
           <TimeSeriesChart
             data={throughputData}
             height={200}
-            color="var(--primary)"
+            color="var(--chart-1)"
             onselect={(p) => openDay(p.bucket, 'throughput')}
           />
         </Card>
       </div>
 
-      <Card title={t('perf.card.operations')} padding="none" class="ops-card">
+      <Card title={t('perf.card.operations')}>
         <DataTable>
           {#snippet head()}
             <tr>
               <SortableTh key="name" columnDefault="asc" {sort} {onsort}>{t('perf.column.name')}</SortableTh>
-              <SortableTh key="op" columnDefault="asc" {sort} {onsort}>Op</SortableTh>
+              <SortableTh key="op" columnDefault="asc" {sort} {onsort}>{t('perf.column.op')}</SortableTh>
               <SortableTh key="throughput" class="num" {sort} {onsort}>{t('perf.stat.throughput')}</SortableTh>
               <SortableTh key="p50" class="num" {sort} {onsort}>p50</SortableTh>
               <SortableTh key="p95" class="num" {sort} {onsort}>p95</SortableTh>
@@ -412,8 +390,8 @@
           {/snippet}
         </DataTable>
       </Card>
-    </div>
   {/if}
+  </div>
 
   <!--
     Mounted once, outside the loading/error branches, and fed the clicked row.
@@ -440,75 +418,25 @@
   />
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .ops {
-    display: inline-flex;
-    gap: 2px;
-    padding: 4px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-  .op {
-    padding: 6px 11px;
-    border: none;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 12.5px;
-    font-weight: 560;
-    border-radius: var(--radius-sm);
-    text-transform: capitalize;
-    white-space: nowrap;
-  }
-  .op:hover {
-    color: var(--text);
-  }
-  .op.active {
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow-sm);
-  }
-  .body {
+  .page {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
+  }
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .charts {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 18px;
+    gap: var(--page-gap) 28px;
     align-items: start;
   }
-  .chart-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-    width: 100%;
-  }
-  .ch-title {
-    font-size: 14.5px;
-    font-weight: 620;
-  }
   .caption {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     font-variant-numeric: tabular-nums;
   }
@@ -533,7 +461,7 @@
   }
   .err-rate.err {
     color: var(--error);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 
   @media (max-width: 900px) {

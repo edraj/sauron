@@ -8,6 +8,7 @@
   endpoint regardless — this is an explanation, not a security boundary.
 -->
 <script lang="ts">
+  import { t } from '../i18n';
   import EmptyState from './ui/EmptyState.svelte';
   import Button from './ui/Button.svelte';
   import {
@@ -35,15 +36,19 @@
     Object.entries(PAGE_ACCESS).find(([, entry]) => canAccessPage(entry)) ??
       (['/account', null] as [string, PageAccess | null]),
   );
-  const fallbackTitle = $derived(fallback[1]?.title ?? 'Account');
+  const fallbackTitle = $derived(fallback[1] ? t(fallback[1].titleKey) : t('nav.account'));
 </script>
 
+<!-- A page-level state like ErrorState/EmptyState everywhere else: hairline
+     glyph, title, muted reason, one secondary way out. -->
 <EmptyState
   icon="lock"
-  title="You don't have access to {access.title}"
-  description="{requirement}. Ask an organization owner for access."
+  title={t('ui.denied.title', { page: t(access.titleKey) })}
+  description={t('ui.denied.description', { requirement })}
 >
   {#snippet action()}
-    <Button variant="primary" href="#{fallback[0]}">Back to {fallbackTitle}</Button>
+    <Button variant="secondary" href="#{fallback[0]}">
+      {t('common.backTo', { target: fallbackTitle })}
+    </Button>
   {/snippet}
 </EmptyState>

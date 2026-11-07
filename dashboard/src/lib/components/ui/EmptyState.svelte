@@ -7,13 +7,17 @@
     description?: string;
     icon?: IconName;
     action?: Snippet;
+    /** `page` stands alone with its icon; `section` is the compact in-section form. */
+    size?: 'page' | 'section';
   }
 
-  let { title, description, icon = 'inbox', action }: Props = $props();
+  let { title, description, icon = 'inbox', action, size = 'page' }: Props = $props();
 </script>
 
-<div class="empty">
-  <div class="glyph" aria-hidden="true"><Icon name={icon} size={26} /></div>
+<div class="empty {size}">
+  {#if size === 'page'}
+    <div class="glyph" aria-hidden="true"><Icon name={icon} size={15} /></div>
+  {/if}
   <h3 class="title">{title}</h3>
   {#if description}<p class="desc">{description}</p>{/if}
   {#if action}<div class="action">{@render action()}</div>{/if}
@@ -25,29 +29,36 @@
     flex-direction: column;
     align-items: center;
     text-align: center;
-    padding: 56px 24px;
-    gap: 8px;
+    gap: 4px;
+  }
+  .empty.page {
+    padding: 40px 24px;
+  }
+  .empty.section {
+    padding: 20px 16px;
   }
   .glyph {
-    width: 56px;
-    height: 56px;
+    width: 30px;
+    height: 30px;
     display: grid;
     place-items: center;
-    font-size: 26px;
     border-radius: 50%;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    color: var(--text-faint);
-    margin-bottom: 6px;
+    border: 1px solid var(--border-strong);
+    color: var(--text-muted);
+    margin-bottom: 8px;
   }
   .title {
-    font-size: 16px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
+  }
+  .section .title {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
   }
   .desc {
     color: var(--text-muted);
-    max-width: 380px;
-    font-size: 13.5px;
+    max-width: 44ch;
+    font-size: var(--text-sm);
   }
   .action {
     margin-top: 10px;

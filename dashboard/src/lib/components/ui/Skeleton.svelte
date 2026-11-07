@@ -52,9 +52,9 @@
        placeholder tracks the theme instead of going invisible in one of them. */
     background: linear-gradient(
       90deg,
-      var(--border, #2a2a2a) 25%,
-      var(--surface-2, #333) 50%,
-      var(--border, #2a2a2a) 75%
+      var(--surface-2) 25%,
+      var(--surface-3) 50%,
+      var(--surface-2) 75%
     );
     background-size: 200% 100%;
     animation: sk-shimmer 1.4s ease-in-out infinite;

@@ -13,7 +13,7 @@
   let {
     data,
     height = 200,
-    emptyLabel = 'No store activity in this range',
+    emptyLabel,
   }: Props = $props();
 
   // ONE scale for both directions — see `divergingScale`. Each half owns half
@@ -51,7 +51,7 @@
 </script>
 
 {#if data.length === 0}
-  <div class="chart-empty" style="height:{height}px">{emptyLabel}</div>
+  <div class="chart-empty" style="height:{height}px">{emptyLabel ?? t('chart.empty.store')}</div>
 {:else}
   <div class="chart">
     <div class="plot" style="height:{height}px">
@@ -137,6 +137,7 @@
     flex-direction: column;
     justify-content: flex-end;
     align-items: center;
+    /* The zero line is an axis, not a gridline: `--border`. */
     border-bottom: 1px solid var(--border);
   }
   .down {
@@ -159,7 +160,7 @@
     border-radius: 0 0 3px 3px;
   }
   .bar.play {
-    background: var(--primary);
+    background: var(--chart-1);
   }
   .bar.apple {
     background: var(--info);
@@ -177,7 +178,7 @@
     justify-content: space-between;
     align-items: center;
     gap: 8px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .legend {
@@ -192,7 +193,7 @@
     border-radius: 2px;
   }
   .legend .k.play {
-    background: var(--primary);
+    background: var(--chart-1);
   }
   .legend .k.apple {
     background: var(--info);
@@ -204,7 +205,7 @@
   .chart-empty {
     display: grid;
     place-items: center;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     border: 1px dashed var(--border);
     border-radius: var(--radius);

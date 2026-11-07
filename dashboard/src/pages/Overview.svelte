@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { t, localeStore, intlTag } from '../lib/i18n';
+  import { t, formatNumber, localeStore, intlTag } from '../lib/i18n';
   import Card from '../lib/components/ui/Card.svelte';
-  import Button from '../lib/components/ui/Button.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
   import StatTile from '../lib/components/StatTile.svelte';
   import DateRange from '../lib/components/DateRange.svelte';
@@ -63,7 +64,7 @@
    */
   const rangeCaption = $derived(
     range.kind === 'last'
-      ? `the last ${spanDays(range)} days`
+      ? t('overview.range.last', { n: spanDays(range) })
       : formatAbsolute(range, intlTag(localeStore.locale)),
   );
 
@@ -388,7 +389,7 @@
   const crashFreeSub = $derived.by(() => {
     if (totals == null) return undefined;
     if (totals.crash_free_sessions != null) {
-      return `${compactNumber(totals.totals.crashed_sessions)} crashed`;
+      return t('overview.stat.crashedSub', { n: compactNumber(totals.totals.crashed_sessions) });
     }
     return totals.totals.sessions === 0
       ? t('overview.stat.crashFree.noSessions')
@@ -417,30 +418,51 @@
     if (!sums || sums.users <= 0) return null;
     return sums.new_users / sums.users;
   });
+
+  /**
+   * The header's one line: the window in words, then — while nothing has
+   * landed yet and a section is still on its first server-side compute — a
+   * "Computing…" qualifier, so a page of skeletons says why it is waiting.
+   */
+  const subtitle = $derived(
+    !computedAt && computing
+      ? `${t('overview.subtitle', { range: rangeCaption })} · ${t('overview.computing')}`
+      : t('overview.subtitle', { range: rangeCaption }),
+  );
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('overview.title')}</h1>
-      <p class="muted sub">
-        Health and activity at a glance for {rangeCaption}.
-        <!--
-          When these numbers were computed, not when they were fetched. The
-          server caches each section for up to an hour and recomputes in the
-          background, so a page that painted instantly can still be showing
-          40-minute-old numbers — saying so is the contract, not a detail.
+  <PageHeader title={t('overview.title')} {subtitle}>
+    <!--
+      The page's ONE stamp. `computedAt` is the oldest server stamp across the
+      five sections; without it the chip would fall back to the browser's
+      fetch time and date hour-old numbers to "just now".
 
-          The absolute time is the label and the relative one is the qualifier:
-          "42m ago" alone forces the reader to do arithmetic to know whether it
-          crosses something they care about, and it silently goes wrong if the
-          tab is left open.
-        -->
-        {#if !computedAt && computing}
-          <span class="stamp">· Computing…</span>
-        {/if}
-      </p>
-    </div>
-    <div class="controls">
+      When these numbers were computed, not when they were fetched. The server
+      caches each section for up to an hour and recomputes in the background,
+      so a page that painted instantly can still be showing 40-minute-old
+      numbers — saying so is the contract, not a detail.
+    -->
+    {#snippet freshness()}
+      <Freshness
+        computedAt={computedAt?.toISOString() ?? null}
+        fetchedAt={pageFreshness.fetchedAt}
+        revalidating={pageFreshness.revalidating}
+      />
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint.
+      -->
+      <RefreshButton
+        onclick={refresher.run}
+        loading={refresher.busy || refreshing || revalidating}
+        title={canForce ? t('overview.recompute') : undefined}
+      />
+    {/snippet}
+    {#snippet actions()}
+      <!-- The window every section below is cut by, so it sits with the
+           page's own controls rather than over any one card. -->
       <DateRange
         value={range}
         onchange={(v) => {
@@ -449,29 +471,8 @@
         }}
         ranges={RANGES}
       />
-      <!--
-        Spins for a background revalidate too, not just an explicit click: that
-        spinner IS the "showing cached data, fetching fresh" hint.
-      -->
-      <!--
-        The page's ONE stamp. `computedAt` is the oldest server stamp across
-        the five sections; without it the chip would fall back to the browser's
-        fetch time and date hour-old numbers to "just now". The subtitle used to
-        carry a second "Updated" line from the same value and the two were read
-        as two different facts.
-      -->
-      <Freshness
-        computedAt={computedAt?.toISOString() ?? null}
-        fetchedAt={pageFreshness.fetchedAt}
-        revalidating={pageFreshness.revalidating}
-      />
-      <RefreshButton
-        onclick={refresher.run}
-        loading={refresher.busy || refreshing || revalidating}
-        title={revalidating ? 'Refreshing…' : canForce ? 'Recompute now' : 'Refresh'}
-      />
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   <!--
     No page-wide {#if loading} gate any more. That single condition is what made
@@ -482,19 +483,21 @@
   -->
   {#if totals}
     <StatTiles min={150}>
-      <StatTile label={t('overview.stat.events')} value={compactNumber(totals.totals.events)} tone="primary" />
+      <StatTile label={t('overview.stat.events')} value={compactNumber(totals.totals.events)} />
       <StatTile
         label={t('overview.stat.errors')}
         value={compactNumber(totals.totals.errors)}
         tone={totals.totals.errors > 0 ? 'error' : 'neutral'}
-        sub={`${formatPercent(totals.error_rate)} error rate`}
+        sub={t('overview.stat.errorRateSub', { pct: formatPercent(totals.error_rate) })}
       />
       <StatTile label={t('overview.stat.sessions')} value={compactNumber(totals.totals.sessions)} />
       <StatTile label={t('overview.stat.users')} value={compactNumber(totals.totals.users)} />
       <StatTile
         label={t('overview.stat.newUsers')}
         value={compactNumber(totals.totals.new_users)}
-        sub={newUserShare != null ? `${formatPercent(newUserShare)} of users` : undefined}
+        sub={newUserShare != null
+          ? t('overview.stat.newUserShare', { pct: formatPercent(newUserShare) })
+          : undefined}
       />
       <StatTile
         wide
@@ -507,20 +510,14 @@
         label={t('perf.stat.errorRate')}
         value={formatPercent(totals.error_rate)}
         tone={errorRateTone}
-        sub="errors / events"
+        sub={t('overview.stat.errorRateFormula')}
       />
     </StatTiles>
   {:else if totalsView.error}
-    <Card>
-      <EmptyState title={t('overview.error.totals')} description={totalsView.error} icon="triangle-alert">
-        {#snippet action()}
-          <Button variant="secondary" onclick={retry}>{t('common.retry')}</Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState size="section" title={t('overview.error.totals')} error={totalsView} onretry={retry} />
   {:else}
     <!-- Tile-height rows, so the KPI strip does not jump when it fills in. -->
-    <Card><Skeleton rows={2} height="34px" label={t('overview.loading.totals')} /></Card>
+    <Skeleton rows={2} height="34px" label={t('overview.loading.totals')} />
   {/if}
 
   <div class="grid">
@@ -530,11 +527,11 @@
           <TimeSeriesChart
             data={series.events_series}
             height={220}
-            color="var(--primary)"
-            emptyLabel="No events in this range"
+            color="var(--chart-1)"
+            emptyLabel={t('common.empty.range', { things: t('events.things') })}
           />
         {:else if seriesView.error}
-          <EmptyState title={t('overview.error.chart')} description={seriesView.error} icon="triangle-alert" />
+          <ErrorState size="section" title={t('overview.error.chart')} error={seriesView} onretry={retry} />
         {:else}
           <Skeleton rows={1} height="220px" label={t('overview.loading.eventVolume')} />
         {/if}
@@ -545,10 +542,10 @@
             data={series.errors_series}
             height={180}
             color="var(--error)"
-            emptyLabel="No errors in this range — nice."
+            emptyLabel={t('common.empty.range', { things: t('overview.things.errors') })}
           />
         {:else if seriesView.error}
-          <EmptyState title={t('overview.error.chart')} description={seriesView.error} icon="triangle-alert" />
+          <ErrorState size="section" title={t('overview.error.chart')} error={seriesView} onretry={retry} />
         {:else}
           <Skeleton rows={1} height="180px" label={t('overview.loading.errorsOverTime')} />
         {/if}
@@ -558,8 +555,8 @@
           <TimeSeriesChart
             data={activeUsersChart}
             height={180}
-            color="var(--success, var(--primary))"
-            emptyLabel="No identified activity in this range"
+            color="var(--chart-1)"
+            emptyLabel={t('overview.empty.activeUsers')}
           />
           {#if activeUsers.partial_days.length > 0}
             <!--
@@ -569,15 +566,20 @@
               configuration — see `tier_read::active_users_by_day`.
             -->
             <p class="partial">
-              {activeUsers.partial_days.length} day{activeUsers.partial_days.length > 1 ? 's' : ''}
-              omitted: {activeUsers.partial_days[0].reason}
+              {activeUsers.partial_days.length > 1
+                ? t('overview.partialDays.many', {
+                    n: activeUsers.partial_days.length,
+                    reason: activeUsers.partial_days[0].reason,
+                  })
+                : t('overview.partialDays.one', { reason: activeUsers.partial_days[0].reason })}
             </p>
           {/if}
         {:else if activeUsersView.error}
-          <EmptyState
+          <ErrorState
+            size="section"
             title={t('overview.error.activeUsers')}
-            description={activeUsersView.error}
-            icon="triangle-alert"
+            error={activeUsersView}
+            onretry={retry}
           />
         {:else}
           <Skeleton rows={1} height="180px" label={t('overview.loading.activeUsers')} />
@@ -592,13 +594,13 @@
         viewer is not permitted to see.
       -->
       {#if !issuesForbidden}
-        <Card title={t('overview.card.topIssues')} padding="sm">
+        <Card title={t('overview.card.topIssues')}>
           {#if topIssues}
             {#if topIssues.length === 0}
               <EmptyState
-                title={t('overview.empty.issues')}
-                description={t('overview.empty.issuesBody')}
-                icon="check"
+                size="section"
+                title={t('common.empty.range', { things: t('overview.things.issues') })}
+                description={t('common.empty.rangeHint')}
               />
             {:else}
               <div class="issues">
@@ -606,15 +608,15 @@
                   <a class="issue-row" href={`#/issues/${issue.id}`}>
                     <span class="issue-title truncate">{issue.title}</span>
                     <LevelBadge level={issue.level} size="sm" />
-                    <span class="issue-count mono" title={t('overview.timesSeen')}>
-                      {compactNumber(issue.times_seen)}
+                    <span class="issue-count" title={t('overview.timesSeen')}>
+                      {formatNumber(issue.times_seen)}
                     </span>
                   </a>
                 {/each}
               </div>
             {/if}
           {:else if issuesView.error}
-            <EmptyState title={t('overview.error.issues')} description={issuesView.error} icon="triangle-alert" />
+            <ErrorState size="section" title={t('overview.error.issues')} error={issuesView} onretry={retry} />
           {:else}
             <Skeleton rows={5} label={t('overview.loading.topIssues')} />
           {/if}
@@ -625,15 +627,15 @@
         {#if topEvents}
           {#if topEvents.length === 0}
             <EmptyState
-              title={t('events.empty.none')}
-              description={t('events.empty.body')}
-              icon="chart-column"
+              size="section"
+              title={t('common.empty.range', { things: t('events.things') })}
+              description={t('common.empty.rangeHint')}
             />
           {:else}
             <BarList items={topEvents} />
           {/if}
         {:else if eventsView.error}
-          <EmptyState title={t('events.error.load')} description={eventsView.error} icon="triangle-alert" />
+          <ErrorState size="section" title={t('events.error.load')} error={eventsView} onretry={retry} />
         {:else}
           <Skeleton rows={5} label={t('overview.loading.topEvents')} />
         {/if}
@@ -658,64 +660,41 @@
      is not itself a warning. */
   .partial {
     margin: 8px 0 0;
-    font-size: 12px;
-    color: var(--text-muted, #888);
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  /*
-    `white-space: nowrap` so the timestamp and its relative qualifier never
-    break across lines — split over two lines they read as two separate facts.
-    The subtitle itself still wraps, at the space before the leading "·".
-  */
-  .stamp {
-    white-space: nowrap;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
   .grid {
     display: grid;
     grid-template-columns: 1.5fr 1fr;
-    gap: 18px;
-    margin-top: 18px;
+    gap: var(--page-gap);
+    margin-top: var(--page-gap);
     align-items: start;
   }
   .col {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
     min-width: 0;
   }
   .issues {
     display: flex;
     flex-direction: column;
   }
+  /* The hover fill reaches 8px past the text on both sides while the text
+     itself stays on the section's edge, as table rows do. */
   .issue-row {
     display: flex;
     align-items: center;
     gap: 10px;
     padding: 9px 8px;
+    margin-inline: -8px;
     border-radius: var(--radius-sm);
     text-decoration: none;
     color: inherit;
-    transition: background 0.12s ease;
+    transition: background-color 0.12s ease;
   }
   .issue-row:hover {
-    background: var(--surface-2);
+    background: var(--surface);
   }
   .issue-row + .issue-row {
     border-top: 1px solid var(--border);
@@ -723,13 +702,13 @@
   .issue-title {
     flex: 1;
     min-width: 0;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
   }
   .issue-count {
     flex-shrink: 0;
-    font-size: 12.5px;
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }

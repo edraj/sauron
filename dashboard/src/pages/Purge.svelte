@@ -1,9 +1,15 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
-  import { formatNumber } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { errorMessage } from '../lib/api/client';
+  import { purgeKindName } from '../lib/models/purge-kinds';
+  import { formatNumber, labelFor, t, type MessageKey } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import Input from '../lib/components/ui/Input.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
@@ -25,6 +31,7 @@
     type PurgeCatalog,
     type PurgeJob,
     type PurgeKind,
+    type PurgeStatus,
   } from '../lib/api/purge';
 
   // Cached view (lib/stores/cached-view.svelte.ts): the catalogue paints
@@ -52,7 +59,6 @@
    */
   const revalidating = $derived(view.revalidating);
   let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
 
   // --- the form ------------------------------------------------------------
   let selectedKinds = $state<Set<string>>(new Set());
@@ -109,15 +115,6 @@
     );
   }
 
-  function describe(e: unknown): string {
-    const anyE = e as { response?: { data?: { error?: string; message?: string } } };
-    return (
-      anyE?.response?.data?.error ??
-      anyE?.response?.data?.message ??
-      (e instanceof Error ? e.message : 'Request failed')
-    );
-  }
-
   async function startPreview() {
     if (!app || !canPreview) return;
     busy = true;
@@ -141,7 +138,7 @@
       job = data;
       poll();
     } catch (e) {
-      actionError = describe(e);
+      actionError = errorMessage(e, t('purge.requestFailed'));
     } finally {
       busy = false;
     }
@@ -164,7 +161,7 @@
         job = data;
         poll();
       } catch (e) {
-        actionError = describe(e);
+        actionError = errorMessage(e, t('purge.requestFailed'));
       }
     }, 1500);
   }
@@ -178,7 +175,7 @@
       job = data;
       poll();
     } catch (e) {
-      actionError = describe(e);
+      actionError = errorMessage(e, t('purge.requestFailed'));
     } finally {
       busy = false;
     }
@@ -192,7 +189,7 @@
       job = data;
       poll();
     } catch (e) {
-      actionError = describe(e);
+      actionError = errorMessage(e, t('purge.requestFailed'));
     } finally {
       busy = false;
     }
@@ -213,8 +210,30 @@
   }
 
   function kindLabel(k: PurgeKind): string {
-    return k.slug.replace(/_/g, ' ');
+    return purgeKindName(k.slug);
   }
+
+  const STATUS_LABELS: Record<PurgeStatus, MessageKey> = {
+    previewing: 'purge.status.previewing',
+    previewed: 'purge.status.previewed',
+    pending: 'purge.status.pending',
+    running: 'purge.status.running',
+    cancelling: 'purge.status.cancelling',
+    done: 'purge.status.done',
+    failed: 'purge.status.failed',
+    cancelled: 'purge.status.cancelled',
+  };
+  const PHASE_LABELS: Record<PurgeJob['phase'], MessageKey> = {
+    idle: 'purge.phase.idle',
+    counting: 'purge.phase.counting',
+    delete: 'purge.phase.delete',
+    recompute: 'purge.phase.recompute',
+    finished: 'purge.phase.finished',
+  };
+  const statusLabel = (s: PurgeStatus): string => labelFor(STATUS_LABELS, s);
+  const phaseLabel = (p: PurgeJob['phase']): string => labelFor(PHASE_LABELS, p);
+  const classLabel = (c: PurgeKind['class']): string =>
+    c === 'raw' ? t('purge.class.raw') : c === 'rollup' ? t('purge.class.rollup') : c;
 
   function statusTone(s: string): 'success' | 'error' | 'warning' | 'neutral' {
     if (s === 'done') return 'success';
@@ -257,237 +276,261 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1>{t('prose.purge.title')}</h1>
-      <p class="sub">
-        {t('prose.purge.lede')} <strong>{t('purge.noUndo')}</strong>
-      </p>
-    </div>
-    <div class="head-actions">
+  <PageHeader
+    title={t('prose.purge.title')}
+    subtitle={`${t('prose.purge.lede')} ${t('purge.noUndo')}`}
+  >
+    {#snippet freshness()}
       <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+    {#snippet actions()}
       <Button variant="ghost" onclick={reset} disabled={busy}>
         <Icon name="refresh" /> {t('common.reset')}
       </Button>
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
   <div class="content">
-    {#if error}
-      <Card><p class="err">{error}</p></Card>
+    {#if actionError}
+      <InlineNotice tone="error">{actionError}</InlineNotice>
+    {/if}
+    {#if view.error && view.data !== undefined}
+      <!-- A forced Refresh failed over the catalogue we already had: it stays. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     {/if}
 
     {#if loading}
-      <Card><Skeleton rows={5} /></Card>
+      <Skeleton rows={5} />
+    {:else if view.error && view.data === undefined}
+      <ErrorState
+        title={t('common.couldntLoad', { thing: t('purge.thing') })}
+        error={view}
+        onretry={refresher.run}
+      />
     {:else if !app}
       <EmptyState title={t('purge.selectApp')} description={t('purge.selectAppBody')} icon="package" />
     {:else if !job}
       <!-- ================= scope form ================= -->
-      <Card>
-      <h2>{t('prose.purge.step1')}</h2>
-      <p class="hint">
-        {t('prose.purge.rollups')}
-      </p>
-      <div class="kinds">
-        {#each catalog?.kinds ?? [] as k (k.slug)}
-          {@const isBlocked = blocked.has(k.slug)}
-          <label class="kind" class:blocked={isBlocked}>
-            <input
-              type="checkbox"
-              disabled={isBlocked}
-              checked={selectedKinds.has(k.slug)}
-              onchange={() => (selectedKinds = toggle(selectedKinds, k.slug))}
-            />
-            <span class="name">{kindLabel(k)}</span>
-            <Badge tone={k.class === 'raw' ? 'neutral' : 'info'}>{k.class}</Badge>
-            {#if isBlocked}
-              <span class="why">
-                {t('prose.purge.blockedKind')}
-              </span>
-            {/if}
-          </label>
-        {/each}
-      </div>
-    </Card>
-
-    <Card>
-      <h2>2 — Environments</h2>
-      <label class="row">
-        <input type="checkbox" bind:checked={envFilterActive} />
-        <span>{t('prose.purge.limitEnvs')}</span>
-      </label>
-      {#if !envFilterActive}
+      <Card title={t('prose.purge.step1')}>
         <p class="hint">
-          {t('purge.allEnvironments')}
+          {t('prose.purge.rollups')}
         </p>
-      {:else}
-        <div class="envs">
-          {#each environments as e (e.id)}
-            <label class="row">
+        <div class="kinds">
+          {#each catalog?.kinds ?? [] as k (k.slug)}
+            {@const isBlocked = blocked.has(k.slug)}
+            <label class="kind" class:blocked={isBlocked}>
               <input
                 type="checkbox"
-                checked={selectedEnvs.has(e.id)}
-                onchange={() => (selectedEnvs = toggle(selectedEnvs, e.id))}
+                disabled={isBlocked}
+                checked={selectedKinds.has(k.slug)}
+                onchange={() => (selectedKinds = toggle(selectedKinds, k.slug))}
               />
-              <span>{e.name}</span>
+              <span class="name">{kindLabel(k)}</span>
+              <Badge tone={k.class === 'raw' ? 'neutral' : 'info'} size="sm">{classLabel(k.class)}</Badge>
+              {#if isBlocked}
+                <span class="why">
+                  {t('prose.purge.blockedKind')}
+                </span>
+              {/if}
             </label>
           {/each}
         </div>
-        {#if selectedEnvs.size === 0}
-          <p class="hint warn">{t('purge.selectEnvironment')}</p>
-        {/if}
-      {/if}
-    </Card>
+      </Card>
 
-    <Card>
-      <h2>{t('prose.purge.step3')}</h2>
-      <label class="row">
-        <input type="checkbox" bind:checked={allTime} />
-        <span><strong>{t('purge.allTime')}</strong> {t('prose.purge.allTimeNote')}</span>
-      </label>
-      {#if !allTime}
-        <div class="range">
-          <label>{t('ui.time.from')} <input type="datetime-local" bind:value={rangeStart} /></label>
-          <label>To <input type="datetime-local" bind:value={rangeEnd} /></label>
-        </div>
-        {#if rangeStart && rangeEnd && rangeStart >= rangeEnd}
-          <p class="hint warn">{t('purge.badRange')}</p>
+      <Card title={t('purge.step2')}>
+        <label class="row">
+          <input type="checkbox" bind:checked={envFilterActive} />
+          <span>{t('prose.purge.limitEnvs')}</span>
+        </label>
+        {#if !envFilterActive}
+          <p class="hint">
+            {t('purge.allEnvironments')}
+          </p>
+        {:else}
+          <div class="envs">
+            {#each environments as e (e.id)}
+              <label class="row">
+                <input
+                  type="checkbox"
+                  checked={selectedEnvs.has(e.id)}
+                  onchange={() => (selectedEnvs = toggle(selectedEnvs, e.id))}
+                />
+                <span>{e.name}</span>
+              </label>
+            {/each}
+          </div>
+          {#if selectedEnvs.size === 0}
+            <div class="note"><InlineNotice tone="warning">{t('purge.selectEnvironment')}</InlineNotice></div>
+          {/if}
         {/if}
-      {:else}
-        <p class="hint warn">
-          {t('purge.unbounded')}
-        </p>
-      {/if}
-    </Card>
+      </Card>
 
-    <div class="actions">
-      <Button onclick={startPreview} disabled={!canPreview || busy}>
-        {busy ? 'Counting…' : 'Preview'}
-      </Button>
-      <span class="hint">{t('prose.purge.previewFirst')}</span>
-    </div>
-  {:else}
-    <!-- ================= the job ================= -->
-    <Card>
-      <div class="jobhead">
-        <h2>{job.app_name}</h2>
-        <Badge tone={statusTone(job.status)}>{job.status}</Badge>
-        {#if job.phase !== 'idle' && job.phase !== 'finished'}
-          <Badge tone="info">{job.phase}</Badge>
+      <Card title={t('prose.purge.step3')}>
+        <label class="row">
+          <input type="checkbox" bind:checked={allTime} />
+          <span><strong>{t('purge.allTime')}</strong> {t('prose.purge.allTimeNote')}</span>
+        </label>
+        {#if !allTime}
+          <div class="range">
+            <Input label={t('ui.time.from')} type="datetime-local" bind:value={rangeStart} />
+            <Input label={t('purge.to')} type="datetime-local" bind:value={rangeEnd} />
+          </div>
+          {#if rangeStart && rangeEnd && rangeStart >= rangeEnd}
+            <div class="note"><InlineNotice tone="warning">{t('purge.badRange')}</InlineNotice></div>
+          {/if}
+        {:else}
+          <div class="note">
+            <InlineNotice tone="warning">{t('purge.unbounded')}</InlineNotice>
+          </div>
         {/if}
+      </Card>
+
+      <div class="actions">
+        <Button variant="primary" onclick={startPreview} loading={busy} disabled={!canPreview}>
+          {t('purge.preview')}
+        </Button>
+        <span class="hint">{t('prose.purge.previewFirst')}</span>
       </div>
+    {:else}
+      <!-- ================= the job ================= -->
+      <Card title={job.app_name}>
+        {#snippet actions()}
+          <Badge tone={statusTone(job!.status)} size="sm">{statusLabel(job!.status)}</Badge>
+          {#if job!.phase !== 'idle' && job!.phase !== 'finished'}
+            <Badge tone="info" size="sm">{phaseLabel(job!.phase)}</Badge>
+          {/if}
+        {/snippet}
 
-      {#if job.status === 'previewing'}
-        <p><Spinner /> {t('purge.counting')}</p>
-      {:else}
-        <table class="counts">
-          <thead>
-            <tr><th>{t('sourcemaps.column.kind')}</th><th>{t('prose.purge.matched')}</th><th>{t('purge.deleted')}</th></tr>
-          </thead>
-          <tbody>
-            {#each job.kinds as k (k)}
+        {#if job.status === 'previewing'}
+          <p class="counting"><Spinner /> {t('purge.counting')}</p>
+        {:else}
+          <DataTable>
+            {#snippet head()}
               <tr>
-                <td>{k.replace(/_/g, ' ')}</td>
-                <td class="n">{formatNumber(job.estimated_counts?.[k] ?? 0)}</td>
-                <td class="n">{formatNumber(job.deleted_counts?.[k] ?? 0)}</td>
+                <th>{t('purge.column.kind')}</th>
+                <th class="num">{t('prose.purge.matched')}</th>
+                <th class="num">{t('purge.deleted')}</th>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each job!.kinds as k (k)}
+                <tr>
+                  <td class="name">{purgeKindName(k)}</td>
+                  <td class="num">{formatNumber(job!.estimated_counts?.[k] ?? 0)}</td>
+                  <td class="num">{formatNumber(job!.deleted_counts?.[k] ?? 0)}</td>
+                </tr>
+              {/each}
+              <tr class="total">
+                <td>{t('common.total')}</td>
+                <td class="num">{formatNumber(totalCount(job!.estimated_counts))}</td>
+                <td class="num">{formatNumber(totalCount(job!.deleted_counts))}</td>
+              </tr>
+            {/snippet}
+          </DataTable>
+
+          {#if job.cold_rows_skipped > 0}
+            <div class="note">
+              <InlineNotice tone="info">
+                <strong>{t('purge.coldSurvive', { n: formatNumber(job.cold_rows_skipped) })}</strong>
+                {t('purge.coldRotated')}
+                {#if job.cold_boundary_at}
+                  ({t('purge.coldBefore')} <TimeValue value={job.cold_boundary_at} />)
+                {/if}
+                {t('purge.coldStays')}
+              </InlineNotice>
+            </div>
+          {/if}
+
+          {#if job.ingest_active}
+            <div class="note">
+              <InlineNotice tone="warning">{t('prose.purge.drift')}</InlineNotice>
+            </div>
+          {/if}
+
+          {#if job.status === 'running' || job.status === 'cancelling'}
+            <p class="hint">
+              {t('purge.rollupProgress', {
+                recomputed: formatNumber(job.rollups_recomputed),
+                removed: formatNumber(job.rollups_deleted),
+              })}
+            </p>
+          {/if}
+
+          {#if job.error}
+            <div class="note"><InlineNotice tone="error">{job.error}</InlineNotice></div>
+          {/if}
+        {/if}
+
+        {#if job.status === 'previewed'}
+          <!-- Bulk destruction keeps type-to-confirm: the slug IS the
+               confirmation, so this is not a ConfirmDialog. -->
+          <div class="confirm">
+            <p>
+              {t('purge.confirmSlug')} <code>{job.app_slug}</code>. {t('purge.confirmBody')}
+            </p>
+            <div class="confirm-row">
+              <div class="slug-field">
+                <Input label={t('purge.confirmLabel')} bind:value={confirmText} placeholder={job.app_slug} />
+              </div>
+              <Button variant="danger" onclick={doConfirm} disabled={!slugMatches || busy}>
+                {t('purge.purgeRows', { n: formatNumber(totalCount(job.estimated_counts)) })}
+              </Button>
+            </div>
+          </div>
+        {/if}
+
+        {#if isActive(job) && job.status !== 'previewing'}
+          <div class="job-actions">
+            <Button variant="secondary" onclick={doCancel} disabled={busy}>
+              {t('purge.cancelNote')}
+            </Button>
+          </div>
+        {/if}
+
+        {#if !isActive(job)}
+          <div class="job-actions">
+            <Button variant="secondary" onclick={reset}>{t('purge.startAnother')}</Button>
+          </div>
+        {/if}
+      </Card>
+    {/if}
+
+    {#if catalog?.jobs?.length}
+      <Card title={t('alerts.tab.history')}>
+        <DataTable>
+          {#snippet head()}
+            <tr>
+              <th>{t('nav.selectApp')}</th>
+              <th>{t('common.status')}</th>
+              <th class="num">{t('prose.purge.kinds')}</th>
+              <th class="num">{t('purge.deleted')}</th>
+              <th>{t('prose.purge.requestedBy')}</th>
+              <th>{t('ui.opModal.when')}</th>
+            </tr>
+          {/snippet}
+          {#snippet children()}
+            {#each catalog?.jobs ?? [] as j (j.id)}
+              <tr>
+                <td>{j.app_name}</td>
+                <td><Badge tone={statusTone(j.status)} size="sm">{statusLabel(j.status)}</Badge></td>
+                <td class="num">{formatNumber((j.kinds ?? []).length)}</td>
+                <td class="num">{formatNumber(totalCount(j.deleted_counts))}</td>
+                <td>{j.requested_by_email}</td>
+                <td><TimeValue value={j.requested_at} /></td>
               </tr>
             {/each}
-          </tbody>
-          <tfoot>
-            <tr>
-              <th>{t('common.total')}</th>
-              <th class="n">{formatNumber(totalCount(job.estimated_counts))}</th>
-              <th class="n">{formatNumber(totalCount(job.deleted_counts))}</th>
-            </tr>
-          </tfoot>
-        </table>
-
-        {#if job.cold_rows_skipped > 0}
-          <p class="cold">
-            <Icon name="layers" />
-            <strong>{formatNumber(job.cold_rows_skipped)} rows will survive.</strong>
-            They have already rotated to cold storage
-            {#if job.cold_boundary_at}
-              (anything before <TimeValue value={job.cold_boundary_at} />)
-            {/if}
-            and cannot be deleted. Counters are still recomputed against them, so the numbers
-            stay truthful — but this data stays in your charts.
-          </p>
-        {/if}
-
-        {#if job.ingest_active}
-          <p class="hint warn">
-            {t('prose.purge.drift')}
-          </p>
-        {/if}
-
-        {#if job.status === 'running' || job.status === 'cancelling'}
-          <p class="hint">
-            Recomputed {formatNumber(job.rollups_recomputed)} rollups, removed
-            {formatNumber(job.rollups_deleted)} with nothing left.
-          </p>
-        {/if}
-
-        {#if job.error}
-          <p class="err">{job.error}</p>
-        {/if}
-      {/if}
-
-      {#if job.status === 'previewed'}
-        <div class="confirm">
-          <p>
-            {t('purge.confirmSlug')} <code>{job.app_slug}</code>. This deletes the rows
-            above and cannot be undone.
-          </p>
-          <input type="text" bind:value={confirmText} placeholder={job.app_slug} />
-          <Button variant="primary" onclick={doConfirm} disabled={!slugMatches || busy}>
-            Purge {formatNumber(totalCount(job.estimated_counts))} rows
-          </Button>
-        </div>
-      {/if}
-
-      {#if isActive(job) && job.status !== 'previewing'}
-        <Button variant="ghost" onclick={doCancel} disabled={busy}>
-          {t('purge.cancelNote')}
-        </Button>
-      {/if}
-
-      {#if !isActive(job)}
-        <Button variant="ghost" onclick={reset}>{t('purge.startAnother')}</Button>
-      {/if}
-    </Card>
-  {/if}
-
-  {#if catalog?.jobs?.length}
-    <Card>
-      <h2>{t('alerts.tab.history')}</h2>
-      <DataTable>
-        {#snippet head()}
-          <tr>
-            <th>{t('nav.selectApp')}</th>
-            <th>{t('common.status')}</th>
-            <th class="n">{t('prose.purge.kinds')}</th>
-            <th class="n">{t('purge.deleted')}</th>
-            <th>{t('prose.purge.requestedBy')}</th>
-            <th>{t('ui.opModal.when')}</th>
-          </tr>
-        {/snippet}
-        {#snippet children()}
-          {#each catalog?.jobs ?? [] as j (j.id)}
-            <tr>
-              <td>{j.app_name}</td>
-              <td><Badge tone={statusTone(j.status)}>{j.status}</Badge></td>
-              <td class="n">{(j.kinds ?? []).length}</td>
-              <td class="n">{formatNumber(totalCount(j.deleted_counts))}</td>
-              <td>{j.requested_by_email}</td>
-              <td><TimeValue value={j.requested_at} /></td>
-            </tr>
-          {/each}
-        {/snippet}
-      </DataTable>
-    </Card>
-  {/if}
+          {/snippet}
+        </DataTable>
+      </Card>
+    {/if}
   </div>
 </AdminShell>
 
@@ -495,122 +538,88 @@
   .content {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: var(--page-gap);
   }
-  .head {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-    margin-bottom: 1rem;
-  }
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
-  }
-  h1 {
-    margin: 0;
-    font-size: 1.4rem;
-  }
-  h2 {
-    margin: 0 0 0.5rem;
-    font-size: 1rem;
-  }
-  .sub,
   .hint {
     color: var(--text-muted);
-    font-size: 0.875rem;
-    margin: 0.25rem 0;
+    font-size: var(--text-sm);
+    margin: 4px 0;
   }
-  .hint.warn {
-    color: var(--warning, #b45309);
-  }
-  .err {
-    color: var(--danger, #b91c1c);
+  .note {
+    margin-top: 10px;
   }
   .kinds {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 0.5rem;
+    gap: 8px;
+    margin-top: 8px;
   }
   .kind,
   .row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.35rem 0;
+    gap: 8px;
+    padding: 5px 0;
+  }
+  .kind {
+    flex-wrap: wrap;
   }
   .kind.blocked {
     opacity: 0.55;
   }
   .kind .why {
-    font-size: 0.75rem;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     flex-basis: 100%;
   }
-  .name {
-    text-transform: capitalize;
-  }
   .range {
     display: flex;
-    gap: 1rem;
+    gap: 16px;
     flex-wrap: wrap;
-  }
-  .range label {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    font-size: 0.875rem;
+    margin-top: 8px;
   }
   .actions {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    margin: 1rem 0;
+    gap: 16px;
     flex-wrap: wrap;
   }
-  .jobhead {
+  .counting {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
+    gap: 8px;
+    font-size: var(--text-sm);
   }
-  .counts {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.875rem;
-  }
-  .counts th,
-  .counts td {
-    text-align: start;
-    padding: 0.35rem 0.5rem;
-    border-bottom: 1px solid var(--border);
-  }
-  .counts .n {
-    text-align: end;
-    font-variant-numeric: tabular-nums;
-  }
-  .cold {
-    margin-top: 0.75rem;
-    padding: 0.6rem 0.75rem;
-    border-radius: 6px;
-    background: var(--surface-2, rgba(127, 127, 127, 0.08));
-    font-size: 0.875rem;
+  .total td {
+    font-weight: var(--weight-medium);
   }
   .confirm {
-    margin-top: 1rem;
-    padding-top: 1rem;
+    margin-top: 16px;
+    padding-top: 16px;
     border-top: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    align-items: flex-start;
+    gap: 10px;
+    font-size: var(--text-sm);
   }
   .confirm code {
-    padding: 0.1rem 0.35rem;
-    border-radius: 4px;
-    background: var(--surface-2, rgba(127, 127, 127, 0.12));
+    padding: 1px 6px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-3);
+  }
+  /* Bottom-aligned: the field now carries a label above its box, and the
+     button belongs level with the box, not with the label. */
+  .confirm-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .slug-field {
+    width: 260px;
+    max-width: 100%;
+  }
+  .job-actions {
+    margin-top: 12px;
   }
 </style>

@@ -39,17 +39,16 @@
     height: var(--control-h);
     display: grid;
     place-items: center;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     color: var(--text-muted);
-    transition: color 0.13s ease, background 0.13s ease, border-color 0.13s ease;
+    transition: color 0.12s ease, background 0.12s ease;
     flex-shrink: 0;
   }
   .refresh-btn:hover:not(:disabled) {
     color: var(--text);
-    background: var(--surface-3);
-    border-color: var(--border-strong);
+    background: var(--surface-2);
   }
   .refresh-btn:disabled {
     cursor: default;

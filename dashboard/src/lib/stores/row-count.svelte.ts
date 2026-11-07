@@ -38,6 +38,7 @@ export class RowCount {
    * predicate cannot overwrite a slow one for the live predicate.
    */
   #key: string | null = null;
+  #fetcher: (() => Promise<CountEnvelope>) | null = null;
 
   /**
    * Fetch the count for `key`, unless it is already the one on hand.
@@ -48,6 +49,7 @@ export class RowCount {
   async load(key: string, fetcher: () => Promise<CountEnvelope>, force = false): Promise<void> {
     if (key === this.#key && !force) return;
     this.#key = key;
+    this.#fetcher = fetcher;
     // `total` is deliberately NOT cleared first. The strip derives its width
     // from the page count, and blanking it mid-flight would collapse the strip
     // and spring it back — the width jitter the constant slot count exists to
@@ -64,5 +66,15 @@ export class RowCount {
       this.total = null;
       this.isCapped = false;
     }
+  }
+
+  /**
+   * Repeat the most recent `load`, forced — the count beside a list whose
+   * Retry reloads it (`CachedView.reload` is the list's half). A no-op before
+   * any load: there is nothing to repeat.
+   */
+  async reload(): Promise<void> {
+    if (this.#key === null || this.#fetcher === null) return;
+    await this.load(this.#key, this.#fetcher, true);
   }
 }

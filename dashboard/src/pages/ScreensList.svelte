@@ -1,10 +1,11 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { rowHref, rowNav } from '../lib/utils/row-link';
-  import Card from '../lib/components/ui/Card.svelte';
+  import { formatNumber } from '../lib/i18n';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import SearchInput from '../lib/components/SearchInput.svelte';
@@ -33,7 +34,7 @@
     type OffsetListState,
   } from '../lib/models/list-state';
   import { sortParam, type SortDir } from '../lib/models/sort';
-  import { compactNumber, formatDuration } from '../lib/utils/format';
+  import { formatDuration } from '../lib/utils/format';
   import type { ScreenRow } from '../lib/models';
 
   const LIMIT = 50;
@@ -161,26 +162,11 @@
     const off = list.offset;
     if (aid) void load(aid, win, s, sort, off);
   });
+
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('screens.title')}</h1>
-      <p class="muted sub">{t('screens.subtitle')}</p>
-    </div>
-  </div>
-
-  <!-- The list toolbar: every control that narrows or reloads the table, in
-       the one arrangement all list pages share (`ListToolbar`). It used to sit
-       in the page header beside the title, which no other list page does. -->
-  <ListToolbar>
-    {#snippet searchBox()}
-      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} />
-    {/snippet}
-    {#snippet timeWindow()}
-      <DateRange value={range} onchange={onRange} />
-    {/snippet}
-    {#snippet actions()}
+  <PageHeader title={t('screens.title')} subtitle={t('screens.subtitle')}>
+    {#snippet freshness()}
       <RollupChip />
       <!-- One stamp per page: while rollups serve it, `RollupChip`'s fold
            watermark IS the data's age and this fetch-time chip would be a
@@ -188,38 +174,35 @@
       {#if !rollupState.ready}
         <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
       {/if}
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+  </PageHeader>
+
+  <!-- The list toolbar: every control that narrows the table, in the one
+       arrangement all list pages share (`ListToolbar`). -->
+  <ListToolbar>
+    {#snippet searchBox()}
+      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('screens.search')} />
+    {/snippet}
+    {#snippet timeWindow()}
+      <DateRange value={range} onchange={onRange} />
     {/snippet}
   </ListToolbar>
 
   {#if error && rows.length === 0}
-    <Card>
-      <EmptyState title={t('screens.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) load(aid, range, search, sortParam(list.sort), list.offset);
-            }}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('screens.error.load')} error={view} onretry={() => { void rowCount.reload(); void view.reload(); }} />
   {:else if loading && rows.length === 0}
     <Skeleton rows={6} />
   {:else if rows.length === 0}
-    <Card>
-      <EmptyState
-        title={t('screens.empty.title')}
-        description={search
-          ? `No screens match “${search}”.`
-          : 'Call setScreen() in your SDK to attribute events to screens.'}
-        icon="layout-panel-top"
-      />
-    </Card>
+    <EmptyState
+      title={search
+        ? t('common.empty.match', { things: t('screens.things') })
+        : t('common.empty.range', { things: t('screens.things') })}
+      description={search ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
+      icon="layout-panel-top"
+    />
   {:else}
     <DataTable>
       {#snippet head()}
@@ -247,10 +230,10 @@
             <td>
               <a class="row-link cell-mono truncate" href={rowHref(path)}>{r.screen}</a>
             </td>
-            <td class="num">{compactNumber(r.views)}</td>
-            <td class="num">{compactNumber(r.events)}</td>
-            <td class="num"><span class:err={r.exceptions > 0}>{compactNumber(r.exceptions)}</span></td>
-            <td class="num">{approx(compactNumber(r.users), rollupState.ready)}</td>
+            <td class="num">{formatNumber(r.views)}</td>
+            <td class="num">{formatNumber(r.events)}</td>
+            <td class="num"><span class:err={r.exceptions > 0}>{formatNumber(r.exceptions)}</span></td>
+            <td class="num">{approx(formatNumber(r.users), rollupState.ready)}</td>
             <td class="num">{formatDuration(r.avg_dwell_ms)}</td>
           </tr>
         {/each}
@@ -272,21 +255,6 @@
   {/if}
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .num {
-    text-align: end;
-  }
   .truncate {
     display: inline-block;
     max-width: 320px;
@@ -297,6 +265,6 @@
   }
   .err {
     color: var(--error);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 </style>

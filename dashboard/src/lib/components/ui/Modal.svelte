@@ -102,6 +102,9 @@
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-lg);
     background: var(--surface);
+    /* Tables inside sit on the dialog's fill, not the page's. */
+    --dt-bg: var(--surface);
+    --dt-hover: var(--surface-2);
     color: var(--text);
     box-shadow: var(--shadow-lg);
     width: min(480px, calc(100vw - 32px));
@@ -118,7 +121,7 @@
     width: min(1140px, calc(100vw - 32px));
   }
   .modal::backdrop {
-    background: rgba(8, 10, 14, 0.55);
+    background: var(--overlay);
     backdrop-filter: blur(2px);
   }
   .modal[open] {
@@ -160,8 +163,8 @@
     border-bottom: 1px solid var(--border);
   }
   .m-title {
-    font-size: 15px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .m-close {

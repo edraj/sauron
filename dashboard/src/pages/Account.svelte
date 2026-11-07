@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
@@ -6,9 +7,11 @@
   import TimeValue from '../lib/components/TimeValue.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -21,7 +24,7 @@
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewCache, viewKey } from '../lib/stores/view-cache';
   import { errorMessage } from '../lib/api/client';
-  import { t } from '../lib/i18n';
+  import { formatNumber, t } from '../lib/i18n';
   import { listMySessions, revokeMyOtherSessions, revokeMySession } from '../lib/api/account';
   import {
     allSameIp,
@@ -171,11 +174,13 @@
     try {
       if (target.kind === 'one') {
         await revokeMySession(target.id);
-        toastStore.success('That device will be signed out within a few seconds.');
+        toastStore.success(t('account.sessions.revokedOne'));
       } else {
         const n = await revokeMyOtherSessions();
         toastStore.success(
-          n === 1 ? 'One other device signed out.' : `${n} other devices signed out.`,
+          n === 1
+            ? t('account.sessions.revokedOthersOne')
+            : t('account.sessions.revokedOthersMany', { n: formatNumber(n) }),
         );
       }
       pending = null;
@@ -225,27 +230,20 @@
   });
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('account.title')}</h1>
-      <p class="sub muted">{t('account.subtitle')}</p>
-    </div>
-    <!--
-      Spins for a background revalidate too, not just an explicit click: that
-      spinner IS the "showing cached data, fetching fresh" hint, and without it
-      the instant paint is indistinguishable from live data. The click forces,
-      because this button is also the only retry affordance on this page.
-    -->
-    <Freshness fetchedAt={sessionsView.fetchedAt} revalidating={sessionsView.revalidating} />
-    <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
-  </div>
-
-  {#if error}
-    <div class="err-banner" role="alert">
-      <Icon name="triangle-alert" size={15} />
-      <span>{error}</span>
-    </div>
-  {/if}
+  <PageHeader title={t('account.title')} subtitle={t('account.subtitle')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={sessionsView.fetchedAt} revalidating={sessionsView.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached data, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data. The click forces,
+        because this button is also a retry affordance on this page.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
+    {/snippet}
+  </PageHeader>
 
   <div class="cards">
     <Card title={t('account.profile.title')}>
@@ -266,7 +264,7 @@
       </div>
     </Card>
 
-    <Card title={t('account.sessions.title')} padding="none">
+    <Card title={t('account.sessions.title')}>
       {#snippet actions()}
         <Button variant="ghost" size="sm" onclick={() => void toggleHistory()}>
           {showRevoked ? t('account.sessions.hideRevoked') : t('account.sessions.showRevoked')}
@@ -281,22 +279,40 @@
         </Button>
       {/snippet}
 
+      {#if error && sessionsView.data !== undefined}
+        <!-- A forced Refresh failed over rows we already had: they stay, and
+             so does the reason they are older than asked for. -->
+        <div class="notice">
+          <InlineNotice tone="warning">
+            {t('ui.staleResults', { error: loadErrorText(sessionsView) })}
+            {#snippet action()}
+              <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+            {/snippet}
+          </InlineNotice>
+        </div>
+      {/if}
+
       {#if !hasCurrent && !loading && live.length > 0}
-        <div class="err-banner inset" role="status">
-          <Icon name="info" size={15} />
-          <span>{t('account.sessions.reloadHint')}</span>
+        <div class="notice">
+          <InlineNotice tone="info">{t('account.sessions.reloadHint')}</InlineNotice>
         </div>
       {/if}
 
       {#if loading}
         <Skeleton rows={6} />
+      {:else if error && sessionsView.data === undefined}
+        <ErrorState
+          size="section"
+          title={t('common.couldntLoad', { thing: t('account.sessions.thing') })}
+          error={sessionsView}
+          onretry={refresher.run}
+        />
       {:else if live.length === 0}
-        <div class="pad">
-          <EmptyState
-            title={t('account.sessions.empty.title')}
-            description={t('account.sessions.empty.description')}
-          />
-        </div>
+        <EmptyState
+          size="section"
+          title={t('account.sessions.empty.title')}
+          description={t('account.sessions.empty.description')}
+        />
       {:else}
         <DataTable>
           {#snippet head()}
@@ -413,17 +429,10 @@
 />
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 18px;
-  }
   .cards {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
   }
   .profile {
     display: grid;
@@ -431,7 +440,7 @@
     row-gap: 8px;
     column-gap: 12px;
     margin: 0;
-    font-size: 13.5px;
+    font-size: var(--text-sm);
   }
   .profile dt {
     color: var(--text-faint);
@@ -455,25 +464,11 @@
   tr.dim td {
     opacity: 0.55;
   }
-  .pad {
-    padding: 18px;
+  .notice {
+    margin-bottom: 12px;
   }
   .hint {
-    margin: 10px 16px 14px;
-    font-size: 12px;
-  }
-  .err-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-    margin-bottom: 14px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--surface-2);
-    font-size: 13px;
-  }
-  .err-banner.inset {
-    margin: 14px 16px 0;
+    margin-top: 10px;
+    font-size: var(--text-xs);
   }
 </style>

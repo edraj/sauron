@@ -35,18 +35,27 @@
      * unreachable for anyone not using a mouse.
      */
     onselect?: (point: SeriesPoint) => void;
+    /**
+     * Draw every bucket but the latest in neutral grey, and the latest in
+     * `color`. The history is context; the current bucket is the figure a
+     * reader looks for. Ignored for segmented bars, whose colours ARE the data.
+     */
+    highlightLatest?: boolean;
   }
 
   let {
     data,
     height = 160,
-    color = 'var(--primary)',
-    emptyLabel = 'No data in this range',
+    color = 'var(--chart-1)',
+    emptyLabel,
     format = (n: number) => formatNumber(n),
     showTotal = true,
     label: labelProp,
     onselect,
+    highlightLatest = true,
   }: Props = $props();
+
+  const lastBucket = $derived(data.length ? data[data.length - 1].bucket : null);
 
   const max = $derived(data.length ? Math.max(...data.map((d) => d.count), 1) : 1);
   const total = $derived(data.reduce((sum, d) => sum + d.count, 0));
@@ -83,7 +92,7 @@
 </script>
 
 {#if data.length === 0}
-  <div class="chart-empty" style="height:{height}px">{emptyLabel}</div>
+  <div class="chart-empty" style="height:{height}px">{emptyLabel ?? t('chart.empty.range')}</div>
 {:else}
   <div class="chart">
     <div class="plot" style="height:{height}px" style:--bar-color={color}>
@@ -93,7 +102,12 @@
            the same time). `aria-label` keeps the same text as the accessible
            name without drawing a second box. -->
       {#snippet column(point: SeriesPoint)}
-          <div class="bar" class:has-segments={point.segments && point.segments.length > 0} style="height:{barHeight(point.count)}%">
+          <div
+            class="bar"
+            class:has-segments={point.segments && point.segments.length > 0}
+            class:context={highlightLatest && point.bucket !== lastBucket}
+            style="height:{barHeight(point.count)}%"
+          >
             <div class="bar-fill">
               {#if point.segments && point.segments.length > 0}
                 {#each point.segments as seg}
@@ -165,6 +179,8 @@
     align-items: flex-end;
     gap: 3px;
     padding: 4px 2px 0;
+    /* The baseline is an axis, so `--border`; `--chart-grid` is for the faint
+       interior gridlines and nearly vanishes on the light page (1.09:1). */
     border-bottom: 1px solid var(--border);
   }
   .col {
@@ -196,22 +212,21 @@
     position: relative;
     width: 100%;
     max-width: 42px;
-    border-radius: 3px 3px 0 0;
-    transition: filter 0.12s ease, transform 0.12s ease;
+    border-radius: 2px 2px 0 0;
+    transition: filter 0.12s ease;
   }
   .bar-fill {
     position: absolute;
     inset: 0;
-    border-radius: 3px 3px 0 0;
-    background: linear-gradient(
-      to top,
-      color-mix(in srgb, var(--bar-color) 55%, transparent),
-      var(--bar-color)
-    );
+    border-radius: 2px 2px 0 0;
+    background: var(--bar-color);
     display: flex;
     flex-direction: column;
     justify-content: flex-end;
     overflow: hidden;
+  }
+  .bar.context .bar-fill {
+    background: var(--chart-neutral);
   }
   .bar.has-segments .bar-fill {
     background: transparent;
@@ -233,7 +248,7 @@
     background: var(--surface-3);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
-    font-size: 11px;
+    font-size: var(--text-xs);
     white-space: nowrap;
     color: var(--text);
     opacity: 0;
@@ -246,7 +261,7 @@
      fixed height — the number sits just above however tall the bar is. */
   .tip-value {
     bottom: calc(100% + 6px);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
     font-variant-numeric: tabular-nums;
     display: flex;
     flex-direction: column;
@@ -270,7 +285,7 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
-    font-weight: normal;
+    font-weight: var(--weight-regular);
   }
   .seg-line {
     display: flex;
@@ -288,7 +303,7 @@
     color: var(--text-muted);
   }
   .seg-value {
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
   
   .legend {
@@ -296,7 +311,7 @@
     justify-content: center;
     gap: 16px;
     margin-top: 4px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .legend-item {
@@ -319,18 +334,18 @@
   .axis {
     display: flex;
     justify-content: space-between;
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .axis .total {
     color: var(--text-muted);
-    font-weight: 560;
+    font-weight: var(--weight-medium);
   }
   .chart-empty {
     display: grid;
     place-items: center;
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
   }

@@ -1,13 +1,20 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { errorMessage } from '../lib/api/client';
+  import { labelFor, t, type MessageKey } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
-  import Card from '../lib/components/ui/Card.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import FactList from '../lib/components/FactList.svelte';
+  import Fact from '../lib/components/Fact.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import TimeValue from '../lib/components/TimeValue.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
@@ -59,11 +66,23 @@
   const loading = $derived(view.loading);
   const revalidating = $derived(view.revalidating);
 
-  // Actions report failures through the same banner as the list's own load
-  // error, and a `$derived` cannot be assigned to — so actions keep their own
-  // state and the template's `error` is the two folded together.
+  // An action's failure is reported in its own notice; a failed LOAD replaces
+  // the list with ErrorState (or, over rows already on screen, says they are
+  // stale). Kept apart so a failed Retry never blanks the list.
   let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
+
+  const statusOptions = $derived([
+    { value: 'failed', label: t('failures.state.needsAttention') },
+    { value: 'requeued', label: t('failures.state.retrying') },
+    { value: 'resolved', label: t('failures.state.resolved') },
+    { value: '', label: t('common.all') },
+  ]);
+  const STATUS_LABELS: Record<IngestFailure['status'], MessageKey> = {
+    failed: 'failures.state.needsAttention',
+    requeued: 'failures.state.retrying',
+    resolved: 'failures.state.resolved',
+  };
+  const statusLabel = (s: IngestFailure['status']): string => labelFor(STATUS_LABELS, s);
 
   // Drill-down state.
   let selected = $state<IngestFailure | null>(null);
@@ -121,7 +140,7 @@
       appended = [...appended, ...page.failures];
       appendedCursor = page.next_cursor;
     } catch (e) {
-      actionError = e instanceof Error ? e.message : String(e);
+      actionError = errorMessage(e);
     } finally {
       loadingMore = false;
     }
@@ -134,7 +153,7 @@
     try {
       payloads = await getIngestFailurePayloads(f.id);
     } catch (e) {
-      actionError = e instanceof Error ? e.message : String(e);
+      actionError = errorMessage(e);
     } finally {
       payloadsLoading = false;
     }
@@ -148,14 +167,14 @@
       // Reports what actually happened, including the part that did not. A
       // retry that silently omits its failures reads as a success and sends the
       // operator away believing the problem is resolved.
-      const parts = [`Re-queued ${fmt(r.requeued)} event(s).`];
-      if (r.failed > 0) parts.push(`${fmt(r.failed)} could not be re-queued.`);
+      const parts = [t('failures.notice.requeued', { n: fmt(r.requeued) })];
+      if (r.failed > 0) parts.push(t('failures.notice.requeueFailed', { n: fmt(r.failed) }));
       if (r.unrecoverable > 0)
-        parts.push(`${fmt(r.unrecoverable)} were never retained and cannot be recovered.`);
+        parts.push(t('failures.notice.unrecoverable', { n: fmt(r.unrecoverable) }));
       notice = parts.join(' ');
       await refresh();
     } catch (e) {
-      actionError = e instanceof Error ? e.message : String(e);
+      actionError = errorMessage(e);
     } finally {
       acting = false;
     }
@@ -166,12 +185,12 @@
     acting = true;
     try {
       await dropIngestFailure(confirmDrop.id);
-      notice = `Dropped ${describeKind(confirmDrop.error_kind)} permanently.`;
+      notice = t('failures.notice.dropped', { kind: describeKind(confirmDrop.error_kind) });
       confirmDrop = null;
       selected = null;
       await refresh();
     } catch (e) {
-      actionError = e instanceof Error ? e.message : String(e);
+      actionError = errorMessage(e);
     } finally {
       acting = false;
     }
@@ -186,124 +205,136 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1>{t('failures.title')}</h1>
-      <p class="sub">
-        {t('prose.failures.lede')}
-      </p>
-    </div>
-    <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-    <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
-  </div>
+  <PageHeader title={t('failures.title')} subtitle={t('prose.failures.lede')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || loading || revalidating} />
+    {/snippet}
+  </PageHeader>
 
-  <Card>
+  <div class="page">
     <div class="filters">
-      <label>
-        <span>{t('common.status')}</span>
-        <select bind:value={statusFilter}>
-          <option value="failed">{t('failures.state.needsAttention')}</option>
-          <option value="requeued">{t('failures.state.retrying')}</option>
-          <option value="resolved">{t('failures.state.resolved')}</option>
-          <option value="">{t('common.all')}</option>
-        </select>
-      </label>
+      <Select label={t('common.status')} bind:value={statusFilter} options={statusOptions} />
     </div>
-  </Card>
 
-  {#if notice}
-    <Card>
-      <div class="notice"><Icon name="info" size={15} /> <span>{notice}</span></div>
-    </Card>
-  {/if}
+    {#if notice}
+      <InlineNotice tone="info">{notice}</InlineNotice>
+    {/if}
+    {#if actionError}
+      <InlineNotice tone="error">{actionError}</InlineNotice>
+    {/if}
+    {#if view.error && view.data !== undefined}
+      <!-- A forced Refresh failed over rows we already had: they stay. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
+    {/if}
 
-  {#if loading}
-    <Skeleton rows={6} />
-  {:else if error}
-    <EmptyState title={t('failures.error.load')} description={error} icon="triangle-alert" />
-  {:else if failures.length === 0}
-    <EmptyState
-      title={statusFilter === 'failed' ? 'No failing ingest' : 'Nothing here'}
-      description={statusFilter === 'failed'
-        ? 'Every event the edge accepted has been persisted.'
-        : 'No groups match this filter.'}
-      icon="check"
-    />
-  {:else}
-    <DataTable>
-      {#snippet head()}
-        <tr>
-          <th>{t('failures.column.cause')}</th>
-          <th>{t('nav.selectApp')}</th>
-          <th class="num">{t('failures.column.occurrences')}</th>
-          <th class="num">{t('failures.state.recoverable')}</th>
-          <th>{t('common.status')}</th>
-          <th>{t('explore.column.lastSeen')}</th>
-          <th></th>
-        </tr>
-      {/snippet}
-      {#snippet children()}
-        {#each failures as f (f.id)}
-          <tr class="clickable" onclick={() => openDetail(f)}>
-            <td>
-              <div class="cause">
-                <strong>{describeKind(f.error_kind)}</strong>
-                <code class="fp">{shortFingerprint(f.fingerprint)}</code>
-              </div>
-              <div class="msg">{shortMessage(f.error_message)}</div>
-            </td>
-            <td>{f.app_name || '—'}</td>
-            <td class="num">{fmt(f.occurrences)}</td>
-            <td class="num">
-              {fmt(f.retained)}
-              {#if f.dropped > 0}
-                <!--
-                  Shown in the row, not only in the drill-down. A count of
-                  retained payloads sitting alone next to a Retry button reads
-                  as full coverage; the loss has to be visible at the same
-                  glance as the action.
-                -->
-                <div class="loss">−{fmt(f.dropped)} lost</div>
-              {/if}
-            </td>
-            <td><Badge tone={statusTone(f.status)} size="sm">{f.status}</Badge></td>
-            <td><TimeValue value={f.last_seen_at} /></td>
-            <td class="actions">
-              <Button
-                size="sm"
-                variant="secondary"
-                loading={acting}
-                lockedReason={dropLock}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  doRetry(f);
-                }}
-              >
-                {t('common.retry')}
-              </Button>
-              <Button
-                size="sm"
-                variant="danger"
-                lockedReason={dropLock}
-                onclick={(e) => {
-                  e.stopPropagation();
-                  confirmDrop = f;
-                }}
-              >
-                {t('failures.drop')}
-              </Button>
-            </td>
-          </tr>
-        {/each}
-      {/snippet}
-    </DataTable>
+    {#if loading}
+      <Skeleton rows={6} />
+    {:else if view.error && view.data === undefined}
+      <ErrorState
+        title={t('common.couldntLoad', { thing: t('failures.thing') })}
+        error={view}
+        onretry={refresher.run}
+      />
+    {:else if failures.length === 0}
+      {#if statusFilter === 'failed'}
+        <EmptyState
+          title={t('failures.empty.title')}
+          description={t('failures.empty.body')}
+          icon="check"
+        />
+      {:else}
+        <EmptyState
+          title={t('common.empty.match', { things: t('failures.things') })}
+          description={t('common.empty.matchHint')}
+          icon="search"
+        />
+      {/if}
+    {:else}
+      <div>
+        <DataTable>
+          {#snippet head()}
+            <tr>
+              <th>{t('failures.column.cause')}</th>
+              <th>{t('nav.selectApp')}</th>
+              <th class="num">{t('failures.column.occurrences')}</th>
+              <th class="num">{t('failures.state.recoverable')}</th>
+              <th>{t('common.status')}</th>
+              <th>{t('explore.column.lastSeen')}</th>
+              <th></th>
+            </tr>
+          {/snippet}
+          {#snippet children()}
+            {#each failures as f (f.id)}
+              <tr class="clickable" onclick={() => openDetail(f)}>
+                <td>
+                  <div class="cause">
+                    <strong>{describeKind(f.error_kind)}</strong>
+                    <code class="fp">{shortFingerprint(f.fingerprint)}</code>
+                  </div>
+                  <div class="msg">{shortMessage(f.error_message)}</div>
+                </td>
+                <td>{f.app_name || '—'}</td>
+                <td class="num">{fmt(f.occurrences)}</td>
+                <td class="num">
+                  {fmt(f.retained)}
+                  {#if f.dropped > 0}
+                    <!--
+                      Shown in the row, not only in the drill-down. A count of
+                      retained payloads sitting alone next to a Retry button reads
+                      as full coverage; the loss has to be visible at the same
+                      glance as the action.
+                    -->
+                    <div class="loss">{t('failures.lost', { n: fmt(f.dropped) })}</div>
+                  {/if}
+                </td>
+                <td><Badge tone={statusTone(f.status)} size="sm">{statusLabel(f.status)}</Badge></td>
+                <td><TimeValue value={f.last_seen_at} /></td>
+                <td class="actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={acting}
+                    lockedReason={dropLock}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      doRetry(f);
+                    }}
+                  >
+                    {t('common.retry')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    lockedReason={dropLock}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      confirmDrop = f;
+                    }}
+                  >
+                    {t('failures.drop')}
+                  </Button>
+                </td>
+              </tr>
+            {/each}
+          {/snippet}
+        </DataTable>
 
-    {#if nextCursor}
-      <div class="more">
-        <Button variant="secondary" loading={loadingMore} onclick={loadMore}>{t('failures.loadMore')}</Button>
+        {#if nextCursor}
+          <div class="more">
+            <Button variant="secondary" loading={loadingMore} onclick={loadMore}>{t('failures.loadMore')}</Button>
+          </div>
+        {/if}
       </div>
     {/if}
-  {/if}
+  </div>
 </AdminShell>
 
 {#if selected}
@@ -313,22 +344,22 @@
       <p class="detail-msg">{selected.error_message}</p>
 
       <div class="facts">
-        <div><span>{t('failures.column.fingerprint')}</span><code>{selected.fingerprint}</code></div>
-        <div><span>{t('nav.selectApp')}</span><strong>{selected.app_name || 'unknown'}</strong></div>
-        <div><span>{t('explore.column.firstSeen')}</span><TimeValue value={selected.first_seen_at} /></div>
-        <div><span>{t('explore.column.lastSeen')}</span><TimeValue value={selected.last_seen_at} /></div>
-        <div>
-          <span>{t('failures.state.autoRetried')}</span>
-          <strong>{wasAutoRetried(selected.error_kind) ? 'Yes, 3 attempts' : 'No'}</strong>
-        </div>
+        <FactList>
+          <Fact label={t('failures.column.fingerprint')} mono>{selected.fingerprint}</Fact>
+          <Fact label={t('nav.selectApp')}>{selected.app_name || t('failures.unknownApp')}</Fact>
+          <Fact label={t('explore.column.firstSeen')}><TimeValue value={selected.first_seen_at} /></Fact>
+          <Fact label={t('explore.column.lastSeen')}><TimeValue value={selected.last_seen_at} /></Fact>
+          <Fact label={t('failures.state.autoRetried')}>
+            {wasAutoRetried(selected.error_kind) ? t('failures.autoRetriedYes') : t('failures.autoRetriedNo')}
+          </Fact>
+        </FactList>
       </div>
 
-      <div class="recovery {rec.level}">
-        <Icon name={rec.level === 'full' ? 'check' : 'triangle-alert'} size={15} />
-        <span>{rec.summary}</span>
+      <div class="recovery">
+        <InlineNotice tone={rec.level === 'full' ? 'success' : 'error'}>{rec.summary}</InlineNotice>
       </div>
 
-      <h3>{t('failures.retainedPayloads')}</h3>
+      <h3 class="section-label payloads-label">{t('failures.retainedPayloads')}</h3>
       {#if payloadsLoading}
         <Skeleton rows={3} />
       {:else if payloads.length === 0}
@@ -338,7 +369,9 @@
           <details>
             <summary>
               <TimeValue value={p.created_at} />
-              {#if p.attempts > 0}<Badge tone="neutral" size="sm">{p.attempts} attempts</Badge>{/if}
+              {#if p.attempts > 0}
+                <Badge tone="neutral" size="sm">{t('failures.attempts', { n: fmt(p.attempts) })}</Badge>
+              {/if}
             </summary>
             <pre>{JSON.stringify(p.payload, null, 2)}</pre>
           </details>
@@ -348,44 +381,31 @@
   </Modal>
 {/if}
 
-{#if confirmDrop}
-  <Modal open title={t('failures.confirmDrop')} onclose={() => (confirmDrop = null)}>
-    <div class="confirm">
-      <p>
-        {t('prose.failures.deletes.a')} <strong>{fmt(confirmDrop.retained)}</strong> retained
-        {confirmDrop.retained === 1 ? 'payload' : 'payloads'} for
-        <strong>{describeKind(confirmDrop.error_kind)}</strong>. They cannot be recovered
-        afterwards.
-      </p>
-      <p class="muted">
-        {t('prose.failures.auditFirst')}
-      </p>
-      <div class="confirm-actions">
-        <Button variant="ghost" onclick={() => (confirmDrop = null)}>{t('common.cancel')}</Button>
-        <Button variant="danger" loading={acting} onclick={doDrop}>{t('failures.dropPermanently')}</Button>
-      </div>
-    </div>
-  </Modal>
-{/if}
+<ConfirmDialog
+  open={confirmDrop !== null}
+  title={t('failures.confirmDrop')}
+  message={confirmDrop
+    ? `${
+        confirmDrop.retained === 1
+          ? t('failures.confirmDropBodyOne', { kind: describeKind(confirmDrop.error_kind) })
+          : t('failures.confirmDropBodyMany', {
+              n: fmt(confirmDrop.retained),
+              kind: describeKind(confirmDrop.error_kind),
+            })
+      } ${t('prose.failures.auditFirst')}`
+    : ''}
+  confirmLabel={t('failures.dropPermanently')}
+  danger
+  loading={acting}
+  onconfirm={doDrop}
+  oncancel={() => (confirmDrop = null)}
+/>
 
 <style>
-  .head {
+  .page {
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
+    flex-direction: column;
     gap: 16px;
-    margin-bottom: 18px;
-  }
-  h1 {
-    font-size: 20px;
-    font-weight: 640;
-    margin: 0 0 4px;
-  }
-  .sub {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: 13px;
-    max-width: 68ch;
   }
   .filters {
     display: flex;
@@ -393,43 +413,25 @@
     gap: 14px;
     align-items: flex-end;
   }
-  .filters label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--text-muted);
-  }
-  .notice {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-  }
-  .centered {
-    display: flex;
-    justify-content: center;
-    padding: 48px 0;
-  }
   .cause {
     display: flex;
     align-items: center;
     gap: 8px;
   }
   .fp {
-    font-size: 11px;
+    font-size: var(--text-2xs);
     color: var(--text-faint);
   }
   .msg {
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: var(--text-xs);
     margin-top: 2px;
     max-width: 60ch;
   }
   .loss {
-    font-size: 11px;
-    color: var(--danger, #e5484d);
-    font-weight: 600;
+    font-size: var(--text-xs);
+    color: var(--error);
+    font-weight: var(--weight-medium);
   }
   .actions {
     display: flex;
@@ -442,56 +444,26 @@
     margin-top: 16px;
   }
   .detail-msg {
-    font-family: var(--font-mono, monospace);
-    font-size: 12px;
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     background: var(--surface-2);
     padding: 10px;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius);
     white-space: pre-wrap;
     word-break: break-word;
   }
   .facts {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 10px;
     margin: 14px 0;
   }
-  .facts div {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: 13px;
-  }
-  .facts span {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-faint);
-  }
   .recovery {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-    border-radius: var(--radius-md);
-    font-size: 13px;
     margin-bottom: 16px;
   }
-  .recovery.full {
-    background: color-mix(in srgb, var(--success, #30a46c) 12%, transparent);
-  }
-  .recovery.partial,
-  .recovery.none {
-    background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
-  }
-  h3 {
-    font-size: 13px;
-    font-weight: 620;
-    margin: 0 0 8px;
+  .payloads-label {
+    margin-bottom: 8px;
   }
   details {
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius);
     padding: 8px 10px;
     margin-bottom: 6px;
   }
@@ -500,21 +472,15 @@
     align-items: center;
     gap: 8px;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   pre {
-    font-size: 11px;
+    font-size: var(--text-2xs);
     overflow-x: auto;
     margin: 8px 0 0;
   }
   .muted {
     color: var(--text-muted);
-    font-size: 13px;
-  }
-  .confirm-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 16px;
+    font-size: var(--text-sm);
   }
 </style>

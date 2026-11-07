@@ -12,6 +12,8 @@
     error?: string;
     hint?: string;
     prefix?: string;
+    /** Which on-screen keyboard a phone shows (e.g. `numeric` for day counts). */
+    inputmode?: 'text' | 'numeric' | 'decimal' | 'email' | 'tel' | 'url' | 'search';
     oninput?: (event: Event) => void;
   }
 
@@ -28,6 +30,7 @@
     error,
     hint,
     prefix,
+    inputmode,
     oninput,
   }: Props = $props();
 
@@ -51,6 +54,7 @@
       {required}
       {disabled}
       {autocomplete}
+      {inputmode}
       bind:value
       oninput={oninput}
     />
@@ -69,8 +73,8 @@
     gap: 6px;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
   }
   .req {
@@ -80,10 +84,11 @@
   .control {
     display: flex;
     align-items: center;
-    background: var(--surface-2);
+    min-height: var(--control-h);
+    background: var(--surface);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    transition: border-color 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
   }
   .control:focus-within {
     border-color: var(--primary);
@@ -96,14 +101,15 @@
     box-shadow: 0 0 0 3px var(--error-soft);
   }
   .prefix {
-    padding-inline-start: 12px;
+    padding-inline-start: 10px;
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   input {
     flex: 1;
     width: 100%;
-    padding: 10px 13px;
+    padding: 0 10px;
+    height: calc(var(--control-h) - 2px);
     background: transparent;
     border: none;
     color: var(--text);
@@ -118,7 +124,7 @@
     opacity: 0.6;
   }
   .msg {
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .msg.err {
     color: var(--error);

@@ -48,6 +48,9 @@ export const explore = {
     ar: 'تنزيل المخطط الزمني وسياق الجلسة بصيغة JSON',
   },
   'session.error.load': { en: "Couldn't load session", ar: 'تعذّر تحميل الجلسة' },
+  'session.meta.anonymous': { en: 'Anonymous', ar: 'مجهول' },
+  'session.meta.release': { en: 'Release {release}', ar: 'الإصدار {release}' },
+  'session.meta.env': { en: 'Env {env}', ar: 'البيئة {env}' },
   'session.notFound.title': { en: 'Session not found', ar: 'الجلسة غير موجودة' },
   'session.notFound.body': {
     en: 'This session no longer exists, or it never reached this app.',

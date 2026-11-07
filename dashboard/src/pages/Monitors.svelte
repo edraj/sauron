@@ -1,13 +1,14 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
-  import { formatTime } from '../lib/utils/format';
+  import { formatMs, formatPercent } from '../lib/utils/format';
   import { rowHref, rowNav } from '../lib/utils/row-link';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
   import { lockedBy } from '../lib/models/page-access';
   import { listMonitors, createMonitor } from '../lib/api/monitors';
-  import { MONITOR_INTERVALS } from '../lib/constants/monitorIntervals';
+  import { MONITOR_INTERVALS, intervalLabel } from '../lib/constants/monitorIntervals';
   import type { MonitorListItem } from '../lib/models';
   import StatusPill from '../lib/components/ui/StatusPill.svelte';
   import Button from '../lib/components/ui/Button.svelte';
@@ -17,8 +18,13 @@
   import SortableTh from '../lib/components/SortableTh.svelte';
   import ClientPager from '../lib/components/ClientPager.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import Badge from '../lib/components/ui/Badge.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
-  import Icon from '../lib/components/ui/Icon.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -84,11 +90,11 @@
     list = setOffsetSort(list, key, columnDefault);
   }
 
-  // The create form reports failures through the same banner as the list's own
-  // load error, and a `$derived` cannot be assigned to — so the form keeps its
-  // own state and the template's `error` is the two folded together.
+  // A failed create is reported inside the open form (the feedback rule:
+  // action failures stay with the action); a failed list load gets the page's
+  // load-error state. Two different things, so two different places.
   let formError = $state<string | null>(null);
-  const error = $derived(formError ?? monitorsView.error);
+  const listError = $derived(monitorsView.error);
 
   /**
    * `force` bypasses the fresh-window short-circuit: an explicit Refresh, and the
@@ -143,10 +149,24 @@
     finally { saving = false; }
   }
 
-  // `formatTime` rather than a local `toLocaleTimeString([])`: the empty array
-  // means "the browser's locale", which is not necessarily the one the rest of
-  // the page is in.
-  const fmtTime = (iso: string) => formatTime(iso);
+  const kindOptions = $derived([
+    { value: 'http', label: t('monitors.http') },
+    { value: 'tcp', label: 'TCP' },
+  ]);
+  const methodOptions = [
+    { value: 'GET', label: 'GET' },
+    { value: 'POST', label: 'POST' },
+    { value: 'HEAD', label: 'HEAD' },
+  ];
+  // `$derived` so the labels follow a language switch.
+  const intervalOptions = $derived(
+    MONITOR_INTERVALS.map((opt) => ({ value: String(opt.seconds), label: intervalLabel(opt) })),
+  );
+
+  function kindLabel(k: string): string {
+    // Protocol names, the same in every locale (`monitors.http` is "HTTP(S)").
+    return k === 'tcp' ? 'TCP' : t('monitors.http');
+  }
 
   // Color the 24h uptime figure so health reads at a glance, independent of the
   // "up right now" status pill. Applied inline so it wins over DataTable's own
@@ -173,79 +193,55 @@
   });
 </script>
 
+  <PageHeader title={t('monitors.title')} subtitle={t('monitors.subtitle')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={monitorsView.fetchedAt} revalidating={monitorsView.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached rows, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+    {#snippet primary()}
+      {#if !showForm}
+        <Button variant="primary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
+
   <div class="mons">
-    <header class="head">
-      <div>
-        <h1 class="page-title">{t('monitors.column.uptime')}</h1>
-        <p class="sub muted">{t('monitors.subtitle')}</p>
-      </div>
-      <div class="controls">
-        {#if !showForm}
-          <Button variant="primary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
-        {/if}
-        <!--
-          Spins for a background revalidate too, not just an explicit click: that
-          spinner IS the "showing cached rows, fetching fresh" hint, and without it
-          the instant paint is indistinguishable from live data.
-        -->
-        <Freshness fetchedAt={monitorsView.fetchedAt} revalidating={monitorsView.revalidating} />
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
-      </div>
-    </header>
-
-    {#if error}
-      <div class="err-banner" role="alert">
-        <Icon name="triangle-alert" size={15} />
-        <span>{error}</span>
-      </div>
-    {/if}
-
     {#if showForm}
       <Card title={t('monitors.new')}>
         <div class="form-grid">
           <Input label={t('common.name')} bind:value={name} placeholder={t('monitors.placeholder.name')} required />
 
-          <div class="field">
-            <label class="lbl" for="mon-kind">{t('monitors.column.type')}</label>
-            <div class="control select">
-              <select id="mon-kind" bind:value={kind}>
-                <option value="http">{t('monitors.http')}</option>
-                <option value="tcp">TCP</option>
-              </select>
-              <span class="affix"><Icon name="chevron-down" size={15} /></span>
-            </div>
-          </div>
+          <Select
+            label={t('monitors.column.type')}
+            value={kind}
+            options={kindOptions}
+            onchange={(v) => (kind = v === 'tcp' ? 'tcp' : 'http')}
+          />
 
           {#if kind === 'http'}
             <div class="span-2">
-              <Input label="URL" bind:value={target} placeholder="https://example.com/health" required />
+              <Input label={t('monitors.url')} bind:value={target} placeholder="https://example.com/health" required />
             </div>
-            <div class="field">
-              <label class="lbl" for="mon-method">{t('monitors.column.method')}</label>
-              <div class="control select">
-                <select id="mon-method" bind:value={method}>
-                  <option>GET</option><option>POST</option><option>HEAD</option>
-                </select>
-                <span class="affix"><Icon name="chevron-down" size={15} /></span>
-              </div>
-            </div>
+            <Select label={t('monitors.column.method')} bind:value={method} options={methodOptions} />
           {:else}
             <div class="span-2">
               <Input label={t('monitors.hostPort')} bind:value={target} placeholder={t('monitors.placeholder.hostPort')} required />
             </div>
           {/if}
 
-          <div class="field">
-            <label class="lbl" for="mon-interval">{t('monitors.column.interval')}</label>
-            <div class="control select">
-              <select id="mon-interval" bind:value={interval}>
-                {#each MONITOR_INTERVALS as opt (opt.seconds)}
-                  <option value={opt.seconds}>{opt.label}</option>
-                {/each}
-              </select>
-              <span class="affix"><Icon name="chevron-down" size={15} /></span>
-            </div>
-          </div>
+          <Select
+            label={t('monitors.column.interval')}
+            value={String(interval)}
+            options={intervalOptions}
+            onchange={(v) => (interval = Number(v))}
+          />
 
           <div class="span-2">
             <Input
@@ -257,8 +253,14 @@
           </div>
         </div>
 
+        {#if formError}
+          <div class="form-error">
+            <InlineNotice tone="error">{formError}</InlineNotice>
+          </div>
+        {/if}
+
         <div class="form-foot">
-          <Button variant="ghost" onclick={closeForm}>{t('common.cancel')}</Button>
+          <Button variant="secondary" onclick={closeForm}>{t('common.cancel')}</Button>
           <Button
             variant="primary"
             loading={saving}
@@ -274,6 +276,8 @@
 
     {#if loading}
       <Skeleton rows={6} />
+    {:else if listError && monitors.length === 0}
+      <ErrorState title={t('monitors.error.load')} error={monitorsView} onretry={() => void load(true)} />
     {:else if monitors.length === 0}
       <EmptyState
         title={t('monitors.empty.title')}
@@ -282,11 +286,21 @@
       >
         {#snippet action()}
           {#if !showForm}
-            <Button variant="primary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
+            <Button variant="secondary" lockedReason={writeLock} onclick={openForm}>{t('monitors.new')}</Button>
           {/if}
         {/snippet}
       </EmptyState>
     {:else}
+      {#if listError}
+        <!-- A refresh failed over rows we already had: they stay, with a way
+             back to fresh ones. -->
+        <InlineNotice tone="warning">
+          {t('ui.staleResults', { error: loadErrorText(monitorsView) })}
+          {#snippet action()}
+            <Button variant="ghost" size="sm" onclick={() => void load(true)}>{t('common.retry')}</Button>
+          {/snippet}
+        </InlineNotice>
+      {/if}
       <DataTable>
         {#snippet head()}
           <tr>
@@ -315,19 +329,19 @@
               <td>
                 <a class="row-link name-cell" href={rowHref(path)}>
                   <span class="name">{m.name}</span>
-                  <span class="kind">{m.kind}</span>
+                  <Badge size="sm">{kindLabel(m.kind)}</Badge>
                 </a>
               </td>
               <td><span class="cell-mono cell-muted target" title={m.target}>{m.target}</span></td>
               <td><StatusPill status={m.status} /></td>
               <td class="num" style:color={uptimeColor(m.uptime_24h)}>
-                {#if m.uptime_24h == null}<span class="faint">—</span>{:else}{m.uptime_24h.toFixed(1)}%{/if}
+                {#if m.uptime_24h == null}<span class="faint">—</span>{:else}{formatPercent(m.uptime_24h / 100)}{/if}
               </td>
               <td class="num">
-                {#if m.last_response_time_ms == null}<span class="faint">—</span>{:else}{m.last_response_time_ms} ms{/if}
+                {#if m.last_response_time_ms == null}<span class="faint">—</span>{:else}{formatMs(m.last_response_time_ms)}{/if}
               </td>
               <td class="num">
-                {#if m.last_checked_at}<span class="cell-muted">{fmtTime(m.last_checked_at)}</span>{:else}<span class="faint">—</span>{/if}
+                {#if m.last_checked_at}<TimeValue value={m.last_checked_at} muted />{:else}<span class="faint">—</span>{/if}
               </td>
             </tr>
           {/each}
@@ -356,105 +370,26 @@
   .mons {
     display: flex;
     flex-direction: column;
-    gap: 20px;
-  }
-
-  /* --- header --------------------------------------------------------------- */
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-
-  /* --- error banner --------------------------------------------------------- */
-  .err-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    font-size: 13px;
-    color: var(--error);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
-    border-radius: var(--radius);
+    gap: var(--page-gap);
   }
 
   /* --- create form ---------------------------------------------------------- */
   .form-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 15px 16px;
+    gap: 14px 16px;
   }
   .span-2 {
     grid-column: 1 / -1;
+  }
+  .form-error {
+    margin-top: 14px;
   }
   .form-foot {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
     margin-top: 18px;
-  }
-
-  /* Native controls (select / number) styled to match the Input component. */
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
-    color: var(--text-muted);
-  }
-  .control {
-    position: relative;
-    display: flex;
-    align-items: center;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    transition: border-color 0.14s ease, box-shadow 0.14s ease;
-  }
-  .control:focus-within {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-soft);
-  }
-  .control select {
-    flex: 1;
-    width: 100%;
-    min-width: 0;
-    padding: 10px 13px;
-    background: transparent;
-    border: none;
-    color: var(--text);
-    outline: none;
-  }
-  .control.select select {
-    appearance: none;
-    padding-inline-end: 34px;
-    cursor: pointer;
-  }
-  .affix {
-    display: inline-flex;
-    align-items: center;
-    color: var(--text-faint);
-    pointer-events: none;
-  }
-  .control.select .affix {
-    position: absolute;
-    inset-inline-end: 11px;
   }
 
   /* --- table cells ---------------------------------------------------------- */
@@ -464,17 +399,7 @@
     gap: 8px;
   }
   .name {
-    font-weight: 560;
-  }
-  .kind {
-    font-size: 10px;
-    font-weight: 620;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 1px 6px;
+    font-weight: var(--weight-medium);
   }
   .target {
     display: inline-block;

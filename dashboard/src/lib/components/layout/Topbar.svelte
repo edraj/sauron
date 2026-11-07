@@ -15,6 +15,33 @@
   import { currentRoute } from '../../stores/current-route';
   import { beginForcing, endForcing } from '../../api/force';
   import { runGlobalRefresh } from '../../models/force-refresh';
+  import { topbarOffset } from '../../stores/topbar-offset.svelte';
+
+  /**
+   * Publish the bar's real height as `--topbar-offset`, for everything that
+   * has to clear it (Docs' anchor scroll margin, sticky rails), and as
+   * `topbarOffset.px` for script (Docs' scroll-spy). On a phone the bar wraps
+   * to two rows; measuring keeps those offsets right whatever the rows hold,
+   * where a fixed number silently goes stale.
+   */
+  let bar: HTMLElement | undefined = $state();
+  $effect(() => {
+    const el = bar;
+    if (!el) return;
+    const root = document.documentElement;
+    const publish = () => {
+      root.style.setProperty('--topbar-offset', `${el.offsetHeight}px`);
+      topbarOffset.px = el.offsetHeight;
+    };
+    publish();
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      root.style.removeProperty('--topbar-offset');
+      topbarOffset.px = 0;
+    };
+  });
 
   let refreshing = $state(false);
 
@@ -149,7 +176,7 @@
   );
 </script>
 
-<header class="topbar">
+<header class="topbar" bind:this={bar}>
   <div class="left">
     <!-- Org switcher -->
     {#if orgItems.length > 0}
@@ -171,7 +198,7 @@
           items={projectItems}
           currentId={sessionStore.currentProjectId}
           onSelect={(id) => void sessionStore.setProject(id)}
-          createLabel="New project"
+          createLabel={t('projects.new')}
           onCreate={() => push('/admin/projects')}
           createLocked={createProjectLock}
           ariaLabel={t('nav.switchProject')}
@@ -187,7 +214,7 @@
         items={appItems}
         currentId={sessionStore.currentAppId}
         onSelect={(id) => void sessionStore.setApp(id)}
-        createLabel="New app"
+        createLabel={t('projects.newApp')}
         onCreate={() => push('/admin/projects')}
         createLocked={createAppLock}
         ariaLabel={t('nav.switchApp')}
@@ -268,10 +295,14 @@
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 0 22px;
+    padding: 0 24px;
     border-bottom: 1px solid var(--border);
-    background: color-mix(in srgb, var(--surface) 55%, var(--bg));
-    backdrop-filter: blur(8px);
+    background: var(--bg);
+    /* A size container, so the rules below key on the bar's OWN width. The
+       viewport says nothing useful here: beside the 240px sidebar a 1200px
+       window leaves the bar 960px, while at 800px (sidebar on top) it gets
+       the full width. */
+    container-type: inline-size;
     position: sticky;
     top: 0;
     z-index: 20;
@@ -290,7 +321,7 @@
   }
   .sep {
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .ic {
     display: inline-flex;
@@ -313,20 +344,19 @@
     }
   }
   .icon-btn {
-    width: 36px;
-    height: 36px;
+    width: var(--control-h);
+    height: var(--control-h);
     display: grid;
     place-items: center;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     color: var(--text-muted);
-    font-size: 16px;
-    transition: all 0.13s ease;
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .icon-btn:hover {
     color: var(--text);
-    background: var(--surface-3);
+    background: var(--surface-2);
   }
   .user {
     display: flex;
@@ -335,28 +365,36 @@
     padding-inline-start: 4px;
   }
   .avatar {
-    width: 32px;
-    height: 32px;
+    width: 28px;
+    height: 28px;
     border-radius: 50%;
     display: grid;
     place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 12px;
-    font-weight: 650;
+    background: var(--surface-3);
+    color: var(--text);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     flex-shrink: 0;
   }
   .user-meta {
     display: flex;
     flex-direction: column;
     line-height: 1.25;
+    min-width: 0;
+    max-width: 180px;
+  }
+  .u-name,
+  .u-email {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .u-name {
-    font-size: 13px;
-    font-weight: 560;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
   }
   .u-email {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .logout {
@@ -364,22 +402,50 @@
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     color: var(--text-muted);
-    padding: 7px 12px;
-    font-size: 12.5px;
-    font-weight: 520;
-    transition: all 0.13s ease;
+    height: 28px;
+    padding: 0 10px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    transition: background-color 0.12s ease, color 0.12s ease;
   }
   .logout:hover {
     color: var(--text);
-    border-color: var(--text-faint);
+    background: var(--surface-2);
   }
 
-  @media (max-width: 640px) {
+  /* The scope switchers say what the data on screen belongs to; the signed-in
+     name and email are on the Account page. Give the switchers the room first. */
+  @container (max-width: 960px) {
     .user-meta {
       display: none;
     }
+  }
+
+  @media (max-width: 640px) {
+    /* Two rows on a phone: the account cluster on top, the scope switchers on
+       their own full-width row below. In one row the switchers were squeezed
+       down to bare chevrons, hiding which app the data on screen belongs to. */
     .topbar {
-      padding: 0 14px;
+      height: auto;
+      min-height: var(--topbar-h);
+      flex-wrap: wrap;
+      align-content: center;
+      row-gap: 6px;
+      padding: 8px 14px;
+    }
+    .left {
+      order: 2;
+      flex: 1 1 100%;
+      overflow-x: auto;
+    }
+    .right {
+      margin-inline-start: auto;
+    }
+    /* Scroll the row sideways rather than squeeze each name to one letter. */
+    .left > :global(*) {
+      flex-shrink: 0;
     }
     /* App and environment are what change the meaning of the data on
        screen; project is navigational. When the four triggers no longer

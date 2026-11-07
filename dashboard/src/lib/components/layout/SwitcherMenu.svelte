@@ -4,9 +4,11 @@
   clickable — even with a single option — and the popup lists every option (the
   current one checked) plus an optional "+ New …" action.
 
-  The menu is portalled to <body> because the Topbar clips its children
-  (`overflow: hidden`) and its `backdrop-filter` would otherwise anchor a
-  fixed-positioned menu to the bar instead of the viewport.
+  The menu is portalled to <body> to get out of the Topbar's stacking context:
+  the bar is `position: sticky` with `z-index: 20`, so a menu inside it could
+  stack no higher than the bar, whatever its own z-index. (Neither the phone
+  row's `overflow-x: auto` nor the bar's `container-type` clips or re-anchors
+  a fixed-position menu; checked in Chromium 156.)
 -->
 <script lang="ts">
   import Icon from '../ui/Icon.svelte';
@@ -239,24 +241,22 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 10px 6px 12px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    height: 28px;
+    padding: 0 8px 0 10px;
+    background: transparent;
+    border: 1px solid transparent;
     border-radius: var(--radius);
     min-width: 0;
     cursor: pointer;
-    transition: background 0.13s ease, border-color 0.13s ease;
+    transition: background-color 0.12s ease;
   }
   .trigger:hover,
   .trigger.open {
-    background: var(--surface-3);
-    border-color: var(--border-strong);
+    background: var(--surface-2);
   }
   .kind {
-    font-size: 10px;
-    font-weight: 650;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-regular);
     color: var(--text-faint);
   }
   .t-icon {
@@ -264,13 +264,15 @@
     line-height: 1;
   }
   .name {
-    font-weight: 600;
-    font-size: 13.5px;
+    font-weight: var(--weight-medium);
+    font-size: var(--text-sm);
     color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 180px;
+    /* Never squeezed to nothing: a few letters plus the ellipsis survive. */
+    min-width: 3.5em;
   }
   .chev {
     display: inline-flex;
@@ -286,8 +288,8 @@
     position: fixed;
     z-index: 100;
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow);
     padding: 4px;
     max-height: min(320px, calc(100vh - 80px));
@@ -311,8 +313,8 @@
     border: none;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 13.5px;
-    font-weight: 540;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     text-align: start;
     cursor: pointer;
     transition: background 0.1s ease, color 0.1s ease;
@@ -375,8 +377,8 @@
     border: none;
     border-radius: var(--radius-sm);
     color: var(--text-muted);
-    font-size: 13px;
-    font-weight: 540;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     text-align: start;
     cursor: pointer;
     transition: background 0.1s ease, color 0.1s ease;
@@ -394,17 +396,16 @@
   .plus {
     display: inline-flex;
     align-items: center;
-    font-size: 15px;
+    font-size: var(--text-md);
     line-height: 1;
     color: var(--text-faint);
   }
 
-  @media (max-width: 860px) {
+  /* Keyed on the topbar's own width (it is a size container): the names say
+     what the data belongs to; the "Org / Project / Env" labels go first. */
+  @container (max-width: 960px) {
     .kind {
       display: none;
-    }
-    .trigger {
-      padding: 6px 8px 6px 10px;
     }
   }
   @media (max-width: 640px) {

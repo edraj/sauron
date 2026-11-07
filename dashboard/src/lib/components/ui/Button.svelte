@@ -5,7 +5,7 @@
   import { lockTip } from '../../actions/lock-tip';
   import type { LockReason } from '../../models/page-access';
 
-  type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'subtle';
+  type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
   type Size = 'sm' | 'md' | 'lg';
 
   interface Props {
@@ -100,42 +100,50 @@
 {/if}
 
 <style>
+  /* Four variants, one job each: `primary` for the single main action in a
+     view, `secondary` for everything else, `ghost` for tertiary and icon-only
+     controls, `danger` for anything irreversible. */
   .btn {
     position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 7px;
+    gap: 6px;
     border: 1px solid transparent;
     border-radius: var(--radius);
-    font-weight: 560;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     line-height: 1;
     white-space: nowrap;
     text-decoration: none;
-    transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease,
-      transform 0.05s ease, box-shadow 0.14s ease;
+    transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease,
+      transform 0.05s ease;
     user-select: none;
   }
 
   .btn.sm {
-    padding: 6px 11px;
-    font-size: 12.5px;
-    border-radius: var(--radius-sm);
+    min-height: 28px;
+    padding: 0 10px;
+    font-size: var(--text-xs);
   }
-  /* `min-height` so a md button lines up with the `--control-h` toolbar
-     controls it is most often beside (Export next to Refresh). */
+  /* `min-height` so a md button lines up with the `--control-h` controls it
+     usually sits beside (Export next to Refresh, Save next to an input). */
   .btn.md {
     min-height: var(--control-h);
-    padding: 8px 15px;
-    font-size: 13.5px;
+    padding: 0 12px;
   }
   .btn.lg {
-    padding: 12px 20px;
-    font-size: 15px;
+    min-height: 40px;
+    padding: 0 16px;
   }
 
   .btn.full {
     width: 100%;
+  }
+
+  /* Pressed: a one-pixel settle, so a click registers before any result. */
+  .btn:not(:disabled):not(.locked):active {
+    transform: translateY(1px);
   }
 
   .btn:disabled,
@@ -144,42 +152,29 @@
     opacity: 0.55;
   }
 
-  .btn:not(:disabled):not(.locked):active {
-    transform: translateY(1px);
-  }
-
-  /* primary */
   .btn.primary {
-    background: var(--primary);
+    background: var(--primary-solid);
+    border-color: var(--primary-solid);
     color: var(--primary-contrast);
-    box-shadow: var(--shadow-sm);
   }
   .btn.primary:not(:disabled):not(.locked):hover {
-    background: var(--primary-hover);
+    background: var(--primary-solid-hover);
+    border-color: var(--primary-solid-hover);
+  }
+  .btn.primary:not(:disabled):not(.locked):active {
+    background: var(--primary-active);
+    border-color: var(--primary-active);
   }
 
-  /* secondary */
   .btn.secondary {
-    background: var(--surface-2);
+    background: var(--surface);
     border-color: var(--border-strong);
     color: var(--text);
   }
   .btn.secondary:not(:disabled):not(.locked):hover {
-    background: var(--surface-3);
-    border-color: var(--text-faint);
-  }
-
-  /* subtle */
-  .btn.subtle {
     background: var(--surface-2);
-    color: var(--text-muted);
-  }
-  .btn.subtle:not(:disabled):not(.locked):hover {
-    background: var(--surface-3);
-    color: var(--text);
   }
 
-  /* ghost */
   .btn.ghost {
     background: transparent;
     color: var(--text-muted);
@@ -189,15 +184,14 @@
     color: var(--text);
   }
 
-  /* danger */
   .btn.danger {
-    background: var(--error-soft);
-    border-color: var(--error);
-    color: var(--error);
+    background: var(--error-solid);
+    border-color: var(--error-solid);
+    color: var(--primary-contrast);
   }
   .btn.danger:not(:disabled):not(.locked):hover {
-    background: var(--error);
-    color: #fff;
+    background: color-mix(in srgb, var(--error-solid) 88%, black);
+    border-color: color-mix(in srgb, var(--error-solid) 88%, black);
   }
 
   .spin {
@@ -206,18 +200,16 @@
     display: grid;
     place-items: center;
   }
-
   .label {
     display: inline-flex;
     align-items: center;
-    gap: 7px;
+    gap: 6px;
   }
-
   .label.hidden {
     visibility: hidden;
   }
-
   .lock {
     display: inline-flex;
+    margin-inline-end: 2px;
   }
 </style>

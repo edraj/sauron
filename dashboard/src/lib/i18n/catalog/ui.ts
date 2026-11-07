@@ -80,6 +80,10 @@ export const ui = {
     ar: 'لا توجد بيانات أحداث كافية لرسم الرحلات في هذا النطاق.',
   },
   'ui.tryAgain': { en: 'Try again', ar: 'حاول مرة أخرى' },
+  'ui.staleResults': {
+    en: 'Showing the last results that loaded — refreshing failed: {error}',
+    ar: 'تُعرض آخر النتائج المحمّلة — فشل التحديث: {error}',
+  },
 
   // --- event / span detail sections ---------------------------------------
   'ui.section.tags': { en: 'Tags', ar: 'الوسوم' },
@@ -188,14 +192,14 @@ export const ui = {
   // wire value verbatim. Mapped rather than translated in place because the
   // value is also the sort key and the filter chip's payload — only the label
   // moves.
-  'level.fatal': { en: 'fatal', ar: 'قاتل' },
-  'level.error': { en: 'error', ar: 'خطأ' },
-  'level.warning': { en: 'warning', ar: 'تحذير' },
-  'level.info': { en: 'info', ar: 'معلومة' },
-  'level.debug': { en: 'debug', ar: 'تنقيح' },
-  'status.unresolved': { en: 'unresolved', ar: 'غير محلول' },
-  'status.resolved': { en: 'resolved', ar: 'محلول' },
-  'status.ignored': { en: 'ignored', ar: 'متجاهَل' },
+  'level.fatal': { en: 'Fatal', ar: 'قاتل' },
+  'level.error': { en: 'Error', ar: 'خطأ' },
+  'level.warning': { en: 'Warning', ar: 'تحذير' },
+  'level.info': { en: 'Info', ar: 'معلومة' },
+  'level.debug': { en: 'Debug', ar: 'تنقيح' },
+  'status.unresolved': { en: 'Unresolved', ar: 'غير محلول' },
+  'status.resolved': { en: 'Resolved', ar: 'محلول' },
+  'status.ignored': { en: 'Ignored', ar: 'متجاهَل' },
 
   // --- filter bar & time modes --------------------------------------------
   'filter.addFilter': { en: '+ Add filter', ar: '+ إضافة مرشّح' },

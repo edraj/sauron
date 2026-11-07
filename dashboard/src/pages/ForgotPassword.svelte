@@ -77,11 +77,10 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    font-size: 14px;
+    font-size: var(--text-sm);
     line-height: 1.5;
   }
   .muted {
     color: var(--text-muted);
-    font-size: 13px;
   }
 </style>

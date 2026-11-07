@@ -70,7 +70,7 @@
   {/if}
 
   {#snippet footer()}
-    <Button variant="ghost" onclick={oncancel} disabled={busy}
+    <Button variant="secondary" onclick={oncancel} disabled={busy}
       >{t('members.reset.neverMind')}</Button
     >
     {#if action === 'request'}
@@ -87,12 +87,12 @@
 
 <style>
   .lead {
-    font-size: 14px;
+    font-size: var(--text-sm);
     line-height: 1.5;
     margin-bottom: 10px;
   }
   p {
-    font-size: 13.5px;
+    font-size: var(--text-sm);
     line-height: 1.55;
     color: var(--text-muted);
   }
@@ -101,6 +101,6 @@
   }
   .problem {
     margin-top: 6px;
-    color: var(--danger, #c0392b);
+    color: var(--error);
   }
 </style>

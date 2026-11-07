@@ -1,10 +1,11 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { rowHref, rowNav } from '../lib/utils/row-link';
-  import Card from '../lib/components/ui/Card.svelte';
+  import { formatNumber } from '../lib/i18n';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
-  import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import StatTiles from '../lib/components/StatTiles.svelte';
@@ -173,18 +174,25 @@
     const off = list.offset;
     if (aid) void load(aid, win, s, sort, off);
   });
+
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('workflows.title')}</h1>
-      <p class="muted sub">{t('workflows.subtitle')}</p>
-    </div>
-  </div>
+  <PageHeader title={t('workflows.title')} subtitle={t('workflows.subtitle')}>
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
+    {/snippet}
+    {#snippet refresh()}
+      <!--
+        Spins for a background revalidate too, not just an explicit click: that
+        spinner IS the "showing cached rows, fetching fresh" hint, and without it
+        the instant paint is indistinguishable from live data.
+      -->
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
+    {/snippet}
+  </PageHeader>
 
-  <!-- The list toolbar: every control that narrows or reloads the table, in
-       the one arrangement all list pages share (`ListToolbar`). It used to sit
-       in the page header beside the title, which no other list page does. -->
+  <!-- The list toolbar: every control that narrows the table, in the one
+       arrangement all list pages share (`ListToolbar`). -->
   <ListToolbar>
     {#snippet searchBox()}
       <SearchInput bind:value={search} onsearch={onSearch} placeholder={t('workflows.search')} />
@@ -192,45 +200,18 @@
     {#snippet timeWindow()}
       <DateRange value={range} onchange={onRange} />
     {/snippet}
-    {#snippet actions()}
-      <!--
-        Spins for a background revalidate too, not just an explicit click: that
-        spinner IS the "showing cached rows, fetching fresh" hint, and without it
-        the instant paint is indistinguishable from live data.
-      -->
-      <Freshness fetchedAt={view.fetchedAt} revalidating={view.revalidating} />
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
-    {/snippet}
   </ListToolbar>
 
   {#if error && rows.length === 0}
-    <Card>
-      <EmptyState title={t('workflows.error.load')} description={error} icon="workflow">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) load(aid, range, appliedSearch, sortParam(list.sort), list.offset, true);
-            }}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('workflows.error.load')} error={view} onretry={() => { void rowCount.reload(); void view.reload(); }} />
   {:else if loading && rows.length === 0}
     <Skeleton rows={6} />
   {:else if rows.length === 0}
-    <Card>
-      <EmptyState
-        title={t('workflows.empty.title')}
-        description={appliedSearch
-          ? `No workflows match “${appliedSearch}”.`
-          : 'Call startWorkflow() in your app to group events into named flows.'}
-        icon="workflow"
-      />
-    </Card>
+    <EmptyState
+      title={appliedSearch ? t('workflows.empty.match') : t('workflows.empty.range')}
+      description={appliedSearch ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
+      icon="workflow"
+    />
   {:else}
     <StatTiles min={140}>
       <StatTile label={t('workflows.stat.started')} value={compactNumber(totals.started)} />
@@ -243,7 +224,7 @@
       />
     </StatTiles>
 
-    <Card padding="none">
+    <div class="table">
       <DataTable>
         {#snippet head()}
           <tr>
@@ -275,7 +256,9 @@
                  alias are both `unique_users`. Sending `unique_users` is a
                  400, not a silently ignored parameter. -->
             <SortableTh key="users" class="num" sort={list.sort} {onsort}>{t('users.title')}</SortableTh>
-            <SortableTh key="last_seen" class="num" sort={list.sort} {onsort}>
+            <!-- A timestamp, not a number: start-aligned like every other
+                 time column, not right-aligned into the counts. -->
+            <SortableTh key="last_seen" sort={list.sort} {onsort}>
               {t('explore.column.lastSeen')}
             </SortableTh>
           </tr>
@@ -291,15 +274,15 @@
               <td>
                 <a class="row-link cell-mono truncate" href={rowHref(path)}>{r.name}</a>
               </td>
-              <td class="num">{compactNumber(r.started)}</td>
-              <td class="num">{compactNumber(r.completed)}</td>
-              <td class="num">{compactNumber(r.cancelled)}</td>
-              <td class="num"><span class:err={r.abandoned > 0}>{compactNumber(r.abandoned)}</span></td>
+              <td class="num">{formatNumber(r.started)}</td>
+              <td class="num">{formatNumber(r.completed)}</td>
+              <td class="num">{formatNumber(r.cancelled)}</td>
+              <td class="num"><span class:err={r.abandoned > 0}>{formatNumber(r.abandoned)}</span></td>
               <td class="num">{formatPercent(completionRate(r))}</td>
               <td class="num">{formatDuration(r.median_duration_ms)}</td>
               <td class="num">{formatDuration(r.p95_duration_ms)}</td>
-              <td class="num">{compactNumber(r.unique_users)}</td>
-              <td class="num"><TimeValue value={r.last_seen} /></td>
+              <td class="num">{formatNumber(r.unique_users)}</td>
+              <td><TimeValue value={r.last_seen} muted /></td>
             </tr>
           {/each}
         {/snippet}
@@ -317,24 +300,13 @@
         totalIsCapped={rowCount.isCapped}
         onchange={(o) => (list = setOffsetPage(list, o))}
       />
-    </Card>
+    </div>
   {/if}
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .num {
-    text-align: end;
+  /* The tiles summarise the page; the table is the next section down. */
+  .table {
+    margin-top: var(--page-gap);
   }
   .truncate {
     display: inline-block;
@@ -346,6 +318,6 @@
   }
   .err {
     color: var(--error);
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
 </style>

@@ -33,6 +33,6 @@
 <style>
   .release-note {
     margin: 0 0 8px;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
 </style>

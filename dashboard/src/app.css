@@ -4,118 +4,164 @@
    ========================================================================== */
 
 :root {
-  /* Brand */
-  --primary: #6e7bf2;
-  --primary-hover: #8089f6;
-  --primary-active: #5c69e6;
+  /* Brand. The accent is used sparingly: the one primary action, the active
+     nav item, focus rings, selected controls and links in prose. Charts have
+     their own palette below. */
+  --primary: #7c83f7;
+  --primary-hover: #8d93f8;
+  --primary-active: #464dce;
   --primary-contrast: #ffffff;
-  --primary-soft: rgba(110, 123, 242, 0.16);
-  --primary-border: rgba(110, 123, 242, 0.4);
+  --primary-soft: rgba(124, 131, 247, 0.14);
+  --primary-border: rgba(124, 131, 247, 0.4);
+  /* Filled buttons: deeper than the accent, so white labels clear 4.5:1. */
+  --primary-solid: #5b62e8;
+  --primary-solid-hover: #4f56dc;
 
-  /* Surfaces (dark) */
-  --bg: #0a0c10;
-  --bg-gradient: radial-gradient(1200px 600px at 80% -10%, rgba(110, 123, 242, 0.08), transparent 60%);
-  --surface: #12151b;
-  --surface-2: #171b22;
-  --surface-3: #1d222b;
-  --overlay: rgba(6, 8, 12, 0.6);
+  /* Surfaces (dark). Flat: no background glow. */
+  --bg: #0b0c0e;
+  --surface: #111215;
+  --surface-2: #17191d;
+  --surface-3: #1f2126;
+  --overlay: rgba(4, 5, 6, 0.6);
 
-  /* Lines */
-  --border: #262c37;
-  --border-strong: #343c49;
+  /* Lines. Hairlines separate sections; boxes are the exception. */
+  --border: #1d1f23;
+  --border-strong: #26292e;
 
   /* Text */
-  --text: #e7eaef;
-  --text-muted: #98a2b1;
-  --text-faint: #626c7a;
+  --text: #e4e5e8;
+  --text-muted: #8a8f98;
+  --text-faint: #646972;
 
   /* Semantic — level & status */
-  --error: #f0616d;
-  --error-soft: rgba(240, 97, 109, 0.15);
-  --warning: #f0a850;
-  --warning-soft: rgba(240, 168, 80, 0.16);
+  --error: #ef6b73;
+  --error-soft: rgba(239, 107, 115, 0.12);
+  --error-solid: #c93a45;
+  --warning: #e2a85a;
+  --warning-soft: rgba(226, 168, 90, 0.12);
   --info: #5cb0e6;
-  --info-soft: rgba(92, 176, 230, 0.15);
-  --success: #43c06d;
-  --success-soft: rgba(67, 192, 109, 0.15);
-  --neutral: #828d9d;
-  --neutral-soft: rgba(130, 141, 157, 0.15);
-  --fatal: #d5457e;
-  --fatal-soft: rgba(213, 69, 126, 0.15);
+  --info-soft: rgba(92, 176, 230, 0.12);
+  --success: #4cb782;
+  --success-soft: rgba(76, 183, 130, 0.12);
+  --neutral: #8a8f98;
+  --fatal: #e86a9a;
+  --fatal-soft: rgba(232, 106, 154, 0.12);
+
+  /* Charts are data, not UI chrome: a categorical palette (series in order),
+     grey for the "context" bars of a single-series time series, and a grid. */
+  --chart-1: #7c83f7;
+  --chart-2: #4fb6c9;
+  --chart-3: #e2a85a;
+  --chart-4: #c27ad6;
+  --chart-5: #6fbf7e;
+  --chart-neutral: #2a2d34;
+  --chart-grid: #1d1f23;
 
   /* Focus */
-  --focus-ring: rgba(110, 123, 242, 0.5);
+  --focus-ring: rgba(124, 131, 247, 0.55);
 
   /* Radii */
-  --radius-sm: 6px;
-  --radius: 10px;
-  --radius-lg: 14px;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
   --radius-pill: 999px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.5);
+  /* Shadows — overlays only (menus, dialogs, toasts, tooltips). */
+  --shadow-sm: none;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.55);
 
-  /* Typography */
-  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
-    Helvetica, Arial, sans-serif;
+  /* Typography. Six sizes, three weights — nothing else. */
+  --font-sans: 'Inter Variable', 'Noto Sans Arabic Variable', ui-sans-serif, system-ui,
+    -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', 'Cascadia Code',
     Menlo, Consolas, monospace;
+  --text-2xs: 11.5px; /* mono only: IDs, stack frames, culprits */
+  --text-xs: 12px; /* labels, captions, table headers, meta */
+  --text-sm: 13px; /* body, table cells, buttons, inputs */
+  --text-md: 15px; /* section and dialog titles */
+  --text-lg: 19px; /* page titles */
+  --text-xl: 22px; /* stat values */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-strong: 600;
 
   /* Layout */
   --sidebar-w: 240px;
-  --topbar-h: 60px;
-  /* The one height every list-toolbar control shares: both search boxes, the
-     range pills, the TimeFilter, "+ Add filter", Refresh, and a md Button. A
-     toolbar whose controls differ by a few pixels each reads as five separate
-     widgets that happen to be adjacent; at one height it reads as a row. */
-  --control-h: 36px;
+  --topbar-h: 48px;
+  /* How far below the viewport top content must start to clear the sticky
+     topbar. Equals --topbar-h until Topbar.svelte measures itself and writes
+     the real height here — on a phone the bar wraps to two rows, and a
+     hand-measured number drifts the moment a control's size changes. Read
+     this, not --topbar-h, for any offset (anchor scroll margins, sticky rails). */
+  --topbar-offset: var(--topbar-h);
+  /* The one height every control shares: inputs, selects, segmented
+     controls, toolbar buttons, Refresh. A row of controls a few pixels apart
+     reads as separate widgets; at one height it reads as a row. */
+  --control-h: 32px;
   --content-max: 2200px;
+  /* What a table sits on. A table on the page uses the page colour for its
+     sticky header and the surface colour for row hover; a container with its
+     own fill (a dialog) redefines both so the header band and
+     the hover stay visible on it. */
+  --dt-bg: var(--bg);
+  --dt-hover: var(--surface);
+
+  /* Vertical rhythm: between top-level sections, and under a page header. */
+  --page-gap: 22px;
+  --head-gap: 20px;
 
   color-scheme: dark;
 }
 
 [data-theme='light'] {
-  --primary: #5460e6;
-  --primary-hover: #4954d8;
-  --primary-active: #3e49c9;
+  --primary: #5b62e8;
+  --primary-hover: #4c53d9;
+  --primary-active: #4249c9;
   --primary-contrast: #ffffff;
-  --primary-soft: rgba(84, 96, 230, 0.1);
-  --primary-border: rgba(84, 96, 230, 0.28);
+  --primary-soft: rgba(91, 98, 232, 0.1);
+  --primary-border: rgba(91, 98, 232, 0.3);
+  --primary-solid: #5b62e8;
+  --primary-solid-hover: #4c53d9;
 
-  --bg: #f5f6f9;
-  --bg-gradient: radial-gradient(1200px 600px at 80% -10%, rgba(84, 96, 230, 0.07), transparent 60%);
+  --bg: #f7f7f8;
   --surface: #ffffff;
-  --surface-2: #f4f6f9;
-  --surface-3: #eaedf3;
-  --overlay: rgba(20, 24, 34, 0.35);
+  --surface-2: #f1f2f4;
+  --surface-3: #e8eaed;
+  --overlay: rgba(20, 22, 28, 0.32);
 
-  --border: #e3e7ee;
-  --border-strong: #ccd3de;
+  --border: #e6e7ea;
+  --border-strong: #d5d8dd;
 
-  --text: #171b23;
-  --text-muted: #59616f;
-  --text-faint: #8b93a1;
+  --text: #17181b;
+  --text-muted: #5e636d;
+  --text-faint: #80858f;
 
-  --error: #d83a4a;
-  --error-soft: rgba(216, 58, 74, 0.1);
-  --warning: #c9820f;
-  --warning-soft: rgba(201, 130, 15, 0.12);
-  --info: #2f86c4;
-  --info-soft: rgba(47, 134, 196, 0.1);
-  --success: #1f9d54;
-  --success-soft: rgba(31, 157, 84, 0.12);
-  --neutral: #6b7482;
-  --neutral-soft: rgba(107, 116, 130, 0.12);
-  --fatal: #bb3273;
-  --fatal-soft: rgba(187, 50, 115, 0.1);
+  --error: #d0323f;
+  --error-soft: rgba(208, 50, 63, 0.09);
+  --error-solid: #c62f3c;
+  --warning: #9a5b00;
+  --warning-soft: rgba(154, 91, 0, 0.1);
+  --info: #1f74b8;
+  --info-soft: rgba(31, 116, 184, 0.09);
+  --success: #1a7f48;
+  --success-soft: rgba(26, 127, 72, 0.09);
+  --neutral: #5e636d;
+  --fatal: #c4306c;
+  --fatal-soft: rgba(196, 48, 108, 0.09);
 
-  --focus-ring: rgba(84, 96, 230, 0.4);
+  --chart-1: #5b62e8;
+  --chart-2: #1f8fa3;
+  --chart-3: #c4860f;
+  --chart-4: #9a4fb3;
+  --chart-5: #3f9a52;
+  --chart-neutral: #d9dce1;
+  --chart-grid: #eceef1;
 
-  --shadow-sm: 0 1px 2px rgba(20, 24, 34, 0.06);
-  --shadow: 0 6px 20px rgba(20, 24, 34, 0.08);
-  --shadow-lg: 0 18px 50px rgba(20, 24, 34, 0.14);
+  --focus-ring: rgba(91, 98, 232, 0.45);
+
+  --shadow: 0 8px 24px rgba(20, 22, 28, 0.08);
+  --shadow-lg: 0 18px 50px rgba(20, 22, 28, 0.14);
 
   color-scheme: light;
 }
@@ -139,12 +185,10 @@ body {
 
 body {
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--text);
   background-color: var(--bg);
-  background-image: var(--bg-gradient);
-  background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -187,6 +231,24 @@ option {
   outline-offset: 2px;
 }
 
+/* Native checkboxes and radios take the accent instead of the browser blue. */
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: var(--primary);
+}
+
+/* Motion is short and only on colour and opacity. With reduced motion, it
+   stops; spinners (which signal work in flight) are exempt and slow to 1.4s in
+   their own components (Spinner, RefreshButton, the Topbar refresh). */
+@media (prefers-reduced-motion: reduce) {
+  *:not(.spinner):not(.spinning),
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
 ::selection {
   background: var(--primary-soft);
 }
@@ -195,7 +257,7 @@ h1,
 h2,
 h3,
 h4 {
-  font-weight: 650;
+  font-weight: var(--weight-strong);
   line-height: 1.25;
   letter-spacing: -0.01em;
 }
@@ -246,16 +308,32 @@ kbd {
 }
 
 .page-title {
-  font-size: 22px;
-  font-weight: 680;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
 }
 
+/* A quiet label above a group of fields or a sub-block. Sentence case: the
+   uppercase-and-tracked version shouted over the content it introduced. */
 .section-label {
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
   color: var(--text-faint);
+}
+
+/* The detail-page layout: a main column beside a 320px rail, which drops under
+   it at 900px. One rule for every detail page (css-guards holds them to it);
+   four local copies had drifted apart. Not `.detail-grid`: Retention already
+   uses that name for its churn rows, and a global rule would land on them. */
+.detail-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: var(--page-gap);
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .detail-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .stack {
@@ -291,7 +369,7 @@ kbd {
    Arabic text (SDK names, HTTP verbs, IDs) still get Inter — and name explicit
    Arabic faces behind it. */
 [lang='ar'] {
-  --font-sans: 'Inter', 'Noto Sans Arabic', 'Noto Naskh Arabic', 'Segoe UI',
+  --font-sans: 'Inter Variable', 'Noto Sans Arabic Variable', 'Noto Naskh Arabic', 'Segoe UI',
     Tahoma, 'Geeza Pro', 'Arabic Typesetting', sans-serif;
 }
 

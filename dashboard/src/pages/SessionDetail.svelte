@@ -1,6 +1,7 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import { formatNumber } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
@@ -8,6 +9,8 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import ViewSection from '../lib/components/ViewSection.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
@@ -23,7 +26,12 @@
   import { viewKey } from '../lib/stores/view-cache';
   import { getSessionSummary, getSessionTimeline } from '../lib/api/sessions';
   import { isNormalizedError } from '../lib/api/client';
-  import { formatDateTime, formatDuration, durationBetween } from '../lib/utils/format';
+  import {
+    formatDuration,
+    durationBetween,
+    formatTimestamp,
+    relativeTime,
+  } from '../lib/utils/format';
   import type { Session, TimelineItem, Transaction } from '../lib/models';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import {
@@ -185,6 +193,11 @@
     });
   });
 
+  const sliceOptions = $derived([
+    { value: 'occurred_at', label: t('session.slice.occurredAt') },
+    { value: 'received_at', label: t('session.slice.receivedAt') },
+  ]);
+
   function closeSliceModal() {
     sliceStack = [];
   }
@@ -213,7 +226,47 @@
   }
 </script>
 
-  <button class="back" onclick={() => push('/sessions')}><Icon name="arrow-left" size={14} /> {t('explore.column.sessions')}</button>
+  <PageHeader
+    title={s?.session_id ?? sessionId}
+    titleClass="mono"
+    back={{ label: t('nav.sessions'), href: '#/sessions' }}
+  >
+    {#snippet meta()}
+      {#if s}
+        <CopyButton value={s.session_id} size="sm" />
+        {#if s.distinct_id}
+          <a class="meta-link mono" href={`#/persons/${encodeURIComponent(s.distinct_id)}`}>
+            <Icon name="user" size={13} />{s.distinct_id}
+          </a>
+        {:else}
+          <span class="meta-link"><Icon name="user" size={13} />{t('session.meta.anonymous')}</span>
+        {/if}
+        {#if s.device_key}
+          <a class="meta-link mono" href={`#/devices/${encodeURIComponent(s.device_key)}`}>
+            <Icon name="monitor" size={13} />{s.device_key}
+          </a>
+        {/if}
+        {#if s.release}<Badge tone="neutral" size="sm">{t('session.meta.release', { release: s.release })}</Badge>{/if}
+        {#if s.environment_id}
+          <span class="meta-link mono">{t('session.meta.env', { env: s.environment_id })}</span>
+        {/if}
+      {/if}
+    {/snippet}
+    {#snippet freshness()}
+      {#if s}
+        <Freshness
+          fetchedAt={view.fetchedAt}
+          revalidating={view.revalidating || timelineView.revalidating}
+        />
+      {/if}
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton
+        onclick={refresher.run}
+        loading={refresher.busy || view.revalidating || timelineView.revalidating}
+      />
+    {/snippet}
+  </PageHeader>
 
   <!-- The session ROW decides whether there is a page at all (not found, or a
        failed read); the timeline is a section of a page that exists, and waits
@@ -229,55 +282,15 @@
       {/snippet}
     </EmptyState>
   {:else if !loading && error}
-    <EmptyState title={t('session.error.load')} description={error} icon="triangle-alert">
-      {#snippet action()}
-        <Button
-          variant="secondary"
-          onclick={() => sessionStore.currentAppId && load(sessionStore.currentAppId, sessionId, true)}
-        >
-          {t('common.retry')}
-        </Button>
-      {/snippet}
-    </EmptyState>
+    <ErrorState
+      title={t('session.error.load')}
+      error={view}
+      onretry={() => sessionStore.currentAppId && load(sessionStore.currentAppId, sessionId, true)}
+    />
   {:else}
     {#if !s}
-      <header class="detail-head"><Skeleton rows={2} height="18px" /></header>
-      <Skeleton rows={1} height="64px" />
+      <Skeleton rows={1} height="56px" />
     {:else}
-    <header class="detail-head">
-      <div class="refresh-slot">
-        <Freshness
-          fetchedAt={view.fetchedAt}
-          revalidating={view.revalidating || timelineView.revalidating}
-        />
-        <RefreshButton
-          onclick={refresher.run}
-          loading={refresher.busy || view.revalidating || timelineView.revalidating}
-        />
-      </div>
-      <div class="id-row">
-        <h1 class="session-id mono">{s.session_id}</h1>
-        <CopyButton value={s.session_id} size="sm" />
-      </div>
-      <div class="meta-row">
-        {#if s.distinct_id}
-          <a class="meta-link mono" href={`#/persons/${encodeURIComponent(s.distinct_id)}`}>
-            <Icon name="user" size={14} />{s.distinct_id}
-          </a>
-        {:else}
-          <span class="meta-static muted"><Icon name="user" size={14} />anonymous</span>
-        {/if}
-        {#if s.device_key}
-          <a class="meta-link mono" href={`#/devices/${encodeURIComponent(s.device_key)}`}>
-            <Icon name="monitor" size={14} />{s.device_key}
-          </a>
-        {/if}
-        {#if s.release}<Badge tone="neutral" size="sm">release {s.release}</Badge>{/if}
-        {#if s.environment_id}
-          <span class="meta-static faint mono">env {s.environment_id}</span>
-        {/if}
-      </div>
-    </header>
 
     <StatTiles min={160}>
       <StatTile label={t('explore.column.duration')} value={formatDuration(durationMs)} />
@@ -287,11 +300,18 @@
         value={formatNumber(s.errors_count)}
         tone={s.errors_count > 0 ? 'error' : 'neutral'}
       />
-      <StatTile label={t('explore.column.started')} value={formatDateTime(s.started_at)} />
+      <!-- A tile's value is plain text, so it cannot hold the TimeValue toggle;
+           it shows both halves of it instead — relative, with the exact
+           instant under it in TimeValue's own absolute format. -->
+      <StatTile
+        label={t('explore.column.started')}
+        value={relativeTime(s.started_at)}
+        sub={formatTimestamp(s.started_at)}
+      />
     </StatTiles>
     {/if}
 
-    <div class="grid">
+    <div class="detail-layout">
       <div class="col-main">
         <Card title={t('session.card.timeline')}>
           {#snippet actions()}
@@ -309,12 +329,12 @@
               variant="ghost"
               size="sm"
               title={timeMode === 'delta'
-                ? 'Showing time since the previous entry — click to measure from the session start'
-                : 'Showing time since the session started — click to measure from the previous entry'}
+                ? t('session.timeMode.deltaTitle')
+                : t('session.timeMode.startTitle')}
               onclick={() => (timeMode = timeMode === 'delta' ? 'session' : 'delta')}
             >
               <Icon name="clock" size={14} />
-              {timeMode === 'delta' ? 'Since previous' : 'Since start'}
+              {timeMode === 'delta' ? t('timeline.mode.sincePrevious') : t('session.timeMode.sinceStart')}
             </Button>
           {/snippet}
           <!-- Hidden for an empty session: with every count at zero the strip
@@ -336,7 +356,7 @@
                 {timeMode}
                 onslice={pushSlice}
                 emptyLabel={timelineFiltered
-                  ? 'No entries match the selected filters.'
+                  ? t('common.empty.match', { things: t('timeline.things.entries') })
                   : undefined}
               />
             {/if}
@@ -350,7 +370,7 @@
           {:else if hasContext}
             <div class="ctx"><JsonTree value={s.context} expandTo={1} /></div>
           {:else}
-            <p class="muted empty-ctx">{t('session.noContext')}</p>
+            <EmptyState size="section" title={t('session.empty.context')} />
           {/if}
         </Card>
       </aside>
@@ -363,29 +383,20 @@
         <div class="slice-breadcrumbs">
           {#each sliceStack as tx, i}
             <button class="breadcrumb-btn" onclick={() => (sliceStack = sliceStack.slice(0, i + 1))}>
-              {tx.name || tx.op || 'transaction'}
+              {tx.name || tx.op || t('timeline.kind.transaction')}
             </button>
             {#if i < sliceStack.length - 1}
               <Icon name="chevron-right" size={12} />
             {/if}
           {/each}
         </div>
-        <div class="slice-toggles">
-          <Button
-            size="sm"
-            variant={sliceStartTime === 'occurred_at' ? 'primary' : 'secondary'}
-            onclick={() => (sliceStartTime = 'occurred_at')}
-          >
-            occurred_at
-          </Button>
-          <Button
-            size="sm"
-            variant={sliceStartTime === 'received_at' ? 'primary' : 'secondary'}
-            onclick={() => (sliceStartTime = 'received_at')}
-          >
-            received_at
-          </Button>
-        </div>
+        <SegmentedControl
+          size="sm"
+          ariaLabel={t('session.slice.measureFrom')}
+          options={sliceOptions}
+          value={sliceStartTime}
+          onchange={(v) => (sliceStartTime = v as 'occurred_at' | 'received_at')}
+        />
       </div>
       <div class="slice-timeline">
         <!-- The slice deliberately ignores the category filter — it answers
@@ -398,83 +409,28 @@
           startedAt={sliceStack[sliceStack.length - 1][sliceStartTime]}
           timeMode="delta"
           onslice={pushSlice}
-          emptyLabel="Nothing else was recorded while this transaction was open."
+          emptyLabel={t('session.slice.empty')}
         />
       </div>
     {/if}
   </Modal>
 
 <style>
-  .refresh-slot {
-    float: right;
-    margin-inline-start: 12px;
+  /* Links in the header's meta line: plain muted text with an icon, not pills. */
+  .meta-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--text-muted);
+  }
+  a.meta-link:hover {
+    color: var(--text);
+    text-decoration: underline;
   }
 
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-    margin-bottom: 16px;
-  }
-  .back:hover {
-    color: var(--text);
-  }
-  .detail-head {
-    margin-bottom: 20px;
-  }
-  .id-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-  .session-id {
-    font-size: 20px;
-    font-weight: 640;
-    word-break: break-all;
-  }
-  .meta-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-top: 10px;
-    flex-wrap: wrap;
-  }
-  .meta-link,
-  .meta-static {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    max-width: 320px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding: 4px 10px;
-    border-radius: var(--radius-pill);
-    border: 1px solid var(--border);
-    background: var(--surface-2);
-  }
-  .meta-link {
-    color: var(--text-muted);
-    text-decoration: none;
-    transition: color 0.12s ease, border-color 0.12s ease;
-  }
-  .meta-link:hover {
-    color: var(--primary);
-    border-color: var(--primary-border);
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 340px;
-    gap: 18px;
-    align-items: start;
-    margin-top: 20px;
+  /* The rail layout itself is the shared `.detail-layout` (app.css). */
+  .detail-layout {
+    margin-top: var(--page-gap);
   }
   .col-main {
     min-width: 0;
@@ -482,13 +438,10 @@
   .col-side {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--page-gap);
   }
   .ctx {
     overflow-x: auto;
-  }
-  .empty-ctx {
-    font-size: 13px;
   }
   .slice-header {
     display: flex;
@@ -504,7 +457,7 @@
     align-items: center;
     gap: 6px;
     flex-wrap: wrap;
-    font-size: 13px;
+    font-size: var(--text-sm);
   }
   .breadcrumb-btn {
     background: none;
@@ -516,15 +469,5 @@
   }
   .breadcrumb-btn:hover {
     background: var(--surface-3);
-  }
-  .slice-toggles {
-    display: flex;
-    gap: 8px;
-  }
-
-  @media (max-width: 960px) {
-    .grid {
-      grid-template-columns: 1fr;
-    }
   }
 </style>

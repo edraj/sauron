@@ -62,13 +62,13 @@
   .list-toolbar {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    margin-bottom: 16px;
+    gap: 8px;
+    margin-bottom: 14px;
   }
   .row {
     display: flex;
     align-items: flex-start;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
   }
   .slot {
@@ -86,6 +86,11 @@
   }
   .slot.search > :global(*) {
     width: 100%;
+  }
+  /* The window slot can hold two controls (a release-mode toggle beside a
+     `TimeFilter`); on a phone they stack rather than push the page sideways. */
+  .slot.range {
+    flex-wrap: wrap;
   }
   /* Keeps the actions at the end of the line even when a page has no search
      slot, or when the row wraps and the actions land on a line of their own. */

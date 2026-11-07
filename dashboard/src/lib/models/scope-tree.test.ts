@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   EMPTY_SELECTION,
+  countLabel,
   isEmptySelection,
   isImpliedByAncestor,
   projectCheckState,
@@ -236,5 +237,18 @@ describe('isImpliedByAncestor with environments', () => {
 
   it('does not imply an env when no grandparentId is supplied and no app is ticked', () => {
     expect(isImpliedByAncestor({ org: false, projects: [], apps: [], envs: [] }, 'env', 'app-1')).toBe(false);
+  });
+});
+
+describe('countLabel', () => {
+  // The tree's "3 apps" hints and the selection summary read through this one
+  // helper, so the two cannot disagree on the wording or the number format.
+  it('picks the singular key for exactly one', () => {
+    expect(countLabel(1, 'scope.summary.appOne', 'scope.summary.appMany')).toBe('1 app');
+  });
+
+  it('picks the plural key and formats the number otherwise', () => {
+    expect(countLabel(1234, 'scope.summary.envOne', 'scope.summary.envMany')).toBe('1,234 environments');
+    expect(countLabel(2, 'scope.summary.appOne', 'scope.summary.appMany')).toBe('2 apps');
   });
 });

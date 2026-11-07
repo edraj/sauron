@@ -1,4 +1,5 @@
 import type { AuditEntry, AuditFilters } from '../api/audit';
+import { t, type MessageKey } from '../i18n';
 
 /**
  * Presentation rules for the Wall of Shame.
@@ -11,58 +12,76 @@ import type { AuditEntry, AuditFilters } from '../api/audit';
 /** How prominently an action should read in the feed. */
 export type ActionTone = 'destructive' | 'credential' | 'neutral';
 
-/** `entity.verb` → human phrase. Verb half only; the entity half is derived. */
-const VERBS: Record<string, string> = {
-  create: 'Created',
-  update: 'Updated',
-  delete: 'Deleted',
-  retire: 'Retired',
-  activate: 'Activated',
-  deactivate: 'Deactivated',
-  reset_password: 'Reset password for',
-  email_change_request: 'Requested an email change for',
-  email_change_approved: 'Confirmed a new email for',
-  email_change_cancelled: 'Cancelled an email change for',
-  revoke_sessions: 'Revoked sessions for',
-  rotate_key: 'Rotated ingest key for',
-  enrollment_update: 'Updated enrollment for',
-  upload: 'Uploaded',
-  upsert: 'Configured',
-  sync: 'Queued sync for',
-  test: 'Sent test through',
-  reveal: 'Revealed PII in',
-  mask: 'Masked PII in',
-  mask_preview: 'Previewed PII mask for',
-  release: 'Released',
-  extend: 'Extended',
-  // Auth. These read as complete phrases on their own — see the `auth`
-  // special case in `describeAction`.
-  login: 'Signed in',
-  login_failed: 'Failed sign-in',
-  logout: 'Signed out',
-  password_change: 'Changed own password',
+/**
+ * `entity.verb` → catalog key for the phrase, with a `{noun}` slot the entity
+ * half fills. A template per verb, not a verb glued to a noun, so each
+ * language places the noun where its grammar wants it.
+ *
+ * Keys rather than strings throughout this file: these are module-level
+ * tables, and a `t()` call here would freeze the language at import time.
+ */
+const VERBS: Record<string, MessageKey> = {
+  create: 'audit.verb.create',
+  update: 'audit.verb.update',
+  delete: 'audit.verb.delete',
+  retire: 'audit.verb.retire',
+  activate: 'audit.verb.activate',
+  deactivate: 'audit.verb.deactivate',
+  reset_password: 'audit.verb.resetPassword',
+  email_change_request: 'audit.verb.emailChangeRequest',
+  email_change_approved: 'audit.verb.emailChangeApproved',
+  email_change_cancelled: 'audit.verb.emailChangeCancelled',
+  revoke_sessions: 'audit.verb.revokeSessions',
+  rotate_key: 'audit.verb.rotateKey',
+  enrollment_update: 'audit.verb.enrollmentUpdate',
+  upload: 'audit.verb.upload',
+  upsert: 'audit.verb.upsert',
+  sync: 'audit.verb.sync',
+  test: 'audit.verb.test',
+  reveal: 'audit.verb.reveal',
+  mask: 'audit.verb.mask',
+  mask_preview: 'audit.verb.maskPreview',
+  release: 'audit.verb.release',
+  extend: 'audit.verb.extend',
 };
 
-/** `entity_type`/entity half → the noun shown after the verb. */
-const NOUNS: Record<string, string> = {
-  org: 'organization',
-  project: 'project',
-  app: 'app',
-  environment: 'environment',
-  member: 'member',
-  role: 'role',
-  grant: 'access grant',
-  alert_rule: 'alert rule',
-  alert_channel: 'alert channel',
-  monitor: 'monitor',
-  artifact: 'artifact',
-  store: 'store connection',
-  inspector_policy: 'privacy policy',
-  tier_policy: 'tier policy',
-  tier_restore: 'cold-data restore',
-  tier_pin: 'restore pin',
-  pii: 'data',
+/**
+ * `auth.verb` → complete phrase. Auth actions are about the actor, not about a
+ * thing they acted on, so they carry no noun — "Signed in", not "Signed in
+ * auth".
+ */
+const AUTH_VERBS: Record<string, MessageKey> = {
+  login: 'audit.auth.login',
+  login_failed: 'audit.auth.loginFailed',
+  logout: 'audit.auth.logout',
+  password_change: 'audit.auth.passwordChange',
 };
+
+/** `entity_type`/entity half → the noun shown in the verb's `{noun}` slot. */
+const NOUNS: Record<string, MessageKey> = {
+  org: 'audit.noun.org',
+  project: 'audit.noun.project',
+  app: 'audit.noun.app',
+  environment: 'audit.noun.environment',
+  member: 'audit.noun.member',
+  role: 'audit.noun.role',
+  grant: 'audit.noun.grant',
+  alert_rule: 'audit.noun.alertRule',
+  alert_channel: 'audit.noun.alertChannel',
+  monitor: 'audit.noun.monitor',
+  artifact: 'audit.noun.artifact',
+  store: 'audit.noun.store',
+  inspector_policy: 'audit.noun.inspectorPolicy',
+  tier_policy: 'audit.noun.tierPolicy',
+  tier_restore: 'audit.noun.tierRestore',
+  tier_pin: 'audit.noun.tierPin',
+  pii: 'audit.noun.pii',
+};
+
+/** Own-property lookup, so an action like `constructor.toString` cannot hit `Object.prototype`. */
+function lookup(table: Record<string, MessageKey>, key: string): MessageKey | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
 
 /**
  * Actions that destroy something or move a credential.
@@ -99,6 +118,7 @@ export interface DescribedAction {
 
 /**
  * Turn `environment.rotate_key` into "Rotated ingest key for environment".
+ * Translated on each call — call it from markup or a `$derived`.
  *
  * Falls back to the raw action string rather than throwing or rendering
  * "undefined": a backend that adds an action before the dashboard learns
@@ -118,13 +138,14 @@ export function describeAction(action: string): DescribedAction {
       ? 'credential'
       : 'neutral';
 
-  const verbLabel = VERBS[verb];
-  // Auth actions are about the actor, not about a thing they acted on, so they
-  // carry no noun — "Signed in", not "Signed in auth".
-  if (entity === 'auth') return { label: verbLabel ?? action, tone };
-  const noun = NOUNS[entity];
-  if (!verbLabel || !noun) return { label: action, tone };
-  return { label: `${verbLabel} ${noun}`, tone };
+  if (entity === 'auth') {
+    const phrase = lookup(AUTH_VERBS, verb);
+    return { label: phrase ? t(phrase) : action, tone };
+  }
+  const verbKey = lookup(VERBS, verb);
+  const nounKey = lookup(NOUNS, entity);
+  if (!verbKey || !nounKey) return { label: action, tone };
+  return { label: t(verbKey, { noun: t(nounKey) }), tone };
 }
 
 /** `interval_seconds` → "Interval seconds". */
@@ -142,9 +163,9 @@ export function formatFieldName(field: string): string {
  */
 export function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '—';
-  if (typeof value === 'boolean') return value ? 'yes' : 'no';
-  if (typeof value === 'string') return value === '' ? '(empty)' : value;
-  if (Array.isArray(value)) return value.length === 0 ? '(none)' : value.join(', ');
+  if (typeof value === 'boolean') return value ? t('audit.value.yes') : t('audit.value.no');
+  if (typeof value === 'string') return value === '' ? t('audit.value.empty') : value;
+  if (Array.isArray(value)) return value.length === 0 ? t('audit.value.none') : value.join(', ');
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
 }

@@ -27,7 +27,7 @@
         {#if item.locked}
           <button type="button" class="item locked" use:lockTip={item.locked}>
             <Icon name={item.icon} size={15} />
-            <span>{item.label}</span>
+            <span>{t(item.labelKey)}</span>
             <span class="lk" aria-hidden="true"><Icon name="lock" size={12} /></span>
           </button>
         {:else}
@@ -38,7 +38,7 @@
             aria-current={$location.startsWith(item.href) ? 'page' : undefined}
           >
             <Icon name={item.icon} size={15} />
-            <span>{item.label}</span>
+            <span>{t(item.labelKey)}</span>
           </a>
         {/if}
       {/each}
@@ -61,11 +61,11 @@
     /* Below the topbar, not at viewport 0. The topbar is itself sticky and
        paints over this column, so `top: 0` parks the first rail item
        underneath it. Same offset the Docs table of contents uses. */
-    top: calc(var(--topbar-h) + 16px);
+    top: calc(var(--topbar-offset) + 16px);
     align-self: start;
     /* A rail taller than the viewport has to scroll on its own, or its lower
        entries become unreachable once it is pinned. */
-    max-height: calc(100vh - var(--topbar-h) - 32px);
+    max-height: calc(100vh - var(--topbar-offset) - 32px);
     overflow-y: auto;
   }
   .item {
@@ -74,7 +74,7 @@
     gap: 9px;
     padding: 7px 10px;
     border-radius: var(--radius);
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     text-decoration: none;
   }
@@ -90,7 +90,7 @@
     border: 0;
     background: none;
     font: inherit;
-    font-size: 13px;
+    font-size: var(--text-sm);
     text-align: start;
     cursor: not-allowed;
     opacity: 0.5;
@@ -113,7 +113,7 @@
   .item.active {
     background: var(--surface-2);
     color: var(--text);
-    font-weight: 560;
+    font-weight: var(--weight-medium);
   }
   .body {
     min-width: 0;

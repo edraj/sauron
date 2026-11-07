@@ -1,8 +1,9 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { replace } from 'svelte-spa-router';
+  import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
-  import Card from '../lib/components/ui/Card.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -35,7 +36,7 @@
     saving = true;
     try {
       await authStore.applyPasswordChange(currentPassword, newPassword);
-      toastStore.success('Password updated.');
+      toastStore.success(t('auth.change.toast.updated'));
       replace('/overview');
     } catch (err) {
       error = errorMessage(err);
@@ -44,6 +45,8 @@
     }
   }
 
+  // A button, not a link: signing out is an action. As a link, "open in new
+  // tab" skipped the handler and opened /login while still signed in.
   async function signOut() {
     await authStore.logout();
     sessionStore.reset();
@@ -51,138 +54,51 @@
   }
 </script>
 
-<div class="cp">
-  <header class="cp-top">
-    <div class="brand">
-      <span class="mark" aria-hidden="true"><span class="eye"></span></span>
-      <span class="name">Sauron</span>
-    </div>
-    <button class="link" onclick={signOut}>{t('auth.signOut')}</button>
-  </header>
+<AuthLayout title={t('auth.change.title')} subtitle={t('auth.change.temporary')}>
+  <form class="form" onsubmit={submit}>
+    {#if error}<InlineNotice tone="error">{error}</InlineNotice>{/if}
+    <Input
+      label={t('auth.password.current')}
+      type="password"
+      bind:value={currentPassword}
+      autocomplete="current-password"
+      required
+    />
+    <Input
+      label={t('auth.password.new')}
+      type="password"
+      bind:value={newPassword}
+      autocomplete="new-password"
+      hint={tooShort || reused ? undefined : t('auth.password.hint.minLength')}
+      error={tooShort
+        ? t('auth.password.error.tooShort')
+        : reused
+          ? t('auth.password.error.reused')
+          : undefined}
+      required
+    />
+    <Input
+      label={t('auth.password.confirm')}
+      type="password"
+      bind:value={confirmPassword}
+      autocomplete="new-password"
+      error={mismatch ? t('auth.password.error.mismatch') : undefined}
+      required
+    />
+    <Button type="submit" variant="primary" size="lg" fullWidth disabled={!canSubmit} loading={saving}>
+      {t('auth.change.submit')}
+    </Button>
+  </form>
 
-  <div class="cp-body">
-    <div class="intro">
-      <h1>{t('auth.change.title')}</h1>
-      <p class="lead">
-        {t('auth.change.temporary')}
-      </p>
-    </div>
-
-    <Card>
-      <form class="cp-form" onsubmit={submit}>
-        {#if error}<div class="alert" role="alert">{error}</div>{/if}
-        <Input
-          label={t('auth.password.current')}
-          type="password"
-          bind:value={currentPassword}
-          autocomplete="current-password"
-          required
-        />
-        <Input
-          label={t('auth.password.new')}
-          type="password"
-          bind:value={newPassword}
-          autocomplete="new-password"
-          hint={tooShort || reused ? undefined : 'At least 8 characters.'}
-          error={tooShort
-            ? 'Must be at least 8 characters.'
-            : reused
-              ? 'Must be different from your current password.'
-              : undefined}
-          required
-        />
-        <Input
-          label={t('auth.password.confirm')}
-          type="password"
-          bind:value={confirmPassword}
-          autocomplete="new-password"
-          error={mismatch ? 'Passwords do not match.' : undefined}
-          required
-        />
-        <Button type="submit" variant="primary" size="lg" fullWidth disabled={!canSubmit} loading={saving}>
-          {t('auth.change.submit')}
-        </Button>
-      </form>
-    </Card>
-  </div>
-</div>
+  {#snippet footer()}
+    <Button variant="ghost" size="sm" onclick={signOut}>{t('auth.signOut')}</Button>
+  {/snippet}
+</AuthLayout>
 
 <style>
-  .cp {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
-  .cp-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .mark {
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-    background: radial-gradient(circle at 50% 45%, #ffe08a 0%, #f5a623 45%, #e0524a 100%);
-    display: grid;
-    place-items: center;
-  }
-  .eye {
-    width: 5px;
-    height: 15px;
-    background: #0a0c10;
-    border-radius: 50%;
-  }
-  .name {
-    font-weight: 700;
-    font-size: 16px;
-  }
-  .link {
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-  }
-  .link:hover {
-    color: var(--text);
-    text-decoration: underline;
-  }
-  .cp-body {
-    flex: 1;
-    width: 100%;
-    max-width: 460px;
-    margin: 0 auto;
-    padding: 48px 22px 64px;
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    animation: fade-in 0.25s ease;
-  }
-  .intro h1 {
-    font-size: 25px;
-  }
-  .lead {
-    color: var(--text-muted);
-    margin-top: 8px;
-    font-size: 14px;
-  }
-  .cp-form {
+  .form {
     display: flex;
     flex-direction: column;
     gap: 16px;
-  }
-  .alert {
-    padding: 10px 12px;
-    border-radius: var(--radius);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
-    color: var(--error);
-    font-size: 13px;
   }
 </style>

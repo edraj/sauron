@@ -1,4 +1,4 @@
-import { formatNumber } from '../i18n';
+import { formatNumber, t } from '../i18n';
 /**
  * The label/value rows that describe a single span, and the SDK-truncation
  * probe that goes with them.
@@ -48,50 +48,57 @@ export interface DetailRow {
  * (`serialize_masked_ip`) and nulls it for a caller without `event:read`, so
  * the value here is at best a truncated address and at worst a blank field
  * that reads as "no IP recorded".
+ *
+ * Labels are translated on each call, so call this from markup (as
+ * `TransactionDetailPanel` does) and a language switch re-renders them.
  */
-export function detailRows(t: Transaction): DetailRow[] {
+export function detailRows(tx: Transaction): DetailRow[] {
   return [
-    { label: 'Name', value: t.name, mono: true },
-    { label: 'Operation', value: t.op },
-    { label: 'Duration', value: `${formatNumber(t.duration_ms)} ms` },
-    { label: 'Status', value: t.status },
-    { label: 'HTTP method', value: t.http_method },
-    { label: 'HTTP status', value: t.http_status == null ? null : String(t.http_status) },
-    { label: 'URL', value: t.url, mono: true, wide: true },
+    { label: t('tx.field.name'), value: tx.name, mono: true },
+    { label: t('tx.field.operation'), value: tx.op },
+    // `ms` is a unit symbol, the same in both locales.
+    { label: t('tx.field.duration'), value: `${formatNumber(tx.duration_ms)} ms` },
+    { label: t('tx.field.status'), value: tx.status },
+    { label: t('tx.field.httpMethod'), value: tx.http_method },
     {
-      label: 'User',
-      value: t.distinct_id,
-      href: t.distinct_id ? `#/persons/${encodeURIComponent(t.distinct_id)}` : undefined,
+      label: t('tx.field.httpStatus'),
+      value: tx.http_status == null ? null : String(tx.http_status),
+    },
+    { label: t('tx.field.url'), value: tx.url, mono: true, wide: true },
+    {
+      label: t('tx.field.user'),
+      value: tx.distinct_id,
+      href: tx.distinct_id ? `#/persons/${encodeURIComponent(tx.distinct_id)}` : undefined,
       mono: true,
     },
     {
-      label: 'Session',
-      value: t.session_id,
-      href: t.session_id ? `#/sessions/${encodeURIComponent(t.session_id)}` : undefined,
+      label: t('tx.field.session'),
+      value: tx.session_id,
+      href: tx.session_id ? `#/sessions/${encodeURIComponent(tx.session_id)}` : undefined,
       mono: true,
     },
     {
-      label: 'Device',
-      value: t.device_key,
-      href: t.device_key ? `#/devices/${encodeURIComponent(t.device_key)}` : undefined,
+      label: t('tx.field.device'),
+      value: tx.device_key,
+      href: tx.device_key ? `#/devices/${encodeURIComponent(tx.device_key)}` : undefined,
       mono: true,
     },
-    { label: 'Release', value: t.release, mono: true },
-    { label: 'Workflow', value: t.workflow_name },
-    { label: 'Occurred at', value: t.occurred_at, mono: true },
+    { label: t('tx.field.release'), value: tx.release, mono: true },
+    { label: t('tx.field.workflow'), value: tx.workflow_name },
+    { label: t('tx.field.occurredAt'), value: tx.occurred_at, mono: true },
     // Both timestamps, always. The GAP between them is the interesting
     // number on a mobile SDK — a span that occurred hours before it arrived
     // came out of an offline queue, or off a device with a skewed clock, and
     // either fact changes how you read the one above.
-    { label: 'Received at', value: t.received_at, mono: true },
-    { label: 'Finished at', value: t.finished_at, mono: true },
-    { label: 'Transaction id', value: t.id, mono: true },
+    { label: t('tx.field.receivedAt'), value: tx.received_at, mono: true },
+    { label: t('tx.field.finishedAt'), value: tx.finished_at, mono: true },
+    { label: t('tx.field.id'), value: tx.id, mono: true },
   ];
 }
 
 /** The SDK capped this payload — the span is real, the blob is a marker. */
-export function isTruncated(t: Transaction): boolean {
-  return t.extra?._truncated === true;
+export function isTruncated(tx: Transaction): boolean {
+  return tx.extra?._truncated === true;
 }
 
 /**
@@ -101,8 +108,8 @@ export function isTruncated(t: Transaction): boolean {
  * serialized at all", which is a different fact from "it was too big" and
  * reads wrong as `-1 bytes`.
  */
-export function truncatedBytesLabel(t: Transaction): string {
-  const bytes = t.extra?._bytes;
+export function truncatedBytesLabel(tx: Transaction): string {
+  const bytes = tx.extra?._bytes;
   if (typeof bytes !== 'number' || bytes < 0) return 'the value could not be serialized';
   return `${formatNumber(bytes)} bytes`;
 }

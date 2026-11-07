@@ -32,12 +32,20 @@
   }
   let { counts, ops, filter, onchange }: Props = $props();
 
-  const LABEL: Record<RowCategory, string> = {
-    navigation: 'Navigation',
-    transaction: 'Transactions',
-    event: 'Events',
-    issue: 'Issues',
-  };
+  // `$derived` so a language switch reaches the chips.
+  const LABEL = $derived<Record<RowCategory, string>>({
+    navigation: t('timeline.category.navigation'),
+    transaction: t('timeline.category.transaction'),
+    event: t('timeline.category.event'),
+    issue: t('timeline.category.issue'),
+  });
+  /** The tooltip on a chip with nothing behind it in this session. */
+  const NONE = $derived<Record<RowCategory, string>>({
+    navigation: t('timeline.category.noneNavigation'),
+    transaction: t('timeline.category.noneTransaction'),
+    event: t('timeline.category.noneEvent'),
+    issue: t('timeline.category.noneIssue'),
+  });
 
   // The glyphs the timeline's own rail nodes use, so a chip and the rows it
   // admits read as one control rather than two vocabularies.
@@ -76,7 +84,7 @@
 
   /** `''` is the blank-op bucket, not a missing value — see `transactionOp`. */
   function opLabel(op: string): string {
-    return op === '' ? '(none)' : op;
+    return op === '' ? t('timeline.filter.noOp') : op;
   }
 </script>
 
@@ -101,7 +109,7 @@
         aria-pressed={filter.categories.has(c)}
         class:on={filter.categories.has(c)}
         disabled={counts[c] === 0}
-        title={counts[c] === 0 ? `No ${LABEL[c].toLowerCase()} in this session` : undefined}
+        title={counts[c] === 0 ? NONE[c] : undefined}
       >
         <Icon name={ICON[c]} size={12} />
         {LABEL[c]}
@@ -112,7 +120,7 @@
 
   {#if showOps}
     <div class="tf-row ops" role="group" aria-label={t('ui.timeline.filterByOp')}>
-      <span class="ops-label">op</span>
+      <span class="ops-label">{t('timeline.filter.op')}</span>
       {#each ops as o (o.op)}
         <!-- Named explicitly rather than left to name-from-contents: an op chip
              has no bare text node, only two spans, and "(none)" in particular
@@ -123,7 +131,7 @@
           type="button"
           onclick={() => toggleOp(o.op)}
           aria-pressed={filter.ops.has(o.op)}
-          aria-label={`op ${opLabel(o.op)}, ${o.count}`}
+          aria-label={t('timeline.filter.opAria', { op: opLabel(o.op), n: o.count })}
           class:on={filter.ops.has(o.op)}
         >
           <span class="mono">{opLabel(o.op)}</span>
@@ -157,10 +165,8 @@
     background: var(--border);
   }
   .ops-label {
-    font-size: 10px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-faint);
     padding-inline-start: 3px;
   }
@@ -169,8 +175,8 @@
     align-items: center;
     gap: 6px;
     padding: 4px 10px;
-    font-size: 12px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     /* The border width is constant across every state and only its COLOUR
        changes: swapping to `border: none` when a chip lights up would shift
        every chip after it by 2px on each click. */
@@ -189,15 +195,14 @@
     cursor: default;
   }
   .count {
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: currentColor;
     opacity: 0.7;
   }
   .all[aria-pressed='true'] {
-    background: var(--surface);
+    background: var(--surface-3);
     color: var(--text);
-    box-shadow: var(--shadow-sm);
     opacity: 1;
   }
   /* Lit chips borrow the tone of the row badge they admit, so the strip carries

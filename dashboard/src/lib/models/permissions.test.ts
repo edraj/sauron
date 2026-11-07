@@ -5,7 +5,13 @@ import fs from 'node:fs';
 // @ts-expect-error -- no @types/node in this project; the Node runtime that
 // executes vitest provides this builtin regardless.
 import path from 'node:path';
-import { ALL_PERMISSIONS, PERMISSION_GROUPS, PERMISSION_LABELS } from './permissions';
+import {
+  ALL_PERMISSIONS,
+  PERMISSION_GROUPS,
+  PERMISSION_LABELS,
+  PERMISSION_LABEL_KEYS,
+  permissionLabel,
+} from './permissions';
 
 // This test parses perm::ALL straight out of the backend source instead of
 // comparing against a hand-copied list. A hand-copied list only catches drift
@@ -118,5 +124,17 @@ describe('permission catalog', () => {
     for (const p of ALL_PERMISSIONS) {
       expect(PERMISSION_LABELS[p], `missing label for ${p}`).toBeTruthy();
     }
+  });
+
+  // The lock tooltip reads the catalog copy; the role editor reads the English
+  // table. Same English in both, or one of them is describing a permission
+  // the other has since reworded.
+  it('gives every permission a catalog label whose English matches PERMISSION_LABELS', () => {
+    for (const p of ALL_PERMISSIONS) {
+      expect(PERMISSION_LABEL_KEYS[p], `missing catalog key for ${p}`).toBeTruthy();
+      expect(permissionLabel(p), p).toBe(PERMISSION_LABELS[p]);
+    }
+    expect(Object.keys(PERMISSION_LABEL_KEYS).sort()).toEqual([...ALL_PERMISSIONS].sort());
+    expect(permissionLabel('future:permission')).toBeUndefined();
   });
 });

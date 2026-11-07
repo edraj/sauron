@@ -4,6 +4,7 @@
  * tested without a DOM (the dashboard's vitest runs on the node environment).
  */
 import type { TimelineItem, Transaction } from './index';
+import { t } from '../i18n';
 
 /** The badge shown at the head of a timeline row. */
 export type RowKind = 'navigation' | 'http' | 'event' | 'error' | 'transaction';
@@ -228,7 +229,7 @@ export function rowTitle(item: TimelineItem): string {
       if (e.exception_type) {
         return e.exception_value ? `${e.exception_type}: ${e.exception_value}` : e.exception_type;
       }
-      return e.message ?? 'Error';
+      return e.message ?? t('level.error');
     }
     case 'transaction':
       return httpTitle(item.transaction);

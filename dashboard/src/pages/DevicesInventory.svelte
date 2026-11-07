@@ -1,10 +1,12 @@
 <script lang="ts">
   import { t } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
-  import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import Badge from '../lib/components/ui/Badge.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
   import DeviceFlatTable from '../lib/components/devices/DeviceFlatTable.svelte';
   import DeviceGroupTable from '../lib/components/devices/DeviceGroupTable.svelte';
@@ -53,10 +55,15 @@
    * always meant here, it is the only form an index can serve, and it is the
    * OPPOSITE of what the Users list means by the same words.
    */
-  const TIME_FIELDS: TimeField[] = [
-    { key: 'last_seen', label: 'Last seen' },
-    { key: 'first_seen', label: 'First seen' },
+  const STATIC_TIME_FIELDS: TimeField[] = [
+    { key: 'last_seen', label: 'last_seen' },
+    { key: 'first_seen', label: 'first_seen' },
   ];
+  /** The same fields with their labels, derived so they follow a language switch. */
+  const TIME_FIELDS: TimeField[] = $derived([
+    { key: 'last_seen', label: t('explore.column.lastSeen') },
+    { key: 'first_seen', label: t('explore.column.firstSeen') },
+  ]);
   const DEFAULT_TIME_FIELD = 'last_seen';
   const DEFAULT_DAYS = 30;
 
@@ -72,7 +79,7 @@
   let timeFilter = $state<TimeFilterState>(
     fromParams(
       new URLSearchParams($querystring ?? ''),
-      TIME_FIELDS,
+      STATIC_TIME_FIELDS,
       DEFAULT_TIME_FIELD,
       DEFAULT_DAYS,
     ),
@@ -370,9 +377,6 @@
     }
   });
 
-  function backToGroups() {
-    replace('/devices');
-  }
 
   async function refresh() {
     const aid = sessionStore.currentAppId;
@@ -395,26 +399,35 @@
 
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('devices.title')}</h1>
-      <p class="muted sub">{t('devices.subtitle')}</p>
-    </div>
-  </div>
+  <!--
+    In a drill-down the header grows the back link and the group as a badge.
+    The back link is above the loading/error/empty chain below, on purpose: a
+    search or window narrowing can empty out or error a drill-down, and it is
+    the ONLY way back to the grouped view short of the browser's own Back.
 
-  <!-- The list toolbar: every control that narrows or reloads the table, in
-       the one arrangement all list pages share (`ListToolbar`). It used to sit
-       in the page header beside the title, which no other list page does. -->
-  <ListToolbar>
-    {#snippet searchBox()}
-      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('devices.search')} />
+    `groupKey` alongside `!grouped` is not redundant despite `grouped` being
+    derived from it (`grouped = groupKey === null`): Svelte's `{#if}` doesn't
+    narrow `groupKey`'s type from the truthiness of a separate `grouped`
+    variable, so `groupLabel(groupKey)` below needs its own null check to
+    type-check. Do not simplify this to `{#if !grouped}`.
+  -->
+  {#snippet groupBadge()}
+    {#if groupKey}<Badge tone="neutral">{groupLabel(groupKey)}</Badge>{/if}
+  {/snippet}
+
+  <PageHeader
+    title={t('devices.title')}
+    subtitle={t('devices.subtitle')}
+    back={!grouped && groupKey ? { label: t('nav.devices'), href: '#/devices' } : undefined}
+    badge={!grouped && groupKey ? groupBadge : undefined}
+  >
+    {#snippet freshness()}
+      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
     {/snippet}
-    {#snippet timeWindow()}
-      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
     {/snippet}
     {#snippet actions()}
-      <Freshness fetchedAt={pageFreshness.fetchedAt} revalidating={pageFreshness.revalidating} />
-      <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing || revalidating} />
       <Button
         variant="secondary"
         disabled={rowCount === 0}
@@ -425,61 +438,31 @@
         {t('explore.exportCsv')}
       </Button>
     {/snippet}
+  </PageHeader>
+
+  <!-- The list toolbar: every control that narrows the table, in the one
+       arrangement all list pages share (`ListToolbar`). -->
+  <ListToolbar>
+    {#snippet searchBox()}
+      <SearchInput bind:value={query} onsearch={onSearch} placeholder={t('devices.search')} />
+    {/snippet}
+    {#snippet timeWindow()}
+      <TimeFilter fields={TIME_FIELDS} value={timeFilter} onchange={onTimeFilter} />
+    {/snippet}
   </ListToolbar>
 
-  <!--
-    Hoisted above the loading/error/empty/loaded chain below, on purpose: a
-    search or date-range narrowing can empty out or error a drill-down, and
-    the crumb is the ONLY way back to the grouped view short of the browser's
-    own Back button. Keeping it inside the `{:else}` (loaded-with-rows) branch
-    would strand the user in exactly that case.
-
-    `groupKey` alongside `!grouped` is not redundant despite `grouped` being
-    derived from it (`grouped = groupKey === null`): Svelte's `{#if}` doesn't
-    narrow `groupKey`'s type from the truthiness of a separate `grouped`
-    variable, so `groupLabel(groupKey)` below needs its own null check to
-    type-check. Do not simplify this to `{#if !grouped}`.
-  -->
-  {#if !grouped && groupKey}
-    <div class="crumb">
-      <button class="back" onclick={backToGroups} type="button">
-        <Icon name="arrow-left" size={14} />
-        {t('devices.all')}
-      </button>
-      <span class="chip">{groupLabel(groupKey)}</span>
-    </div>
-  {/if}
-
   {#if error && rowCount === 0}
-    <Card>
-      <EmptyState title={t('devices.error.load')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) load(aid, timeFilter, search, sortParam(list.sort), list.offset);
-            }}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('devices.error.load')} error={view} onretry={() => { void totalRows.reload(); void view.reload(); }} />
   {:else if loading && rowCount === 0}
     <Skeleton rows={6} />
   {:else if rowCount === 0}
-    <Card>
-      <EmptyState
-        title={grouped ? 'No devices found' : 'No devices in this group'}
-        description={search
-          ? `No devices match “${search}”.`
-          : grouped
-            ? 'No device telemetry has been reported in this window yet.'
-            : 'This model and OS has no devices in the selected window.'}
-        icon="monitor"
-      />
-    </Card>
+    <EmptyState
+      title={search
+        ? t('common.empty.match', { things: t('devices.things') })
+        : t('common.empty.range', { things: t('devices.things') })}
+      description={search ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
+      icon="monitor"
+    />
   {:else}
     {#if grouped}
       <DeviceGroupTable rows={groups} sort={list.sort} {onsort} />
@@ -500,45 +483,3 @@
       onchange={(o) => (list = setOffsetPage(list, o))}
     />
   {/if}
-
-<style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .crumb {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
-  }
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 13px;
-    padding: 0;
-  }
-  .back:hover {
-    color: var(--text);
-  }
-  .chip {
-    font-size: 12.5px;
-    color: var(--text-muted);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 3px 8px;
-  }
-</style>

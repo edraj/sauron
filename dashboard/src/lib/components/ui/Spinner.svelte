@@ -29,4 +29,11 @@
       transform: rotate(360deg);
     }
   }
+  /* Work in flight still shows, at half speed — the rate the refresh icons
+     use. app.css's reduced-motion rule exempts `.spinner` so this applies. */
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation-duration: 1.4s;
+    }
+  }
 </style>

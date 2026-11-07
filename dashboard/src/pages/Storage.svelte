@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
-  import { formatNumber } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { formatNumber, t, type MessageKey } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import {
     getAdminStorage,
@@ -20,6 +20,12 @@
     RestorableTable,
   } from '../lib/api/admin';
   import Button from '../lib/components/ui/Button.svelte';
+  import Input from '../lib/components/ui/Input.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import Badge from '../lib/components/ui/Badge.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
@@ -145,7 +151,9 @@
    * list, and the only route back was a page reload (the poll that could have
    * re-fetched runs only while a restore job is active).
    */
-  let policyLoadError = $state<string | null>(null);
+  // The caught error itself (not its message), so ErrorState can say what
+  // kind of failure it was — a 403 here is the common, expected case.
+  let policyLoadError = $state<unknown>(null);
   let policyActionError = $state<string | null>(null);
   let policyBusy = $state(false);
   let hotDaysInput = $state('');
@@ -206,7 +214,7 @@
       }
     } catch (e) {
       policy = null;
-      policyLoadError = (e as Error).message;
+      policyLoadError = e;
     }
   }
 
@@ -456,6 +464,25 @@
     return () => clearInterval(timer);
   });
 
+  const restoreTableOptions = RESTORABLE_TABLES.map((tbl) => ({ value: tbl, label: tbl }));
+
+  const JOB_STATUS: Record<string, { key: MessageKey; tone: 'neutral' | 'success' | 'error' }> = {
+    queued: { key: 'storage.job.queued', tone: 'neutral' },
+    running: { key: 'storage.job.running', tone: 'neutral' },
+    succeeded: { key: 'storage.job.succeeded', tone: 'success' },
+    failed: { key: 'storage.job.failed', tone: 'error' },
+    cancelled: { key: 'storage.job.cancelled', tone: 'error' },
+  };
+
+  /** "30 days", or "Off" for a retention of 0. */
+  function retentionDays(n: number): string {
+    return n === 0 ? t('storage.retentionOff') : t('storage.days', { n: formatNumber(n) });
+  }
+
+  function day(iso: string): string {
+    return new Date(iso).toISOString().slice(0, 10);
+  }
+
   function jobPercent(j: RestoreJob): number {
     if (j.status === 'succeeded') return 100;
     if (j.rows_estimated <= 0) return 0;
@@ -463,7 +490,7 @@
   }
 
   function fmtBytes(n: number): string {
-    if (n < 1024) return `${n} B`;
+    if (n < 1024) return `${formatNumber(n)} B`;
     const u = ['KB', 'MB', 'GB', 'TB'];
     let v = n / 1024, i = 0;
     while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
@@ -478,44 +505,40 @@
 </script>
 
 <AdminShell>
-  <div class="storage">
-    <header class="head">
-      <div>
-        <h1 class="page-title">
-          {t('storage.title')}
-          <Freshness
-            computedAt={envelope?.computed_at ?? null}
-            fetchedAt={view.fetchedAt}
-            revalidating={view.revalidating || status.computing}
-          />
-        </h1>
-        <!-- Wording tracks `full_scope`. When the caller manages every org there
-             is no other tenant to leak, so the figures are real physical bytes
-             (pg_database_size / pg_total_relation_size) and must NOT be called
-             estimates. Otherwise they are the physical size apportioned by row
-             share, which is still an estimate — just a far better one than the
-             old rows × avg_width, which omitted indexes, TOAST, page overhead
-             and bloat and so read several times low. -->
-        <p class="sub muted">
-          {#if report?.database.full_scope}
-            Actual storage on disk across the deployment, with per-app hot/cold record
-            counts. Postgres figures include indexes and overhead.
-          {:else}
-            Estimated storage across the organisations you manage, with per-app hot/cold
-            record counts.
-          {/if}
-        </p>
-      </div>
-      <div class="head-actions">
-        <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
-      </div>
-    </header>
+  <!-- Wording tracks `full_scope`. When the caller manages every org there is
+       no other tenant to leak, so the figures are real physical bytes
+       (pg_database_size / pg_total_relation_size) and must NOT be called
+       estimates. Otherwise they are the physical size apportioned by row share,
+       which is still an estimate — just a far better one than the old
+       rows × avg_width, which omitted indexes, TOAST, page overhead and bloat
+       and so read several times low. -->
+  <PageHeader
+    title={t('storage.title')}
+    subtitle={report?.database.full_scope
+      ? t('storage.subtitle.actual')
+      : t('storage.subtitle.estimated')}
+  >
+    {#snippet freshness()}
+      <Freshness
+        computedAt={envelope?.computed_at ?? null}
+        fetchedAt={view.fetchedAt}
+        revalidating={view.revalidating || status.computing}
+      />
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || view.revalidating} />
+    {/snippet}
+  </PageHeader>
 
-    {#if error}
-      <div class="err-banner" role="alert">
-        <Icon name="triangle-alert" size={15} />
-        <span>{error}</span>
-      </div>
+  <div class="storage">
+    {#if error && report}
+      <!-- A forced Refresh failed over a report we already had: it stays. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view.error ? view : error) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     {/if}
 
     {#if loading}
@@ -525,18 +548,23 @@
            aggregate walks pg_partition_tree over every partitioned table and
            is legitimately slow on a big deployment; a lone spinner reads as
            a hang exactly when the page is working hardest. -->
-      <Card><Skeleton rows={2} height="34px" /></Card>
-      <div class="section"><Card><Skeleton rows={4} /></Card></div>
-      <div class="section"><Card><Skeleton rows={7} /></Card></div>
+      <Skeleton rows={2} height="34px" />
+      <Card><Skeleton rows={4} /></Card>
+      <Card><Skeleton rows={7} /></Card>
+    {:else if error && !report}
+      <ErrorState
+        title={t('common.couldntLoad', { thing: t('storage.thing') })}
+        error={view.error ? view : error}
+        onretry={refresher.run}
+      />
     {:else if report}
       {@const rep = report}
       {@const dbBytes = rep.database.physical_bytes ?? rep.database.total_bytes}
       {@const coldBytes = rep.database.cold_bytes ?? 0}
       <StatTiles min={180}>
         <StatTile
-          label={rep.database.full_scope ? 'Database (Postgres)' : 'Estimated size'}
+          label={rep.database.full_scope ? t('storage.stat.database') : t('storage.stat.estimated')}
           value={fmtBytes(dbBytes)}
-          tone="primary"
         />
         <StatTile label={t('storage.stat.cold')} value={fmtBytes(coldBytes)} />
         <StatTile label={t('common.total')} value={fmtBytes(dbBytes + coldBytes)} />
@@ -548,499 +576,503 @@
            while every other table tiers normally; on a production host that
            went unnoticed for weeks and filled the disk. Say so at the top. -->
       {#each (rep.tiering ?? []).filter((h) => h.consecutive_failures > 0) as h (h.table_name)}
-        <div class="err-banner" role="alert">
-          <Icon name="triangle-alert" size={15} />
-          <span>
-            {t('storage.tiering.failing', {
-              table: h.table_name,
-              n: h.consecutive_failures,
-              error: h.last_error ?? '',
-            })}
-          </span>
-        </div>
+        <InlineNotice tone="error">
+          {t('storage.tiering.failing', {
+            table: h.table_name,
+            n: h.consecutive_failures,
+            error: h.last_error ?? '',
+          })}
+        </InlineNotice>
       {/each}
 
-      <div class="section">
-        <Card title={t('storage.card.rotation')}>
-          {#if policyLoadError}
-            <!-- Shown inline, not as a page error: this endpoint needs org:manage in
-                 every org, so a single-tenant admin legitimately gets a 403 while the
-                 rest of this page still works for them.
+      <Card title={t('storage.card.rotation')}>
+        {#if policyLoadError}
+          <!-- Shown inline, not as a page error: this endpoint needs org:manage in
+               every org, so a single-tenant admin legitimately gets a 403 while the
+               rest of this page still works for them.
 
-                 Only a LOAD failure belongs here. An action that fails leaves the
-                 policy perfectly displayable, so it renders inside the card below —
-                 replacing the card would strand the user with no way to retry. -->
-            <p class="policy-denied muted">{policyLoadError}</p>
-          {:else if policy}
-            {@const pol = policy}
-            <p class="muted policy-lede">
-              {t('prose.storage.rotation')}
-            </p>
+               Only a LOAD failure belongs here. An action that fails leaves the
+               policy perfectly displayable, so it renders inside the card below —
+               replacing the card would strand the user with no way to retry. -->
+          <ErrorState
+            size="section"
+            title={t('common.couldntLoad', { thing: t('storage.policyThing') })}
+            error={policyLoadError}
+            onretry={() => void loadPolicy()}
+          />
+        {:else if policy}
+          {@const pol = policy}
+          <p class="muted policy-lede">
+            {t('prose.storage.rotation')}
+          </p>
 
+          <div class="policy-row">
+            <!-- Text, not type="number": the binding on a number input hands
+                 back a coerced float, which both broke the parse below and
+                 turned a mis-typed "3.0" into a saved 3-day rotation.
+                 tier-policy.ts has the full reasoning. -->
+            <div class="num-field">
+              <Input label={t('storage.rotationAge')} inputmode="numeric" bind:value={hotDaysInput} disabled={policyBusy} />
+            </div>
+            <Button
+              loading={policyBusy}
+              disabled={!hotDaysValid}
+              onclick={() => {
+                // Belt and braces with the `disabled` above: that guard is a
+                // derived value, and a derived that throws leaves the button
+                // frozen at its last state — which is exactly how this card
+                // first broke. submitRestore re-checks for the same reason.
+                if (parsedHotDays !== null) savePolicy(parsedHotDays);
+              }}
+            >
+              {t('common.apply')}
+            </Button>
+            {#if pol.overridden}
+              <Button variant="secondary" disabled={policyBusy} onclick={askRevert}>
+                {t('storage.revertTo', { value: t('storage.daysShort', { n: pol.configured_hot_days }) })}
+              </Button>
+            {/if}
+          </div>
+
+          {#if parsedHotDays !== null && !hotDaysValid}
+            <div class="note">
+              <InlineNotice tone="warning">
+                {t('storage.hotDaysInvalid', { min: pol.min_hot_days })}
+              </InlineNotice>
+            </div>
+          {:else if wouldLower}
+            <!-- The asymmetry is the single most important thing on this page.
+                 Lowering acts on the next cycle and cannot be undone by raising
+                 the number back. -->
+            <div class="note">
+              <InlineNotice tone="warning">
+                {t('storage.lowerWarning', {
+                  from: parsedHotDays ?? '',
+                  to: pol.effective_hot_days,
+                })}
+              </InlineNotice>
+            </div>
+          {/if}
+
+          {#if policyActionError}
+            <div class="note">
+              <InlineNotice tone="error">{policyActionError}</InlineNotice>
+            </div>
+          {/if}
+
+          <!-- Hidden the moment the field says something else: otherwise the
+               page goes on asserting that an unsaved number is in force. -->
+          {#if policySaved && !hotDaysDirty}
+            <div class="note">
+              <InlineNotice tone="success">{t('storage.saved')}</InlineNotice>
+            </div>
+          {/if}
+
+          <dl class="policy-facts">
+            <div>
+              <dt>{t('storage.inForce')}</dt>
+              <dd>
+                {pol.overridden
+                  ? t('storage.days', { n: formatNumber(pol.effective_hot_days) })
+                  : t('storage.daysDefault', { value: t('storage.days', { n: formatNumber(pol.effective_hot_days) }) })}
+              </dd>
+            </div>
+            <div>
+              <dt>{t('storage.configured')}</dt>
+              <dd>
+                {t('storage.days', { n: formatNumber(pol.configured_hot_days) })}
+                <code class="env-name">TIER_HOT_DAYS</code>
+              </dd>
+            </div>
+          </dl>
+
+          <div class="policy-sub">
+            <h4 class="section-label">{t('storage.sessionRetention')}</h4>
+            <p class="muted policy-lede">{t('prose.storage.sessionRetention')}</p>
             <div class="policy-row">
-              <label class="policy-field">
-                <span class="policy-label">{t('storage.rotationAge')}</span>
-                <!-- Text, not type="number": the binding on a number input
-                     hands back a coerced float, which both broke the parse
-                     below and turned a mis-typed "3.0" into a saved 3-day
-                     rotation. tier-policy.ts has the full reasoning. -->
-                <input
-                  class="policy-input"
-                  type="text"
-                  inputmode="numeric"
-                  bind:value={hotDaysInput}
-                  disabled={policyBusy}
-                />
-              </label>
+              <!-- Text, not type="number", for the rotation field's reasons —
+                   and a silently rounded value here DELETES data with no
+                   restore path at all. -->
+              <div class="num-field">
+                <Input label={t('storage.retentionAge')} inputmode="numeric" bind:value={retentionInput} disabled={retentionBusy} />
+              </div>
               <Button
-                variant="primary"
-                disabled={!hotDaysValid || policyBusy}
+                loading={retentionBusy}
+                disabled={!retentionValid}
                 onclick={() => {
-                  // Belt and braces with the `disabled` above: that guard is a
-                  // derived value, and a derived that throws leaves the button
-                  // frozen at its last state — which is exactly how this card
-                  // first broke. submitRestore re-checks for the same reason.
-                  if (parsedHotDays !== null) savePolicy(parsedHotDays);
+                  if (parsedRetention !== null) saveRetention(parsedRetention);
                 }}
               >
-                {policyBusy ? 'Saving…' : 'Apply'}
+                {t('common.apply')}
               </Button>
-              {#if pol.overridden}
-                <Button variant="secondary" disabled={policyBusy} onclick={askRevert}>
-                  Revert to default ({pol.configured_hot_days}d)
+              {#if pol.session_retention_overridden}
+                <Button
+                  variant="secondary"
+                  disabled={retentionBusy}
+                  onclick={askRetentionRevert}
+                >
+                  {t('storage.revertTo', {
+                    value:
+                      pol.configured_session_retention_days === 0
+                        ? t('storage.retentionOffShort')
+                        : t('storage.daysShort', { n: pol.configured_session_retention_days }),
+                  })}
                 </Button>
               {/if}
             </div>
 
-            {#if parsedHotDays !== null && !hotDaysValid}
-              <p class="policy-warn" role="alert">
-                Must be a whole number of days, at least {pol.min_hot_days}. A smaller
-                value would put the cutoff at or after now and tier partitions that are
-                still being written to.
-              </p>
-            {:else if wouldLower}
-              <!-- The asymmetry is the single most important thing on this page.
-                   Lowering acts on the next cycle and cannot be undone by raising
-                   the number back. -->
-              <p class="policy-warn" role="alert">
-                <Icon name="triangle-alert" size={14} />
-                Lowering this is one-way. On its next cycle the tier worker will export
-                and then drop everything between {parsedHotDays} and
-                {pol.effective_hot_days} days old. Raising the number afterwards does
-                not bring it back into Postgres — that needs a restore from cold.
-              </p>
+            {#if parsedRetention !== null && !retentionValid}
+              <div class="note">
+                <InlineNotice tone="warning">
+                  {t('storage.retentionInvalid', { min: pol.min_session_retention_days })}
+                </InlineNotice>
+              </div>
+            {:else if retentionDeletes}
+              <div class="note">
+                <InlineNotice tone="warning">
+                  {t('storage.retentionWarning', { n: parsedRetention ?? '' })}
+                </InlineNotice>
+              </div>
             {/if}
 
-            {#if policyActionError}
-              <p class="policy-err" role="alert">
-                <Icon name="triangle-alert" size={14} />
-                {policyActionError}
-              </p>
+            {#if retentionActionError}
+              <div class="note">
+                <InlineNotice tone="error">{retentionActionError}</InlineNotice>
+              </div>
             {/if}
 
-            <!-- Hidden the moment the field says something else: otherwise the
-                 page goes on asserting that an unsaved number is in force. -->
-            {#if policySaved && !hotDaysDirty}
-              <p class="policy-ok">{t('storage.saved')}</p>
+            {#if retentionSaved && !retentionDirty}
+              <div class="note">
+                <InlineNotice tone="success">{t('storage.saved')}</InlineNotice>
+              </div>
             {/if}
 
             <dl class="policy-facts">
               <div>
                 <dt>{t('storage.inForce')}</dt>
-                <dd>{pol.effective_hot_days} days{pol.overridden ? '' : ' (default)'}</dd>
+                <dd>
+                  {pol.session_retention_overridden
+                    ? retentionDays(pol.effective_session_retention_days)
+                    : t('storage.daysDefault', { value: retentionDays(pol.effective_session_retention_days) })}
+                </dd>
               </div>
               <div>
                 <dt>{t('storage.configured')}</dt>
-                <dd>{pol.configured_hot_days} days (TIER_HOT_DAYS)</dd>
+                <dd>
+                  {retentionDays(pol.configured_session_retention_days)}
+                  <code class="env-name">SESSION_RETENTION_DAYS</code>
+                </dd>
               </div>
             </dl>
+          </div>
 
-            <div class="policy-sub">
-              <h4 class="policy-subtitle">{t('storage.sessionRetention')}</h4>
-              <p class="muted policy-lede">{t('prose.storage.sessionRetention')}</p>
-              <div class="policy-row">
-                <label class="policy-field">
-                  <span class="policy-label">{t('storage.retentionAge')}</span>
-                  <!-- Text, not type="number", for the rotation field's reasons —
-                       and a silently rounded value here DELETES data with no
-                       restore path at all. -->
-                  <input
-                    class="policy-input"
-                    type="text"
-                    inputmode="numeric"
-                    bind:value={retentionInput}
-                    disabled={retentionBusy}
-                  />
-                </label>
-                <Button
-                  variant="primary"
-                  disabled={!retentionValid || retentionBusy}
-                  onclick={() => {
-                    if (parsedRetention !== null) saveRetention(parsedRetention);
-                  }}
-                >
-                  {retentionBusy ? 'Saving…' : 'Apply'}
-                </Button>
-                {#if pol.session_retention_overridden}
-                  <Button
-                    variant="secondary"
-                    disabled={retentionBusy}
-                    onclick={askRetentionRevert}
-                  >
-                    Revert to default ({pol.configured_session_retention_days === 0
-                      ? 'off'
-                      : `${pol.configured_session_retention_days}d`})
-                  </Button>
-                {/if}
-              </div>
-
-              {#if parsedRetention !== null && !retentionValid}
-                <p class="policy-warn" role="alert">
-                  Must be 0 (off) or a whole number of days, at least
-                  {pol.min_session_retention_days}. Sessions younger than that are never
-                  retention-dropped.
-                </p>
-              {:else if retentionDeletes}
-                <p class="policy-warn" role="alert">
-                  <Icon name="triangle-alert" size={14} />
-                  This deletes raw sessions older than {parsedRetention} days on the next
-                  daily pass — permanently. Sessions have no cold copy: past-retention
-                  days survive only as aggregates, so session lists and drill-downs stop
-                  at the retention window. Raising the number afterwards does not bring
-                  them back.
-                </p>
-              {/if}
-
-              {#if retentionActionError}
-                <p class="policy-err" role="alert">
-                  <Icon name="triangle-alert" size={14} />
-                  {retentionActionError}
-                </p>
-              {/if}
-
-              {#if retentionSaved && !retentionDirty}
-                <p class="policy-ok">{t('storage.saved')}</p>
-              {/if}
-
-              <dl class="policy-facts">
-                <div>
-                  <dt>{t('storage.inForce')}</dt>
-                  <dd>
-                    {pol.effective_session_retention_days === 0
-                      ? t('storage.retentionOff')
-                      : `${pol.effective_session_retention_days} days`}{pol.session_retention_overridden
-                      ? ''
-                      : ' (default)'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>{t('storage.configured')}</dt>
-                  <dd>
-                    {pol.configured_session_retention_days === 0
-                      ? t('storage.retentionOff')
-                      : `${pol.configured_session_retention_days} days`} (SESSION_RETENTION_DAYS)
-                  </dd>
-                </div>
-              </dl>
-            </div>
-
-            {#if pol.follows_on_restart.length > 0}
-              <details class="policy-detail">
-                <summary>{t('storage.notImmediate')}</summary>
-                <p class="muted">
-                  Applies without a restart: {pol.follows_immediately.join('; ')}. Still
-                  reading start-time configuration, and so able to disagree about where
-                  the boundary is until restarted:
-                </p>
-                <ul class="muted">
-                  {#each pol.follows_on_restart as c (c)}
-                    <li>{c}</li>
-                  {/each}
-                </ul>
-              </details>
-            {/if}
-
-            {#if pol.pins.length > 0}
-              <div class="policy-pins">
-                <h3 class="pins-title">{t('storage.pinnedRanges')}</h3>
-                <p class="muted">
-                  {t('prose.storage.pins')}
-                </p>
-                <ul class="pin-list">
-                  {#each pol.pins as pin (pin.id)}
-                    <li class:expired={pin.expired} class:soon={pin.expiring_soon}>
-                      <div class="pin-main">
-                        <code>{pin.table_name}</code>
-                        {new Date(pin.range_start).toISOString().slice(0, 10)} →
-                        {new Date(pin.range_end).toISOString().slice(0, 10)}
-                        <span class="muted">
-                          {pin.expired ? 'expired' : 'until'}
-                          {new Date(pin.expires_at).toISOString().slice(0, 10)}
-                        </span>
-                        {#if pin.reason}<span class="muted">— {pin.reason}</span>{/if}
-                      </div>
-                      {#if pin.expiring_soon}
-                        <!-- Warn BEFORE the data goes. A restore that simply
-                             vanishes is the same silent disappearance the pin
-                             exists to prevent, just deferred to the expiry. -->
-                        <p class="pin-warn" role="alert">
-                          Expires in {Math.max(0, Math.round(pin.expires_in_hours / 24))} day(s).
-                          The restored rows will be deleted from Postgres; the Parquet
-                          copy is not touched.
-                        </p>
-                      {/if}
-                      <div class="pin-actions">
-                        <Button
-                          variant="secondary"
-                          disabled={pinBusy === pin.id}
-                          onclick={() => doExtendPin(pin.id)}
-                        >
-                          {t('storage.extend30')}
-                        </Button>
-                        <Button
-                          variant="secondary"
-                          disabled={pinBusy === pin.id}
-                          onclick={() => doReleasePin(pin.id)}
-                        >
-                          {pinBusy === pin.id ? 'Working…' : 'Release now'}
-                        </Button>
-                      </div>
-                    </li>
-                  {/each}
-                </ul>
-              </div>
-            {/if}
-          {:else}
-            <Skeleton rows={6} />
-          {/if}
-        </Card>
-      </div>
-
-      {#if policy}
-        <div class="section">
-          <Card title={t('storage.card.restore')}>
-            <p class="muted policy-lede">
-              {t('prose.storage.restore')}
-            </p>
-
-            <div class="restore-form">
-              <label class="policy-field">
-                <span class="policy-label">{t('storage.column.table')}</span>
-                <select class="policy-input" bind:value={restoreTable} disabled={restoreBusy}>
-                  {#each RESTORABLE_TABLES as tbl (tbl)}
-                    <option value={tbl}>{tbl}</option>
-                  {/each}
-                </select>
-              </label>
-              <label class="policy-field">
-                <span class="policy-label">{t('storage.from')}</span>
-                <input class="policy-input" type="date" bind:value={restoreFrom} disabled={restoreBusy} />
-              </label>
-              <label class="policy-field">
-                <span class="policy-label">{t('storage.to')}</span>
-                <input class="policy-input" type="date" bind:value={restoreTo} disabled={restoreBusy} />
-              </label>
-              <label class="policy-field">
-                <span class="policy-label">Keep for ({RESTORE_MIN_DAYS}–{RESTORE_MAX_DAYS} days)</span>
-                <!-- Text for the same reason as the rotation age above. -->
-                <input class="policy-input" type="text" inputmode="numeric" bind:value={restoreDays} disabled={restoreBusy} />
-              </label>
-              <Button disabled={!restoreValid} onclick={submitRestore}>
-                {restoreBusy ? 'Queueing…' : 'Restore'}
-              </Button>
-            </div>
-
-            {#if restoreError}
-              <p class="policy-warn" role="alert">{restoreError}</p>
-            {/if}
-            {#if restoreFrom && restoreTo && restoreRange === null}
-              <p class="policy-warn" role="alert">
-                {t('storage.badRange')}
+          {#if pol.follows_on_restart.length > 0}
+            <details class="policy-detail">
+              <summary>{t('storage.notImmediate')}</summary>
+              <p class="muted">
+                {t('storage.followsImmediately', { list: pol.follows_immediately.join('; ') })}
               </p>
-            {/if}
+              <ul class="muted">
+                {#each pol.follows_on_restart as c (c)}
+                  <li>{c}</li>
+                {/each}
+              </ul>
+            </details>
+          {/if}
 
-            {#if jobs.length > 0}
-              <ul class="job-list">
-                {#each jobs as job (job.id)}
-                  <li>
-                    <div class="job-head">
-                      <code>{job.table_name}</code>
-                      {new Date(job.range_start).toISOString().slice(0, 10)} →
-                      {new Date(job.range_end).toISOString().slice(0, 10)}
-                      <span class="job-status job-{job.status}">{job.status}</span>
+          {#if pol.pins.length > 0}
+            <div class="policy-pins">
+              <h4 class="section-label">{t('storage.pinnedRanges')}</h4>
+              <p class="muted">
+                {t('prose.storage.pins')}
+              </p>
+              <ul class="pin-list">
+                {#each pol.pins as pin (pin.id)}
+                  <li class:expired={pin.expired} class:soon={pin.expiring_soon}>
+                    <div class="pin-main">
+                      <code>{pin.table_name}</code>
+                      {day(pin.range_start)} → {day(pin.range_end)}
+                      <span class="muted">
+                        {pin.expired
+                          ? t('storage.pin.expired', { date: day(pin.expires_at) })
+                          : t('storage.pin.until', { date: day(pin.expires_at) })}
+                      </span>
+                      {#if pin.reason}<span class="muted">— {pin.reason}</span>{/if}
                     </div>
-                    {#if job.status === 'running' || job.status === 'queued'}
-                      <div class="job-bar"><div class="job-fill" style="width:{jobPercent(job)}%"></div></div>
-                      <p class="muted">
-                        {formatNumber(job.rows_restored)} of
-                        {formatNumber(job.rows_estimated)} rows
+                    {#if pin.expiring_soon}
+                      <!-- Warn BEFORE the data goes. A restore that simply
+                           vanishes is the same silent disappearance the pin
+                           exists to prevent, just deferred to the expiry. -->
+                      <p class="pin-warn" role="alert">
+                        {t('storage.pin.expiresSoon', {
+                          n: Math.max(0, Math.round(pin.expires_in_hours / 24)),
+                        })}
                       </p>
-                    {:else if job.status === 'succeeded'}
-                      <p class="muted">
-                        Restored {formatNumber(job.rows_restored)} rows. Held until
-                        {new Date(job.pin_expires_at).toISOString().slice(0, 10)}.
-                      </p>
-                    {:else if job.error}
-                      <p class="policy-warn" role="alert">{job.error}</p>
                     {/if}
+                    <div class="pin-actions">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={pinBusy === pin.id}
+                        onclick={() => doExtendPin(pin.id)}
+                      >
+                        {t('storage.extend30')}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={pinBusy === pin.id}
+                        onclick={() => doReleasePin(pin.id)}
+                      >
+                        {t('storage.pin.release')}
+                      </Button>
+                    </div>
                   </li>
                 {/each}
               </ul>
-            {/if}
-          </Card>
-        </div>
+            </div>
+          {/if}
+        {:else}
+          <Skeleton rows={6} />
+        {/if}
+      </Card>
+
+      {#if policy}
+        <Card title={t('storage.card.restore')}>
+          <p class="muted policy-lede">
+            {t('prose.storage.restore')}
+          </p>
+
+          <div class="restore-form">
+            <Select
+              label={t('storage.column.table')}
+              bind:value={restoreTable}
+              options={restoreTableOptions}
+              disabled={restoreBusy}
+            />
+            <Input label={t('storage.from')} type="date" bind:value={restoreFrom} disabled={restoreBusy} />
+            <Input label={t('storage.to')} type="date" bind:value={restoreTo} disabled={restoreBusy} />
+            <!-- Text for the same reason as the rotation age above. -->
+            <div class="num-field">
+              <Input
+                label={t('storage.keepFor', { min: RESTORE_MIN_DAYS, max: RESTORE_MAX_DAYS })}
+                inputmode="numeric"
+                bind:value={restoreDays}
+                disabled={restoreBusy}
+              />
+            </div>
+            <Button loading={restoreBusy} disabled={!restoreValid} onclick={submitRestore}>
+              {t('storage.restore')}
+            </Button>
+          </div>
+
+          {#if restoreError}
+            <div class="note">
+              <InlineNotice tone="error">{restoreError}</InlineNotice>
+            </div>
+          {/if}
+          {#if restoreFrom && restoreTo && restoreRange === null}
+            <div class="note">
+              <InlineNotice tone="warning">{t('storage.badRange')}</InlineNotice>
+            </div>
+          {/if}
+
+          {#if jobs.length > 0}
+            <ul class="job-list">
+              {#each jobs as job (job.id)}
+                {@const st = JOB_STATUS[job.status]}
+                <li>
+                  <div class="job-head">
+                    <code>{job.table_name}</code>
+                    {day(job.range_start)} → {day(job.range_end)}
+                    <Badge tone={st?.tone ?? 'neutral'} size="sm">{st ? t(st.key) : job.status}</Badge>
+                  </div>
+                  {#if job.status === 'running' || job.status === 'queued'}
+                    <div class="job-bar"><div class="job-fill" style="width:{jobPercent(job)}%"></div></div>
+                    <p class="muted">
+                      {t('storage.job.progress', {
+                        done: formatNumber(job.rows_restored),
+                        total: formatNumber(job.rows_estimated),
+                      })}
+                    </p>
+                  {:else if job.status === 'succeeded'}
+                    <p class="muted">
+                      {t('storage.job.done', {
+                        n: formatNumber(job.rows_restored),
+                        date: day(job.pin_expires_at),
+                      })}
+                    </p>
+                  {:else if job.error}
+                    <p class="job-error" role="alert">{job.error}</p>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </Card>
       {/if}
 
-      <div class="section">
-        <Card title={t('storage.card.tables')} padding="none">
-          {#if sortedTables.length === 0}
-            <EmptyState title={t('storage.empty.tables')} description={t('storage.empty.tablesBody')} icon="server" />
-          {:else}
-            <DataTable>
-              {#snippet head()}
+      <Card title={t('storage.card.tables')}>
+        {#if sortedTables.length === 0}
+          <EmptyState
+            size="section"
+            title={t('storage.empty.tables')}
+            description={t('storage.empty.tablesBody')}
+            icon="server"
+          />
+        {:else}
+          <DataTable>
+            {#snippet head()}
+              <tr>
+                <SortableTh key="table" columnDefault="asc" sort={tableSort} onsort={onTableSort}>
+                  {t('storage.column.table')}
+                </SortableTh>
+                <SortableTh key="size" class="num" sort={tableSort} onsort={onTableSort}>
+                  {t('storage.column.size')}
+                </SortableTh>
+                <SortableTh key="hot_rows" class="num" sort={tableSort} onsort={onTableSort}>
+                  {t('storage.column.hotRows')}
+                </SortableTh>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each sortedTables as tbl (tbl.name)}
                 <tr>
-                  <SortableTh key="table" columnDefault="asc" sort={tableSort} onsort={onTableSort}>
-                    {t('storage.column.table')}
-                  </SortableTh>
-                  <SortableTh key="size" class="num" sort={tableSort} onsort={onTableSort}>
-                    {t('storage.column.size')}
-                  </SortableTh>
-                  <SortableTh key="hot_rows" class="num" sort={tableSort} onsort={onTableSort}>
-                    {t('storage.column.hotRows')}
-                  </SortableTh>
+                  <td><span class="cell-mono">{tbl.name}</span></td>
+                  <td class="num">{fmtBytes(tbl.total_bytes)}</td>
+                  <td class="num">{formatNumber(tbl.hot_rows)}</td>
                 </tr>
-              {/snippet}
-              {#snippet children()}
-                {#each sortedTables as tbl (tbl.name)}
-                  <tr>
-                    <td><span class="cell-mono">{tbl.name}</span></td>
-                    <td class="num">{fmtBytes(tbl.total_bytes)}</td>
-                    <td class="num">{formatNumber(tbl.hot_rows)}</td>
-                  </tr>
-                {/each}
-              {/snippet}
-            </DataTable>
-          {/if}
-        </Card>
-      </div>
+              {/each}
+            {/snippet}
+          </DataTable>
+        {/if}
+      </Card>
 
-      <div class="section">
-        <Card title={t('storage.card.byApp')} padding="none">
-          {#if sortedApps.length === 0}
-            <EmptyState title={t('storage.empty.apps')} description={t('storage.empty.appsBody')} icon="package" />
-          {:else}
-            <DataTable>
-              {#snippet head()}
-                <tr>
-                  <SortableTh key="org" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.org')}
-                  </SortableTh>
-                  <SortableTh key="project" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.project')}
-                  </SortableTh>
-                  <SortableTh key="app" columnDefault="asc" sort={appSort} onsort={onAppSort}>
-                    {t('nav.selectApp')}
-                  </SortableTh>
-                  <SortableTh key="hot_rows" class="num" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.hotRows')}
-                  </SortableTh>
-                  <SortableTh key="cold_rows" class="num" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.coldRows')}
-                  </SortableTh>
-                  <SortableTh key="cold_bytes" class="num" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.coldBytes')}
-                  </SortableTh>
-                  <SortableTh key="hot_bytes" class="num" sort={appSort} onsort={onAppSort}>
-                    {t('storage.column.hotBytes')}
-                  </SortableTh>
+      <Card title={t('storage.card.byApp')}>
+        {#if sortedApps.length === 0}
+          <EmptyState
+            size="section"
+            title={t('storage.empty.apps')}
+            description={t('storage.empty.appsBody')}
+            icon="package"
+          />
+        {:else}
+          <DataTable>
+            {#snippet head()}
+              <tr>
+                <SortableTh key="org" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.org')}
+                </SortableTh>
+                <SortableTh key="project" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.project')}
+                </SortableTh>
+                <SortableTh key="app" columnDefault="asc" sort={appSort} onsort={onAppSort}>
+                  {t('nav.selectApp')}
+                </SortableTh>
+                <SortableTh key="hot_rows" class="num" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.hotRows')}
+                </SortableTh>
+                <SortableTh key="cold_rows" class="num" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.coldRows')}
+                </SortableTh>
+                <SortableTh key="cold_bytes" class="num" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.coldBytes')}
+                </SortableTh>
+                <SortableTh key="hot_bytes" class="num" sort={appSort} onsort={onAppSort}>
+                  {t('storage.column.hotBytes')}
+                </SortableTh>
+              </tr>
+            {/snippet}
+            {#snippet children()}
+              {#each sortedApps as a (a.app_id)}
+                <tr class="clickable" onclick={() => toggleApp(a.app_id)}>
+                  <td>
+                    <!-- The disclosure chevron leads the row, so it stays in
+                         the first cell even though what expands below is the
+                         app's breakdown. -->
+                    <div class="name-cell">
+                      <span class="chevron" class:open={openApp[a.app_id]}>
+                        <Icon name="chevron-right" size={14} />
+                      </span>
+                      <span class="cell-muted">{a.org_name}</span>
+                    </div>
+                  </td>
+                  <!-- Empty only for a report cached by a build that predates
+                       project_name; the next refresh fills it in. -->
+                  <td><span class="cell-muted">{a.project_name || '—'}</span></td>
+                  <td><span class="name">{a.app_name}</span></td>
+                  <td class="num">{formatNumber(a.hot_rows_total)}</td>
+                  <td class="num">{formatNumber(a.cold_rows_total)}</td>
+                  <td class="num">{fmtBytes(a.cold_bytes_total)}</td>
+                  <td class="num">{fmtBytes(a.estimated_hot_bytes_total)}</td>
                 </tr>
-              {/snippet}
-              {#snippet children()}
-                {#each sortedApps as a (a.app_id)}
-                  <tr class="clickable" onclick={() => toggleApp(a.app_id)}>
-                    <td>
-                      <!-- The disclosure chevron leads the row, so it stays in
-                           the first cell even though what expands below is the
-                           app's breakdown. -->
-                      <div class="name-cell">
-                        <span class="chevron" class:open={openApp[a.app_id]}>
-                          <Icon name="chevron-right" size={14} />
-                        </span>
-                        <span class="cell-muted">{a.org_name}</span>
+                {#if openApp[a.app_id]}
+                  <tr class="expand-row">
+                    <td colspan="7" style="background: var(--surface-2); white-space: normal; cursor: default;">
+                      <div class="expand-body">
+                        <h4 class="section-label">{t('storage.perTable')}</h4>
+                        <!--
+                          A CSS grid, not a nested <table> — a raw <table> here would sit
+                          inside DataTable's own <tbody>/<td> and pick up its scoped-but-
+                          :global() `tbody td` / `td.num` rules (padding, white-space,
+                          alignment) by DOM descendance, regardless of component
+                          boundaries. See the `uptimeColor` inline-style note in
+                          Monitors.svelte for the same trap on a different property.
+                        -->
+                        <div class="mini-grid" role="table" aria-label={t('storage.perTable')}>
+                          <div class="mini-row mini-head" role="row">
+                            <span role="columnheader">{t('storage.column.table')}</span>
+                            <span class="num" role="columnheader">{t('storage.column.hotRows')}</span>
+                            <span class="num" role="columnheader">{t('storage.column.coldRows')}</span>
+                            <span class="num" role="columnheader">{t('storage.column.coldBytes')}</span>
+                            <span class="num" role="columnheader">{t('storage.column.hotBytes')}</span>
+                          </div>
+                          {#each a.tables as tbl (tbl.name)}
+                            <div class="mini-row" role="row">
+                              <span class="cell-mono" role="cell">{tbl.name}</span>
+                              <span class="num" role="cell">{formatNumber(tbl.hot_rows)}</span>
+                              <span class="num" role="cell">{formatNumber(tbl.cold_rows)}</span>
+                              <span class="num" role="cell">{fmtBytes(tbl.cold_bytes)}</span>
+                              <span class="num" role="cell">{fmtBytes(tbl.estimated_hot_bytes)}</span>
+                            </div>
+                          {/each}
+                        </div>
+
+                        <!-- Show the true total, not the page size: the API
+                             truncates the list, so `cold_files.length` caps
+                             out and silently reads as "that's all of them". -->
+                        <h4 class="section-label files-label">
+                          {t('storage.coldFiles', { n: formatNumber(a.cold_files_total) })}
+                        </h4>
+                        {#if a.cold_files_total === 0}
+                          <p class="faint">{t('storage.noColdFiles')}</p>
+                        {:else}
+                          <ul class="file-list">
+                            {#each a.cold_files as f (f.path)}
+                              <li>
+                                <span class="cell-mono file-path" title={f.path}>{f.path}</span>
+                                <span class="cell-muted file-size">{fmtBytes(f.bytes)}</span>
+                              </li>
+                            {/each}
+                          </ul>
+                          {#if a.cold_files_total > a.cold_files.length}
+                            <p class="faint">
+                              {t('storage.coldFilesTruncated', {
+                                shown: formatNumber(a.cold_files.length),
+                                total: formatNumber(a.cold_files_total),
+                              })}
+                            </p>
+                          {/if}
+                        {/if}
                       </div>
                     </td>
-                    <!-- Empty only for a report cached by a build that predates
-                         project_name; the next refresh fills it in. -->
-                    <td><span class="cell-muted">{a.project_name || '—'}</span></td>
-                    <td><span class="name">{a.app_name}</span></td>
-                    <td class="num">{formatNumber(a.hot_rows_total)}</td>
-                    <td class="num">{formatNumber(a.cold_rows_total)}</td>
-                    <td class="num">{fmtBytes(a.cold_bytes_total)}</td>
-                    <td class="num">{fmtBytes(a.estimated_hot_bytes_total)}</td>
                   </tr>
-                  {#if openApp[a.app_id]}
-                    <tr class="expand-row">
-                      <td colspan="7" style="background: var(--surface-2); white-space: normal; cursor: default;">
-                        <div class="expand-body">
-                          <h4 class="expand-title">{t('storage.perTable')}</h4>
-                          <!--
-                            A CSS grid, not a nested <table> — a raw <table> here would sit
-                            inside DataTable's own <tbody>/<td> and pick up its scoped-but-
-                            :global() `tbody td` / `td.num` rules (padding, white-space,
-                            alignment) by DOM descendance, regardless of component
-                            boundaries. See the `uptimeColor` inline-style note in
-                            Monitors.svelte for the same trap on a different property.
-                          -->
-                          <div class="mini-grid" role="table" aria-label={t('storage.perTable')}>
-                            <div class="mini-row mini-head" role="row">
-                              <span role="columnheader">{t('storage.column.table')}</span>
-                              <span class="num" role="columnheader">{t('storage.column.hotRows')}</span>
-                              <span class="num" role="columnheader">{t('storage.column.coldRows')}</span>
-                              <span class="num" role="columnheader">{t('storage.column.coldBytes')}</span>
-                              <span class="num" role="columnheader">{t('storage.column.hotBytes')}</span>
-                            </div>
-                            {#each a.tables as tbl (tbl.name)}
-                              <div class="mini-row" role="row">
-                                <span class="cell-mono" role="cell">{tbl.name}</span>
-                                <span class="num" role="cell">{formatNumber(tbl.hot_rows)}</span>
-                                <span class="num" role="cell">{formatNumber(tbl.cold_rows)}</span>
-                                <span class="num" role="cell">{fmtBytes(tbl.cold_bytes)}</span>
-                                <span class="num" role="cell">{fmtBytes(tbl.estimated_hot_bytes)}</span>
-                              </div>
-                            {/each}
-                          </div>
-
-                          <!-- Show the true total, not the page size: the API
-                               truncates the list, so `cold_files.length` caps
-                               out and silently reads as "that's all of them". -->
-                          <h4 class="expand-title">Cold Parquet files ({a.cold_files_total})</h4>
-                          {#if a.cold_files_total === 0}
-                            <p class="faint">{t('storage.noColdFiles')}</p>
-                          {:else}
-                            <ul class="file-list">
-                              {#each a.cold_files as f (f.path)}
-                                <li>
-                                  <span class="cell-mono file-path" title={f.path}>{f.path}</span>
-                                  <span class="cell-muted file-size">{fmtBytes(f.bytes)}</span>
-                                </li>
-                              {/each}
-                            </ul>
-                            {#if a.cold_files_total > a.cold_files.length}
-                              <p class="faint">
-                                Showing the first {a.cold_files.length} of {a.cold_files_total} files.
-                              </p>
-                            {/if}
-                          {/if}
-                        </div>
-                      </td>
-                    </tr>
-                  {/if}
-                {/each}
-              {/snippet}
-            </DataTable>
-          {/if}
-        </Card>
-      </div>
+                {/if}
+              {/each}
+            {/snippet}
+          </DataTable>
+        {/if}
+      </Card>
     {/if}
   </div>
 </AdminShell>
@@ -1068,75 +1100,50 @@
 />
 
 <style>
+  .storage {
+    display: flex;
+    flex-direction: column;
+    gap: var(--page-gap);
+  }
+
+  /* --- rotation / retention policy ---------------------------------------- */
   .policy-lede { margin: 0 0 14px; }
   .policy-sub { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
-  .policy-subtitle { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .policy-sub .section-label { margin-bottom: 6px; }
   .policy-row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
-  .policy-field { display: flex; flex-direction: column; gap: 5px; }
-  .policy-label { font-size: 12px; color: var(--text-muted); }
-  .policy-input {
-    width: 120px;
-    padding: 7px 9px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text);
-  }
-  .policy-warn {
-    display: flex;
-    align-items: flex-start;
-    gap: 7px;
-    margin: 12px 0 0;
-    padding: 9px 11px;
-    border: 1px solid var(--warning, var(--border-strong));
-    border-radius: var(--radius);
-    color: var(--text);
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  /* Same shape as .policy-warn, error tone: an action that failed is a harder
-     signal than a caution about one that would succeed. */
-  .policy-err {
-    display: flex;
-    align-items: flex-start;
-    gap: 7px;
-    margin: 12px 0 0;
-    padding: 9px 11px;
-    border: 1px solid var(--error);
-    border-radius: var(--radius);
-    color: var(--error);
-    font-size: 13px;
-    line-height: 1.5;
-  }
-  .policy-ok { margin: 10px 0 0; font-size: 13px; color: var(--success, var(--text)); }
-  .policy-denied { margin: 0; }
+  /* A few digits wide: these fields hold a day count, and a full-width input
+     reads as a place for prose. */
+  .num-field { width: 150px; }
+  .note { margin-top: 12px; }
   .policy-facts {
     display: flex;
     gap: 26px;
     margin: 16px 0 0;
     flex-wrap: wrap;
   }
-  .policy-facts dt { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); }
-  .policy-facts dd { margin: 3px 0 0; font-size: 14px; }
-  .policy-detail { margin-top: 14px; font-size: 13px; }
+  .policy-facts dt { font-size: var(--text-xs); color: var(--text-muted); }
+  .policy-facts dd { margin: 3px 0 0; font-size: var(--text-sm); }
+  .env-name { font-size: var(--text-2xs); color: var(--text-faint); }
+  .policy-detail { margin-top: 14px; font-size: var(--text-sm); }
   .policy-detail summary { cursor: pointer; color: var(--text-muted); }
-  .policy-detail ul { margin: 6px 0 0 18px; }
+  .policy-detail ul { margin-block: 6px 0; margin-inline: 18px 0; }
   .policy-pins { margin-top: 18px; }
-  .pins-title { margin: 0 0 4px; font-size: 14px; }
-  .pin-list { margin: 8px 0 0; padding-inline-start: 18px; font-size: 13px; }
+  .policy-pins .section-label { margin-bottom: 4px; }
+  .pin-list { margin: 8px 0 0; padding-inline-start: 18px; font-size: var(--text-sm); }
   .pin-list li { margin-bottom: 10px; }
   .pin-list li.expired { opacity: 0.55; }
   /* Warning state is a border, not just colour — the row also has to read as
      "about to change" for anyone who cannot distinguish the hue. */
   .pin-list li.soon {
-    border-inline-start: 3px solid var(--warning, #b45309);
+    border-inline-start: 3px solid var(--warning);
     padding-inline-start: 8px;
     margin-inline-start: -11px;
   }
   .pin-main { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
-  .pin-warn { margin: 4px 0; font-size: 12px; color: var(--warning, #b45309); }
+  .pin-warn { margin: 4px 0; font-size: var(--text-xs); color: var(--warning); }
   .pin-actions { display: flex; gap: 8px; margin-top: 6px; }
 
+  /* --- restore ---------------------------------------------------------------- */
   .restore-form {
     display: flex;
     flex-wrap: wrap;
@@ -1144,72 +1151,21 @@
     align-items: flex-end;
     margin: 12px 0;
   }
-  .job-list { list-style: none; margin: 12px 0 0; padding: 0; font-size: 13px; }
+  .job-list { list-style: none; margin: 12px 0 0; padding: 0; font-size: var(--text-sm); }
   .job-list li {
     padding: 8px 0;
-    border-top: 1px solid var(--border, #2a2a2a);
+    border-top: 1px solid var(--border);
   }
-  .job-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
-  .job-status { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
-  .job-succeeded { color: var(--success, #15803d); }
-  .job-failed, .job-cancelled { color: var(--danger, #b91c1c); }
-  .job-queued, .job-running { color: var(--muted-fg, #888); }
+  .job-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .job-error { margin-top: 4px; color: var(--error); font-size: var(--text-sm); }
   .job-bar {
     height: 4px;
-    background: var(--border, #2a2a2a);
-    border-radius: 2px;
+    background: var(--border);
+    border-radius: var(--radius-pill);
     overflow: hidden;
     margin: 6px 0 4px;
   }
-  .job-fill { height: 100%; background: var(--accent, #2563eb); transition: width 0.3s; }
-
-  .storage {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }
-
-  /* --- header --------------------------------------------------------------- */
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-
-  /* --- error banner --------------------------------------------------------- */
-  .err-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    font-size: 13px;
-    color: var(--error);
-    background: var(--error-soft);
-    border: 1px solid color-mix(in srgb, var(--error) 38%, transparent);
-    border-radius: var(--radius);
-  }
-
-  .center {
-    display: grid;
-    place-items: center;
-    min-height: 180px;
-  }
-
-  .section {
-    display: flex;
-    flex-direction: column;
-  }
+  .job-fill { height: 100%; background: var(--primary); transition: width 0.3s; }
 
   /* --- app row / expander ---------------------------------------------------- */
   .name-cell {
@@ -1218,12 +1174,12 @@
     gap: 6px;
   }
   .name {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
   }
   .chevron {
     display: inline-flex;
     color: var(--text-faint);
-    transition: transform 0.14s ease;
+    transition: transform 0.12s ease;
   }
   .chevron.open {
     transform: rotate(90deg);
@@ -1238,22 +1194,14 @@
     gap: 8px;
     padding: 6px 4px 10px;
   }
-  .expand-title {
-    font-size: 11px;
-    font-weight: 620;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
+  .files-label {
     margin-top: 6px;
-  }
-  .expand-title:first-child {
-    margin-top: 0;
   }
 
   .mini-grid {
     display: flex;
     flex-direction: column;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .mini-row {
     display: grid;
@@ -1266,8 +1214,8 @@
     border-bottom: none;
   }
   .mini-head {
-    font-weight: 600;
-    color: var(--text-faint);
+    font-weight: var(--weight-medium);
+    color: var(--text-muted);
   }
   .mini-row .num {
     text-align: end;
@@ -1300,6 +1248,6 @@
   }
   .file-size {
     flex-shrink: 0;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
 </style>

@@ -1,4 +1,5 @@
-import { formatNumber } from '../i18n';
+import { formatNumber, t } from '../i18n';
+import { DETECTORS } from '../constants/inspectorDetectors';
 // Grouping, count rendering and badge logic for the Findings tab. Pure.
 
 export interface FindingView {
@@ -20,6 +21,8 @@ export interface FindingView {
 }
 
 export interface FindingBadge {
+  /** Stable identity for keyed `{#each}`; never rendered. */
+  id: string;
   label: string;
   /** The tooltip. Every badge explains a consequence, not a category. */
   title: string;
@@ -32,50 +35,67 @@ export function formatMatchCount(n: number, exact: boolean): string {
   const s = formatNumber(n);
   // A truncated unit makes every count a LOWER BOUND; rendering it as an
   // exact number would be a quiet lie on a privacy report.
-  return exact ? s : `at least ${s}`;
+  return exact ? s : t('inspector.atLeast', { n: s });
 }
 
+/**
+ * The badges for one finding, labels and tooltips already translated.
+ *
+ * Calls `t()`, so call it from markup (as the Findings tab does) to follow a
+ * language switch rather than caching the result.
+ */
 export function findingBadges(f: FindingView): FindingBadge[] {
   const out: FindingBadge[] = [];
   if (f.partition_kind === 'rollup') {
     out.push({
-      label: 'recurring',
-      title:
-        'This row is rewritten by every matching event, so an at-rest mask will be undone by the next event. Forward enforcement is what covers it.',
+      id: 'recurring',
+      label: t('inspector.badge.recurring.label'),
+      title: t('inspector.badge.recurring.title'),
     });
   }
   if (f.partition_kind === 'default') {
     out.push({
-      label: 'never ages out',
-      title:
-        'This row lives in the default partition, which is never exported to cold storage and never dropped. It is the longest-lived copy in the system.',
+      id: 'never-ages-out',
+      label: t('inspector.badge.neverAgesOut.label'),
+      title: t('inspector.badge.neverAgesOut.title'),
     });
   }
   if (SCAN_ONLY.has(f.source_table)) {
     out.push({
-      label: 'not maskable',
-      title:
+      id: 'not-maskable',
+      label: t('inspector.badge.notMaskable.label'),
+      title: t(
         f.source_table === 'devices'
-          ? 'Every devices column is COALESCE(EXCLUDED.x, devices.x), so a mask would report success and be overwritten by the next event from that device.'
+          ? 'inspector.badge.notMaskable.devices'
           : f.source_table === 'identities'
-            ? 'alias_id and distinct_id ARE the identity graph. Masking them merges every masked person into one rather than redacting anyone.'
-            : 'cancel_reason is derived server-side from an analytics event; mask analytics_events.properties instead, which is where the bytes arrive.',
+            ? 'inspector.badge.notMaskable.identities'
+            : 'inspector.badge.notMaskable.workflows',
+      ),
     });
   }
   if (f.env_scope === 'unattributed') {
     out.push({
-      label: 'no environment',
-      title: 'The platform could not attribute this row to an environment.',
+      id: 'no-environment',
+      label: t('inspector.badge.noEnvironment.label'),
+      title: t('inspector.badge.noEnvironment.title'),
     });
   }
   if (f.env_scope === 'no_env_column') {
     out.push({
-      label: 'app-wide table',
-      title: 'This table has no environment column at all, so the finding covers the whole app.',
+      id: 'app-wide',
+      label: t('inspector.badge.appWide.label'),
+      title: t('inspector.badge.appWide.title'),
     });
   }
   if (f.detector !== '') {
-    out.push({ label: f.detector, title: 'Matched by value shape, not by key name.' });
+    // The detector's name in words ("Credit card"); a detector the dashboard
+    // does not know yet keeps its wire id rather than disappearing.
+    const known = DETECTORS.find((d) => d.id === f.detector);
+    out.push({
+      id: `detector:${f.detector}`,
+      label: known ? t(known.labelKey) : f.detector,
+      title: t('inspector.badge.detector.title'),
+    });
   }
   return out;
 }

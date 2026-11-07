@@ -36,7 +36,7 @@
   }
   .label {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
   }
 </style>

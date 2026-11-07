@@ -38,11 +38,32 @@
      them a state this component does not know renders as an empty outline and
      reads as a broken row. Those four are single-class selectors declared
      after this rule, so they override it. */
-  .pill { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 999px;
-    font-size: 12px; font-weight: 600; border: 1px solid var(--border);
-    color: var(--text-muted); background: var(--surface-2); }
-  .up { color: #16794a; background: color-mix(in srgb, #16794a 12%, transparent); border-color: color-mix(in srgb, #16794a 40%, transparent); }
-  .down { color: #b42318; background: color-mix(in srgb, #b42318 12%, transparent); border-color: color-mix(in srgb, #b42318 40%, transparent); }
-  .paused { color: var(--text-muted); background: var(--surface-2); }
-  .unknown { color: var(--text-faint); background: var(--surface-2); }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 7px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    color: var(--text-muted);
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  .up {
+    color: var(--success);
+    background: var(--success-soft);
+  }
+  .down {
+    color: var(--error);
+    background: var(--error-soft);
+  }
+  .paused {
+    color: var(--text-muted);
+    background: var(--surface-2);
+  }
+  .unknown {
+    color: var(--text-faint);
+    background: var(--surface-2);
+  }
 </style>

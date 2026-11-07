@@ -4,6 +4,7 @@
   import { querystring } from 'svelte-spa-router';
   import AuthLayout from '../lib/components/layout/AuthLayout.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
   import { confirmEmailChange, previewEmailChange } from '../lib/api/auth';
   import type { EmailChangePreview } from '../lib/api/auth';
   import { errorMessage, isNormalizedError } from '../lib/api/client';
@@ -88,16 +89,15 @@
     <!-- No forced sign-out, and no push to /login: sessions deliberately
          survive this change, so the user is still signed in everywhere. Only
          the address they type at the sign-in form has moved. -->
-    <div class="panel" role="status">
-      <p>{t('prose.auth.emailChangeConfirmed')}</p>
-      <p><a href="#/login">{t('auth.forgot.backToSignIn')}</a></p>
-    </div>
+    <InlineNotice tone="success">{t('prose.auth.emailChangeConfirmed')}</InlineNotice>
   {:else if preview}
     <div class="form">
-      {#if error}<div class="alert" role="alert">{error}</div>{/if}
-      <p>{t('prose.auth.emailChangeIntro')}</p>
-      <p class="addr">{preview.new_email}</p>
-      <p class="muted">{t('prose.auth.emailChangeOrg')} {preview.org_name}</p>
+      {#if error}<InlineNotice tone="error">{error}</InlineNotice>{/if}
+      <div class="panel">
+        <p>{t('prose.auth.emailChangeIntro')}</p>
+        <p class="addr">{preview.new_email}</p>
+        <p class="muted">{t('prose.auth.emailChangeOrg')} {preview.org_name}</p>
+      </div>
       <Button variant="primary" size="lg" fullWidth loading={submitting} onclick={confirm}>
         {t('auth.emailChange.confirm')}
       </Button>
@@ -110,25 +110,24 @@
 </AuthLayout>
 
 <style>
-  .panel {
-    text-align: center;
-  }
   .form {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 16px;
   }
-  .addr {
-    font-size: 16px;
-    font-weight: 600;
-    word-break: break-all;
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: var(--text-sm);
+    line-height: 1.5;
   }
   .muted {
     color: var(--text-muted);
-    font-size: 13px;
   }
-  .alert {
-    color: var(--danger, #c0392b);
-    font-size: 13.5px;
+  .addr {
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
+    word-break: break-all;
   }
 </style>

@@ -6,6 +6,7 @@
   the sidebar entry's `show` is cosmetic — the endpoint's 403 is the real gate.
 -->
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
   import { formatNumber } from '../lib/i18n';
   import { querystring, replace } from 'svelte-spa-router';
@@ -17,7 +18,13 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import Spinner from '../lib/components/ui/Spinner.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import CountChip from '../lib/components/ui/CountChip.svelte';
   import Icon from '../lib/components/ui/Icon.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
   import SortableTh from '../lib/components/SortableTh.svelte';
   import ClientPager from '../lib/components/ClientPager.svelte';
@@ -31,11 +38,10 @@
   import { viewKey } from '../lib/stores/view-cache';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import { lockedBy } from '../lib/models/page-access';
-  import { lockTip } from '../lib/actions/lock-tip';
   import { toastStore } from '../lib/stores/toast.svelte';
   import { errorMessage } from '../lib/api/client';
   import * as inspectorApi from '../lib/api/inspector';
-  import { WEEKDAYS, COMMON_TIMEZONES, DST_RISK_HOURS } from '../lib/constants/inspectorSchedules';
+  import { WEEKDAY_KEYS, COMMON_TIMEZONES, DST_RISK_HOURS } from '../lib/constants/inspectorSchedules';
   import {
     weekdayMaskToArray,
     weekdayArrayToMask,
@@ -51,9 +57,12 @@
     defaultEnvEnrollmentId,
     inspectorTabFromQuery,
     inspectorTabRoute,
+    scanStatusLabel,
+    maskStatusLabel,
+    targetTypeLabel,
     type InspectorTab,
   } from '../lib/models/inspector';
-  import { DETECTORS, SUGGESTED_KEYS } from '../lib/constants/inspectorDetectors';
+  import { DETECTORS, SUGGESTED_KEYS, detectorHint } from '../lib/constants/inspectorDetectors';
   import { setOffsetPage, setOffsetSort, type OffsetListState } from '../lib/models/list-state';
   import {
     FINDING_DEFAULT_SORT,
@@ -126,7 +135,9 @@
   const effective = $derived(payload.effective);
   const scans = $derived(payload.scans);
   const findings = $derived(payload.findings);
-  const actions = $derived(payload.actions);
+  // `maskActions`, not `actions`: a Card's `{#snippet actions()}` would
+  // shadow a page variable of that name inside the card it belongs to.
+  const maskActions = $derived(payload.actions);
   const coverageNote = $derived(payload.coverageNote);
   const detectionCaveat = $derived(payload.detectionCaveat);
   const revalidating = $derived(view.revalidating);
@@ -150,11 +161,20 @@
    * so a badge reading 0 beside it would be describing nothing.
    */
   const TAB_META = $derived<{ key: InspectorTab; label: string; count: number | null }[]>([
-    { key: 'findings', label: 'Findings', count: findings.length },
-    { key: 'policy', label: 'Policy', count: null },
-    { key: 'scans', label: 'Scans', count: scans.length },
-    { key: 'audit', label: 'Audit', count: actions.length },
+    { key: 'findings', label: t('inspector.tab.findings'), count: findings.length },
+    { key: 'policy', label: t('inspector.tab.policy'), count: null },
+    { key: 'scans', label: t('inspector.tab.scans'), count: scans.length },
+    { key: 'audit', label: t('inspector.tab.audit'), count: maskActions.length },
   ]);
+
+  type Tone = 'neutral' | 'success' | 'warning' | 'error' | 'info';
+
+  /** Coloured only where the colour means something: done, or failed. */
+  function statusTone(s: string): Tone {
+    if (s === 'succeeded' || s === 'done') return 'success';
+    if (s === 'failed') return 'error';
+    return 'neutral';
+  }
 
   /**
    * Left/Right/Home/End across the strip, wrapping at both ends.
@@ -242,7 +262,7 @@
 
   let maskList = $state<OffsetListState>({ sort: MASK_DEFAULT_SORT, offset: 0 });
   const masksSorted = $derived(
-    sortRows(actions, maskActionAccessor(maskList.sort.key), maskList.sort.dir),
+    sortRows(maskActions, maskActionAccessor(maskList.sort.key), maskList.sort.dir),
   );
   const maskPage = $derived(pageSlice(masksSorted, maskList.offset, PAGE));
   function onMaskSort(key: string, columnDefault: SortDir) {
@@ -254,11 +274,6 @@
   // org-scoped on the wire (POST /v1/orgs/{org}/inspector/policies) with the
   // project / app / environment named in the body.
   type TargetType = 'project' | 'app' | 'app_env';
-  const TARGET_TYPES: { value: TargetType; label: string; hint: string }[] = [
-    { value: 'project', label: 'Project', hint: 'Covers every app in this project' },
-    { value: 'app', label: 'App', hint: 'Covers this app, in every environment' },
-    { value: 'app_env', label: 'Environment', hint: 'Covers one environment of this app' },
-  ];
   let newTargetType = $state<TargetType>('app');
   let newEnvId = $state('');
   let newKeyInput = $state(SUGGESTED_KEYS.join(', '));
@@ -268,6 +283,24 @@
   // Retired enrollments are hidden from every other picker in the app; a
   // policy scoped to one would inspect an environment that cannot ingest.
   const envOptions = $derived(sessionStore.environments.filter((e) => e.retired_at === null));
+  const TARGET_TYPES = $derived<{ value: TargetType; label: string; title: string; disabled?: boolean }[]>([
+    { value: 'project', label: targetTypeLabel('project'), title: t('inspector.targetHint.project') },
+    { value: 'app', label: targetTypeLabel('app'), title: t('inspector.targetHint.app') },
+    {
+      value: 'app_env',
+      label: targetTypeLabel('app_env'),
+      title:
+        envOptions.length === 0 ? t('inspector.noActiveEnvs') : t('inspector.targetHint.appEnv'),
+      disabled: envOptions.length === 0,
+    },
+  ]);
+  const envSelectOptions = $derived(
+    envOptions.map((env) => ({
+      value: env.id,
+      label: env.is_default ? t('inspector.envDefault', { name: env.name }) : env.name,
+    })),
+  );
+  const tzOptions = COMMON_TIMEZONES.map((tz) => ({ value: tz, label: tz }));
   const newKeys = $derived(parseKeyInput(newKeyInput));
   const newTargetId = $derived(
     newTargetType === 'project'
@@ -357,7 +390,7 @@
   $effect(() => {
     const busy =
       scans.some((s) => s.status === 'queued' || s.status === 'running') ||
-      actions.some((a) => ['preview', 'pending', 'running', 'cancelling'].includes(a.status));
+      maskActions.some((a) => ['preview', 'pending', 'running', 'cancelling'].includes(a.status));
     if (!busy) return;
     const id = setInterval(() => void loadAll(true), 3000);
     return () => clearInterval(id);
@@ -365,18 +398,19 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <h1 class="page-title">
-      {t('inspector.title')}
+  <PageHeader
+    title={t('inspector.title')}
+    subtitle={effective
+      ? t('inspector.enforcementLatency', { n: effective.enforcement_latency_secs })
+      : undefined}
+  >
+    {#snippet freshness()}
       <Freshness fetchedAt={view.fetchedAt} {revalidating} />
-    </h1>
-    <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
-    {#if effective}
-      <span class="muted">
-        New events are masked within about {effective.enforcement_latency_secs} seconds of a change.
-      </span>
-    {/if}
-  </div>
+    {/snippet}
+    {#snippet refresh()}
+      <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+  </PageHeader>
 
   <!--
     A real `tablist`, not four buttons that look like one. They already behaved
@@ -385,6 +419,8 @@
     below, and Left/Right did nothing. `tabindex` is roving — only the selected
     tab is in the tab order, so Tab moves past the whole strip to the panel,
     which is the ARIA authoring-practices behaviour people expect from tabs.
+    They stay tabs (not a SegmentedControl) because each one swaps the whole
+    panel below for a different view.
   -->
   <div class="tabs" role="tablist" aria-label={t('inspector.sections')}>
     {#each TAB_META as meta (meta.key)}
@@ -407,27 +443,38 @@
           to see" and then silently changed its mind.
         -->
         {#if !loading && meta.count !== null}
-          <span class="count">{meta.count}</span>
+          <CountChip n={formatNumber(meta.count)} />
         {/if}
       </button>
     {/each}
   </div>
 
   <div class="content" id="inspector-panel" role="tabpanel" aria-labelledby={`tab-${tab}`}>
-  {#if error}
-    <Card><p class="err">{error}</p></Card>
+  {#if error && !view.hasData}
+    <ErrorState title={t('inspector.error.load')} error={view} onretry={refresher.run} />
   {:else if loading}
-    <Card><Skeleton rows={6} label={t('inspector.loading')} /></Card>
-  {:else if tab === 'findings'}
-    <Card>
-      <!-- Non-dismissible, always. Detection is best-effort: the prefilter
-           greps the JSON TEXT for the quoted key name, so a key hidden by a
-           unicode escape, base64 or URL encoding is not found. -->
-      <p class="caveat"><Icon name="info" size={14} /> {detectionCaveat}</p>
-      {#if coverageNote}
-        <p class="caveat">Coverage is partial: {coverageNote}</p>
-      {/if}
-    </Card>
+    <Skeleton rows={6} label={t('inspector.loading')} />
+  {:else}
+    {#if error}
+      <!-- A reload failed over data already on screen (a poll tick, a
+           Refresh): it stays, with the reason and a way back. -->
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
+    {/if}
+  {#if tab === 'findings'}
+    <!-- Non-dismissible, always. Detection is best-effort: the prefilter
+         greps the JSON TEXT for the quoted key name, so a key hidden by a
+         unicode escape, base64 or URL encoding is not found. -->
+    {#if detectionCaveat}
+      <InlineNotice tone="info">{detectionCaveat}</InlineNotice>
+    {/if}
+    {#if coverageNote}
+      <InlineNotice tone="warning">{t('inspector.coveragePartial', { note: coverageNote })}</InlineNotice>
+    {/if}
     {#if findings.length === 0}
       <EmptyState
         title={t('inspector.empty.noFindings')}
@@ -445,8 +492,10 @@
         {@const gl = findingList(g.key)}
         {@const gSorted = sortRows(g.findings, findingAccessor(gl.sort.key), gl.sort.dir)}
         {@const gPage = pageSlice(gSorted, gl.offset, PAGE)}
-        <Card>
-          <h3>{g.table}.{g.column} <Badge>{formatMatchCount(g.total, true)} matches</Badge></h3>
+        <Card title={`${g.table}.${g.column}`}>
+          {#snippet actions()}
+            <Badge size="sm">{t('inspector.matchCount', { n: formatMatchCount(g.total, true) })}</Badge>
+          {/snippet}
           <DataTable>
             {#snippet head()}
               <tr>
@@ -491,15 +540,15 @@
                   class="clickable"
                   onclick={() => (expanded = { ...expanded, [f.id]: !expanded[f.id] })}
                 >
-                  <td>{f.key_path || '(whole value)'}</td>
+                  <td>{f.key_path || t('inspector.wholeValue')}</td>
                   <td>{f.value_type}</td>
                   <td class="num">{formatMatchCount(f.match_count, f.match_count_exact)}</td>
                   <td><TimeValue value={f.last_seen_at} /></td>
                   <td>
                     <!-- Badge has no `title` prop, so the consequence text
                          hangs on a wrapping span instead. -->
-                    {#each findingBadges(f) as b (b.label)}
-                      <span title={b.title}><Badge>{b.label}</Badge></span>
+                    {#each findingBadges(f) as b (b.id)}
+                      <span title={b.title}><Badge size="sm">{b.label}</Badge></span>
                     {/each}
                     {#if !['devices', 'identities', 'workflows'].includes(f.source_table)}
                       <Button
@@ -584,8 +633,7 @@
       {/each}
     {/if}
   {:else if tab === 'policy'}
-    <Card>
-      <h3>{t('inspector.inspection')}</h3>
+    <Card title={t('inspector.inspection')}>
       {#if !policy}
         <!-- This used to be a bare EmptyState reading "Create one from the
              organization settings" — a dead pointer: there is no org settings
@@ -593,6 +641,7 @@
              dashboard, so no role could create a policy at all. The form is
              here, where the wall is. -->
         <EmptyState
+          size="section"
           title={t('inspector.empty.noPolicy')}
           description={t('inspector.empty.noPolicyBody')}
         />
@@ -622,22 +671,16 @@
             <p class="caveat">
               {t('prose.inspector.precedence')}
             </p>
-            <div class="chips">
-              {#each TARGET_TYPES as tt (tt.value)}
-                <Button
-                  size="sm"
-                  variant={newTargetType === tt.value ? 'primary' : 'ghost'}
-                  lockedReason={manageLock}
-                  disabled={tt.value === 'app_env' && envOptions.length === 0}
-                  title={tt.value === 'app_env' && envOptions.length === 0
-                    ? 'This app has no active environments'
-                    : tt.hint}
-                  onclick={() => (newTargetType = tt.value)}
-                >
-                  {tt.label}
-                </Button>
-              {/each}
-            </div>
+            <!-- One choice of three: a segmented control, not three buttons
+                 dressed as one. Locked as a whole when `pii:manage` is
+                 missing; the submit button below carries the lock's reason. -->
+            <SegmentedControl
+              value={newTargetType}
+              options={TARGET_TYPES}
+              ariaLabel={t('members.column.scope')}
+              lockedReason={manageLock}
+              onchange={(v) => (newTargetType = v as TargetType)}
+            />
           </fieldset>
 
           <fieldset class="field">
@@ -647,22 +690,18 @@
                    catalogue `environment_id` — `validate_scope_in_org` matches
                    `app_environments.id` for app_env, and sending the catalogue
                    id would 404 with no hint as to why. -->
-              <select
-                class="sel"
-                aria-label={t('inspector.targetEnvironment')}
-                use:lockTip={manageLock}
+              <Select
                 bind:value={newEnvId}
-              >
-                {#each envOptions as env (env.id)}
-                  <option value={env.id}>{env.name}{env.is_default ? ' (default)' : ''}</option>
-                {/each}
-              </select>
+                options={envSelectOptions}
+                ariaLabel={t('inspector.targetEnvironment')}
+                lockedReason={manageLock}
+              />
             {:else}
               <p class="target">
-                <Badge>{newTargetType === 'project' ? 'project' : 'app'}</Badge>
+                <Badge size="sm">{targetTypeLabel(newTargetType)}</Badge>
                 {newTargetType === 'project'
-                  ? (sessionStore.currentProject?.name ?? 'this project')
-                  : (sessionStore.currentApp?.name ?? 'this app')}
+                  ? (sessionStore.currentProject?.name ?? t('inspector.thisProject'))
+                  : (sessionStore.currentApp?.name ?? t('inspector.thisApp'))}
               </p>
             {/if}
           </fieldset>
@@ -671,8 +710,9 @@
             <legend>{t('inspector.trackedKeys')}</legend>
             <p class="caveat">
               {t('inspector.literalKeys')}
-              <code>{t('common.email')}</code> matches <code>email</code>; <code>user_email</code> does not.
-              Separate with commas or spaces.
+              <code>Email</code> {t('inspector.keyExample.matches')} <code>email</code>;
+              <code>user_email</code> {t('inspector.keyExample.doesNot')}
+              {t('inspector.separateKeys')}
             </p>
             <Input
               bind:value={newKeyInput}
@@ -681,7 +721,7 @@
             />
             {#if newKeys.length > 0}
               <div class="chips">
-                {#each newKeys as k (k.key)}<Badge>{k.key}</Badge>{/each}
+                {#each newKeys as k (k.key)}<Badge size="sm">{k.key}</Badge>{/each}
               </div>
             {/if}
           </fieldset>
@@ -693,7 +733,7 @@
             </p>
             <div class="dets">
               {#each DETECTORS as d (d.id)}
-                <label class="det" title={d.hint}>
+                <label class="det" title={detectorHint(d)}>
                   <input
                     type="checkbox"
                     disabled={manageLock !== null}
@@ -705,7 +745,7 @@
                         : newDetectors.filter((x) => x !== d.id);
                     }}
                   />
-                  <span>{d.label}</span>
+                  <span>{t(d.labelKey)}</span>
                 </label>
               {/each}
             </div>
@@ -729,10 +769,10 @@
           </div>
         </form>
       {:else}
-        <p>
-          {t('prose.inspector.scopeLabel')} <Badge>{policy.target_type}</Badge>
+        <p class="policy-line">
+          {t('prose.inspector.scopeLabel')} <Badge size="sm">{targetTypeLabel(policy.target_type)}</Badge>
           {t('prose.inspector.statusLabel')}
-          <Badge tone={policy.enabled ? 'success' : 'neutral'}>
+          <Badge size="sm" tone={policy.enabled ? 'success' : 'neutral'}>
             {policy.enabled ? t('prose.inspector.enabled') : t('prose.inspector.disabled')}
           </Badge>
         </p>
@@ -741,18 +781,19 @@
           lockedReason={manageLock}
           onclick={() => act(() => inspectorApi.patchPolicy(policy.id, { enabled: !policy.enabled }))}
         >
-          {policy.enabled ? 'Disable' : 'Enable'}
+          {policy.enabled ? t('inspector.disable') : t('inspector.enable')}
         </Button>
 
-        <h4>{t('inspector.trackedKeys')}</h4>
+        <p class="section-label sub-head">{t('inspector.trackedKeys')}</p>
         <p class="caveat">
           {t('inspector.keyMatchNote')}
-          <code>{t('common.email')}</code> matches <code>email</code>; <code>user_email</code> does not.
+          <code>Email</code> {t('inspector.keyExample.matches')} <code>email</code>;
+          <code>user_email</code> {t('inspector.keyExample.doesNot')}
         </p>
         <div class="chips">
           {#each policy.tracked_keys as k (k.key)}
             <Badge>
-              {k.key}{k.scope === 'top' ? ' (top level)' : ''}
+              {k.key}{k.scope === 'top' ? ` ${t('inspector.topLevel')}` : ''}
               <Button
                 size="sm"
                 lockedReason={manageLock}
@@ -790,7 +831,7 @@
             <Button type="submit" size="sm" lockedReason={manageLock}>{t('filter.add')}</Button>
           </form>
 
-        <h4>{t('inspector.schedule')}</h4>
+        <p class="section-label sub-head">{t('inspector.schedule')}</p>
         <p>{describeSchedule(policy.schedule_days, policy.schedule_time, policy.schedule_tz)}</p>
         {#if DST_RISK_HOURS.includes(Number.parseInt(policy.schedule_time.slice(0, 2), 10))}
           <p class="caveat">
@@ -812,76 +853,83 @@
                   });
                 })}
             >
-              {WEEKDAYS[i]}
+              {t(WEEKDAY_KEYS[i])}
             </Button>
           {/each}
         </div>
-        <!-- No Select primitive; a raw <select> fed by the constants module. -->
-        <select
-          class="sel"
-          aria-label={t('inspector.scheduleTimezone')}
-          use:lockTip={manageLock}
-          value={policy.schedule_tz}
-          onchange={(e: Event) =>
-            act(() =>
-              inspectorApi.patchPolicy(policy.id, {
-                schedule_tz: (e.currentTarget as HTMLSelectElement).value,
-              }),
-            )}
-        >
-          {#each COMMON_TIMEZONES as tz (tz)}
-            <option value={tz}>{tz}</option>
-          {/each}
-        </select>
+        <div class="tz">
+          <Select
+            value={policy.schedule_tz}
+            options={tzOptions}
+            ariaLabel={t('inspector.scheduleTimezone')}
+            lockedReason={manageLock}
+            onchange={(v) =>
+              act(() =>
+                inspectorApi.patchPolicy(policy.id, {
+                  schedule_tz: v,
+                }),
+              )}
+          />
+        </div>
         <p class="caveat">
-          Next runs (approximate — the server decides):
-          {nextRuns(policy.schedule_days, policy.schedule_time, policy.schedule_tz)
-            .map((d) => d.toISOString())
-            .join(', ') || 'none'}
+          {t('inspector.nextRuns', {
+            runs:
+              nextRuns(policy.schedule_days, policy.schedule_time, policy.schedule_tz)
+                .map((d) => d.toISOString())
+                .join(', ') || t('common.none'),
+          })}
         </p>
         {#if policy.last_skip_reason}
-          <p class="caveat">Last scheduled run: {policy.last_skip_reason}</p>
+          <p class="caveat">{t('inspector.lastSkip', { reason: policy.last_skip_reason })}</p>
         {/if}
       {/if}
     </Card>
 
-    <Card>
-      <h3>{t('inspector.forwardEnforcement')}</h3>
-      <p class="caveat">
-        New events are masked within about {effective?.enforcement_latency_secs} seconds of a change.
-      </p>
+    <Card title={t('inspector.forwardEnforcement')}>
+      {#if effective}
+        <p class="caveat">
+          {t('inspector.enforcementLatency', { n: effective.enforcement_latency_secs })}
+        </p>
+      {/if}
       {#if (effective?.masked_keys ?? []).length === 0}
-        <EmptyState title={t('inspector.empty.nothingMasked')} description={t('inspector.empty.maskToEnforce')} />
+        <EmptyState
+          size="section"
+          title={t('inspector.empty.nothingMasked')}
+          description={t('inspector.empty.maskToEnforce')}
+        />
       {:else}
         <ul>
           {#each effective?.masked_keys ?? [] as k (k.id)}
             <li>
               <code>{k.target_table}.{k.target_column}{k.json_path ? `.${k.json_path}` : ''}</code>
-              <span class="caveat">since <TimeValue value={k.created_at} /></span>
+              <span class="caveat">{t('inspector.since')} <TimeValue value={k.created_at} /></span>
             </li>
           {/each}
         </ul>
       {/if}
     </Card>
   {:else if tab === 'scans'}
-    <Card>
-      <div class="head">
-        <h3>{t('inspector.tab.scans')}</h3>
+    <Card title={t('inspector.tab.scans')}>
+      {#snippet actions()}
         {#if policy}
           <Button
             lockedReason={manageLock}
             onclick={() =>
               act(async () => {
                 await inspectorApi.startScan(policy.id);
-                toastStore.success('Scan queued');
+                toastStore.success(t('inspector.scanQueued'));
               })}
           >
             {t('inspector.runScan')}
           </Button>
         {/if}
-      </div>
+      {/snippet}
       {#if scans.length === 0}
-        <EmptyState title={t('inspector.empty.noScans')} description={t('inspector.empty.noScansBody')}>
+        <EmptyState
+          size="section"
+          title={t('inspector.empty.noScans')}
+          description={t('inspector.empty.noScansBody')}
+        >
           {#snippet action()}
             <Button variant="secondary" onclick={() => goTab('policy')}>{t('inspector.setSchedule')}</Button>
           {/snippet}
@@ -920,16 +968,20 @@
                 <td><TimeValue value={s.started_at} /></td>
                 <td><TimeValue value={s.finished_at} /></td>
                 <td>
-                  {#if s.status === 'running' || s.status === 'queued'}
-                    <Spinner size={14} />
-                  {/if}
-                  <Badge>{s.status}</Badge>
+                  <span class="status-cell">
+                    {#if s.status === 'running' || s.status === 'queued'}
+                      <Spinner size={14} />
+                    {/if}
+                    <Badge size="sm" tone={statusTone(s.status)}>{scanStatusLabel(s.status)}</Badge>
+                  </span>
                 </td>
                 <td class="num">{formatNumber(s.rows_scanned)}</td>
                 <td class="num">{formatNumber(s.findings_count)}</td>
                 <td>
                   <span title={s.coverage_note}>
-                    <Badge tone={s.coverage === 'full' ? 'success' : 'warning'}>{s.coverage}</Badge>
+                    <Badge size="sm" tone={s.coverage === 'full' ? 'success' : 'warning'}>
+                      {s.coverage === 'full' ? t('inspector.coverage.full') : t('inspector.coverage.partial')}
+                    </Badge>
                   </span>
                 </td>
                 <td>
@@ -980,14 +1032,40 @@
       {/if}
     </Card>
   {:else}
-    <Card>
-      <h3>{t('inspector.maskAuditTrail')}</h3>
+    <Card title={t('inspector.maskAuditTrail')}>
+      {#snippet actions()}
+        {#if maskActions.length > 0}
+          <!-- Exports the WHOLE trail, not the page on screen — the server
+               builds the CSV from the app's actions and knows nothing about
+               this pager. -->
+          <Button
+            size="sm"
+            onclick={() => {
+              if (!appId) return;
+              void act(
+                () =>
+                  inspectorApi.downloadMaskActionsCsv(
+                    appId,
+                    csvFilename('mask-actions', appSlug, '', ''),
+                  ),
+                false,
+              );
+            }}
+          >
+            <Icon name="download" size={14} />
+            {t('explore.exportCsv')}
+          </Button>
+        {/if}
+      {/snippet}
       <p class="caveat">
-        {t('inspector.readableBy')} <code>pii:read</code> — deliberately, and affordable precisely
-        because these rows store paths and counts and never a value.
+        {t('inspector.readableBy')} <code>pii:read</code> {t('inspector.readableByWhy')}
       </p>
-      {#if actions.length === 0}
-        <EmptyState title={t('inspector.empty.nothingMaskedTrail')} description={t('inspector.empty.maskToTrail')} />
+      {#if maskActions.length === 0}
+        <EmptyState
+          size="section"
+          title={t('inspector.empty.nothingMaskedTrail')}
+          description={t('inspector.empty.maskToTrail')}
+        />
       {:else}
         <DataTable>
           {#snippet head()}
@@ -1024,8 +1102,8 @@
               >
                 <td><TimeValue value={a.requested_at} /></td>
                 <td>{a.requested_by_email || '—'}</td>
-                <td class="num">{a.targets.length}</td>
-                <td><Badge>{a.status}</Badge></td>
+                <td class="num">{formatNumber(a.targets.length)}</td>
+                <td><Badge size="sm" tone={statusTone(a.status)}>{maskStatusLabel(a.status)}</Badge></td>
                 <!-- rows_masked > estimated_rows is NORMAL on an actively
                      ingesting app, because preview and execution are separated
                      in time. Never render it as an error. -->
@@ -1061,12 +1139,14 @@
                           </span>
                         </div>
                       {/if}
-                      <h4>{t('inspector.notReached')}</h4>
+                      <p class="section-label">{t('inspector.notReached')}</p>
                       {#each UNREACHABLE_COPY as r, i (i)}
                         <div role="row">
-                          <span role="cell">{r.headline ? '' : r.what}</span>
+                          <span role="cell">{r.headline ? '' : t(r.whatKey)}</span>
                           <span role="cell" class:headline={r.headline}>
-                            {r.headline ? r.what : `${r.why} — bounded by: ${r.bounded}`}
+                            {r.headline
+                              ? t(r.whatKey)
+                              : t('inspector.boundedBy', { why: t(r.whyKey), bounded: t(r.boundedKey) })}
                           </span>
                         </div>
                       {/each}
@@ -1086,27 +1166,9 @@
           total={masksSorted.length}
           onchange={(o) => (maskList = setOffsetPage(maskList, o))}
         />
-
-        <!-- Exports the WHOLE trail, not the page on screen — the server builds
-             the CSV from the app's actions and knows nothing about this pager. -->
-        <Button
-          size="sm"
-          onclick={() => {
-            if (!appId) return;
-            void act(
-              () =>
-                inspectorApi.downloadMaskActionsCsv(
-                  appId,
-                  csvFilename('mask-actions', appSlug, '', ''),
-                ),
-              false,
-            );
-          }}
-        >
-          {t('explore.exportCsv')}
-        </Button>
       {/if}
     </Card>
+  {/if}
   {/if}
   </div>
 </AdminShell>
@@ -1128,39 +1190,31 @@
   .content {
     display: flex;
     flex-direction: column;
-    gap: 16px;
-  }
-  .head {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-    margin-bottom: 12px;
-  }
-  .muted {
-    color: var(--text-muted);
-    font-size: 12.5px;
-  }
-  /* --danger is not defined in app.css; the theme name is --error. An undefined
-     custom property with no fallback invalidates the whole declaration, so this
-     banner — the one that must render the 403 the cosmetic sidebar `show` does
-     not prevent — inherited body colour and stopped reading as a failure. */
-  .err {
-    color: var(--error);
+    gap: var(--page-gap);
+    margin-top: var(--page-gap);
   }
   .tabs {
     display: flex;
     gap: 4px;
     border-bottom: 1px solid var(--border);
   }
+  /* Quiet tabs: the selected one is full-contrast text over a 2px rule in the
+     same colour; the rest are muted. No accent — the selection is a state of
+     the strip, not a call to action. */
   .tab {
-    padding: 8px 14px;
-    font-size: 13.5px;
-    font-weight: 550;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    margin-bottom: -1px;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
     background: none;
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease;
   }
   .tab:hover {
     color: var(--text);
@@ -1173,20 +1227,12 @@
     border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   }
   .tab.active {
-    color: var(--primary);
-    border-bottom-color: var(--primary);
-  }
-  .count {
-    display: inline-block;
-    margin-inline-start: 6px;
-    padding: 1px 6px;
-    border-radius: 999px;
-    background: var(--surface-2);
-    font-size: 11px;
+    color: var(--text);
+    border-bottom-color: var(--text);
   }
   .caveat {
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     margin: 0 0 6px;
   }
   .detail {
@@ -1205,8 +1251,24 @@
     gap: 6px;
     margin: 6px 0;
   }
-  .sel {
-    padding: 6px 8px;
+  .tz {
+    margin: 6px 0;
+  }
+  .policy-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 10px;
+    font-size: var(--text-sm);
+  }
+  .sub-head {
+    margin: 20px 0 6px;
+  }
+  .status-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
   .addkey {
     display: flex;
@@ -1214,7 +1276,7 @@
     gap: 8px;
   }
   .headline {
-    font-weight: 600;
+    font-weight: var(--weight-strong);
   }
   .create {
     display: grid;
@@ -1233,15 +1295,15 @@
   .create legend {
     padding: 0;
     margin-bottom: 4px;
-    font-size: 13.5px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
   }
   .target {
     display: flex;
     align-items: center;
     gap: 8px;
     margin: 0;
-    font-size: 13.5px;
+    font-size: var(--text-sm);
   }
   .dets {
     display: grid;
@@ -1252,7 +1314,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 13px;
+    font-size: var(--text-sm);
     cursor: pointer;
   }
   .det input {

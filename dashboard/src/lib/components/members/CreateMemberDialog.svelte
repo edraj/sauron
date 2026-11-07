@@ -4,6 +4,8 @@
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Input from '../ui/Input.svelte';
+  import Select from '../ui/Select.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import CopyButton from '../ui/CopyButton.svelte';
   import ScopeTree from './ScopeTree.svelte';
   import { createMember } from '../../api/orgs';
@@ -119,7 +121,7 @@
 <Modal
   {open}
   size="lg"
-  title={tempPassword ? 'Member created' : 'Create member'}
+  title={tempPassword ? t('members.created') : t('members.new')}
   dismissible={tempPassword === null}
   onclose={onclose}
 >
@@ -131,9 +133,7 @@
       <code>{tempPassword}</code>
       <CopyButton value={tempPassword} size="sm" />
     </div>
-    <p class="warning">
-      {t('prose.members.oneTimeSecret')}
-    </p>
+    <InlineNotice tone="warning">{t('prose.members.oneTimeSecret')}</InlineNotice>
   {:else}
     <div class="fields">
       <Input
@@ -144,14 +144,11 @@
         required
       />
       <Input label={t('common.name')} bind:value={name} placeholder={t('members.placeholder.name')} />
-      <div class="gf-field">
-        <span class="lbl">{t('members.column.role')}</span>
-        <select class="sel" bind:value={roleId} aria-label={t('members.column.role')}>
-          {#each roles as role (role.id)}
-            <option value={role.id}>{role.name}</option>
-          {/each}
-        </select>
-      </div>
+      <Select
+        label={t('members.column.role')}
+        bind:value={roleId}
+        options={roles.map((r) => ({ value: r.id, label: r.name }))}
+      />
       <div class="gf-field">
         <span class="lbl">{t('members.column.scope')}</span>
         <ScopeTree
@@ -168,14 +165,14 @@
         />
       </div>
     </div>
-    {#if error}<p class="err-msg">{error}</p>{/if}
+    {#if error}<p class="err-msg" role="alert">{error}</p>{/if}
   {/if}
 
   {#snippet footer()}
     {#if tempPassword}
       <Button variant="primary" onclick={onclose}>{t('common.done')}</Button>
     {:else}
-      <Button variant="ghost" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
+      <Button variant="secondary" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
       <Button variant="primary" disabled={!canSubmit} loading={saving} onclick={submit}>
         {t('members.create')}
       </Button>
@@ -185,7 +182,7 @@
 
 <style>
   .lede {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     margin-bottom: 14px;
   }
@@ -201,23 +198,9 @@
     gap: 6px;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
-  }
-  .sel {
-    padding: 10px 13px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text);
-    font-size: 13.5px;
-    outline: none;
-    height: 40px;
-  }
-  .sel option {
-    background: var(--surface);
-    color: var(--text);
   }
   .temp-password {
     display: flex;
@@ -231,23 +214,15 @@
     margin-bottom: 14px;
   }
   .temp-password code {
-    font-size: 14px;
-    font-weight: 620;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     letter-spacing: 0.02em;
     color: var(--text);
     word-break: break-all;
   }
-  .warning {
-    font-size: 12.5px;
-    color: var(--warning);
-    background: var(--warning-soft);
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-radius: var(--radius);
-    padding: 8px 12px;
-  }
   .err-msg {
     color: var(--error);
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin-top: 4px;
   }
 </style>

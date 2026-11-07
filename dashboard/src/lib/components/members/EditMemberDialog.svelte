@@ -1,13 +1,15 @@
 <script lang="ts">
-  import { t } from '../../i18n';
+  import { formatNumber, t } from '../../i18n';
   import { untrack } from 'svelte';
   import Modal from '../ui/Modal.svelte';
   import Button from '../ui/Button.svelte';
   import Badge from '../ui/Badge.svelte';
   import Skeleton from '../ui/Skeleton.svelte';
+  import Select from '../ui/Select.svelte';
+  import InlineNotice from '../ui/InlineNotice.svelte';
   import ScopeTree from './ScopeTree.svelte';
   import { createGrant, deleteGrant } from '../../api/orgs';
-  import { isNormalizedError } from '../../api/client';
+  import { errorMessage, isNormalizedError } from '../../api/client';
   import { authStore } from '../../stores/auth.svelte';
   import {
     emptyBlockKeys,
@@ -270,7 +272,7 @@
   }
 
   function roleName(id: string): string {
-    return rolesById[id]?.name ?? 'Unknown role';
+    return rolesById[id]?.name ?? t('members.edit.unknownRole');
   }
 
   /** An env's own name, prefixed with its app's name when known — mirrors the
@@ -300,20 +302,24 @@
 
   const addSummary = $derived(
     plan.additions
-      .flatMap((a) => a.scopes.map((s) => `${roleName(a.roleId)} on ${scopeRefLabel(s)}`))
+      .flatMap((a) =>
+        a.scopes.map((s) => t('members.edit.roleOn', { role: roleName(a.roleId), scope: scopeRefLabel(s) })),
+      )
       .join(', '),
   );
 
   const removeSummary = $derived(
-    plan.revocations.map((g) => `${roleName(g.role_id)} on ${scopeLabel(g)}`).join(', '),
+    plan.revocations
+      .map((g) => t('members.edit.roleOn', { role: roleName(g.role_id), scope: scopeLabel(g) }))
+      .join(', '),
   );
 
   /** Two roles reaching the same scope is legal — permissions union. Say so. */
   const overlapNote = $derived.by(() => {
     const orgBlocks = blocks.filter((b) => b.selection.org);
     if (orgBlocks.length < 2) return '';
-    const names = orgBlocks.map((b) => roleName(b.roleId)).join(' and ');
-    return `${names} both cover ${orgName} — permissions add up.`;
+    const names = orgBlocks.map((b) => roleName(b.roleId)).join(t('members.edit.and'));
+    return t('members.edit.overlap', { names, org: orgName });
   });
 
   function humanize(message: string): string {
@@ -340,8 +346,11 @@
     // one more Save from correct) rather than locked out.
     for (const add of plan.additions) {
       done += 1;
-      progress = `Applying ${done} of ${total}…`;
-      const label = `Grant ${roleName(add.roleId)} on ${add.scopes.map(scopeRefLabel).join(', ')}`;
+      progress = t('members.edit.applying', { done: formatNumber(done), total: formatNumber(total) });
+      const label = t('members.edit.stepGrant', {
+        role: roleName(add.roleId),
+        scope: add.scopes.map(scopeRefLabel).join(', '),
+      });
       try {
         await createGrant(orgId, {
           email: member.email,
@@ -352,7 +361,7 @@
         networkFailures = 0;
       } catch (err) {
         anyGrantFailed = true;
-        steps.push({ label, status: 'error', message: humanize(readMessage(err)) });
+        steps.push({ label, status: 'error', message: humanize(errorMessage(err, t('members.edit.somethingWrong'))) });
         if (isNormalizedError(err) && err.isNetwork) networkFailures += 1;
         else networkFailures = 0;
         if (networkFailures >= 2) break;
@@ -365,21 +374,21 @@
     // 403s — running the delete anyway is the one way this dialog could
     // destroy access.
     for (const g of plan.revocations) {
-      const label = `Remove ${roleName(g.role_id)} on ${scopeLabel(g)}`;
+      const label = t('members.edit.stepRemove', { role: roleName(g.role_id), scope: scopeLabel(g) });
       if (anyGrantFailed) {
         steps.push({
           label,
           status: 'skipped',
-          message: 'Kept, because some new access could not be granted.',
+          message: t('members.edit.keptBecause'),
         });
         continue;
       }
       if (networkFailures >= 2) {
-        steps.push({ label, status: 'skipped', message: 'Stopped — the API is unreachable.' });
+        steps.push({ label, status: 'skipped', message: t('members.edit.unreachable') });
         continue;
       }
       done += 1;
-      progress = `Applying ${done} of ${total}…`;
+      progress = t('members.edit.applying', { done: formatNumber(done), total: formatNumber(total) });
       try {
         await deleteGrant(g.id);
         steps.push({ label, status: 'ok' });
@@ -389,14 +398,14 @@
         // would strand the dialog in its result panel after any retry, or when
         // another admin removed the same grant first.
         if (isNormalizedError(err) && err.status === 404) {
-          steps.push({ label, status: 'ok', message: 'Already removed.' });
+          steps.push({ label, status: 'ok', message: t('members.edit.alreadyRemoved') });
           continue;
         }
-        let message = humanize(readMessage(err));
+        let message = humanize(errorMessage(err, t('members.edit.somethingWrong')));
         // DELETE's 403 is the bare "you do not have access", unlike POST's,
         // which names the scope — so say which check actually failed.
         if (isNormalizedError(err) && err.status === 403) {
-          message = `You don't hold every permission in "${roleName(g.role_id)}" at this scope, so you can't remove this grant.`;
+          message = t('members.edit.cannotRemove', { role: roleName(g.role_id) });
         }
         steps.push({ label, status: 'error', message });
         if (isNormalizedError(err) && err.isNetwork) networkFailures += 1;
@@ -417,12 +426,6 @@
     }
   }
 
-  function readMessage(err: unknown): string {
-    if (isNormalizedError(err)) return err.message;
-    if (err instanceof Error) return err.message;
-    return 'Something went wrong';
-  }
-
   /** Re-seed from the now-authoritative server state and return to the form. */
   function backToEditing() {
     results = null;
@@ -433,7 +436,9 @@
 <Modal
   {open}
   size="lg"
-  title={member ? `Edit access — ${member.name || member.email}` : 'Edit access'}
+  title={member
+    ? t('members.edit.titleFor', { name: member.name || member.email })
+    : t('members.edit.title')}
   dismissible={!saving}
   onclose={onclose}
 >
@@ -447,7 +452,11 @@
       {#each results as step, i (i)}
         <li class="result-row">
           <Badge tone={step.status === 'ok' ? 'success' : step.status === 'error' ? 'error' : 'neutral'} size="sm">
-            {step.status === 'ok' ? 'done' : step.status === 'error' ? 'failed' : 'kept'}
+            {step.status === 'ok'
+              ? t('members.edit.step.done')
+              : step.status === 'error'
+                ? t('members.edit.step.failed')
+                : t('members.edit.step.kept')}
           </Badge>
           <div class="r-body">
             <span class="r-label">{step.label}</span>
@@ -467,14 +476,14 @@
     <p class="lede">{t('members.edit.tickReach')}</p>
 
     {#if !member.is_active}
-      <p class="warning">
-        {t('prose.members.deactivated')}
-      </p>
+      <div class="warning">
+        <InlineNotice tone="warning">{t('prose.members.deactivated')}</InlineNotice>
+      </div>
     {/if}
     {#if editingSelf}
-      <p class="warning">
-        {t('prose.members.selfEdit')}
-      </p>
+      <div class="warning">
+        <InlineNotice tone="warning">{t('prose.members.selfEdit')}</InlineNotice>
+      </div>
     {/if}
 
     <div class="blocks">
@@ -483,18 +492,13 @@
         <div class="block" class:invalid={isEmpty}>
           <div class="b-head">
             <div class="gf-field">
-              <span class="lbl">{t('members.column.role')}</span>
-              <select
-                class="sel"
+              <Select
+                label={t('members.column.role')}
                 value={block.roleId}
-                aria-label={t('members.column.role')}
+                options={availableRoles(block).map((r) => ({ value: r.id, label: r.name }))}
                 disabled={saving}
-                onchange={(e) => setRole(block.key, e.currentTarget.value)}
-              >
-                {#each availableRoles(block) as role (role.id)}
-                  <option value={role.id}>{role.name}</option>
-                {/each}
-              </select>
+                onchange={(v) => setRole(block.key, v)}
+              />
             </div>
             <Button
               variant="ghost"
@@ -551,7 +555,7 @@
 
     {#if blocks.length === 0}
       <p class="empty">
-        This member holds no access in {orgName}. Add a role to give them some.
+        {t('members.edit.noAccess', { org: orgName })}
       </p>
     {/if}
 
@@ -565,40 +569,42 @@
 
     {#if !planIsEmpty(plan)}
       <div class="preview">
-        {#if addSummary}<p class="p-add">Adding: {addSummary}.</p>{/if}
+        {#if addSummary}<p class="p-add">{t('members.edit.adding', { list: addSummary })}</p>{/if}
         {#if removeSummary}
-          <p class="warning">Removing: {removeSummary}.</p>
+          <div class="warning">
+            <InlineNotice tone="warning">{t('members.edit.removing', { list: removeSummary })}</InlineNotice>
+          </div>
         {/if}
       </div>
     {/if}
 
     {#if stripsLastOwner}
-      <p class="warning">
-        {t('members.edit.lastOrgManage')}
-      </p>
+      <div class="warning">
+        <InlineNotice tone="warning">{t('members.edit.lastOrgManage')}</InlineNotice>
+      </div>
     {:else if destructive}
-      <p class="warning">
-        This removes every grant for {member.email} in {orgName}. They will disappear from this
-        list and lose access to the org. Their account is not deleted — it stays active and they
-        can still sign in.
-      </p>
+      <div class="warning">
+        <InlineNotice tone="warning">
+          {t('members.edit.destructive', { email: member.email, org: orgName })}
+        </InlineNotice>
+      </div>
     {/if}
   {/if}
 
   {#snippet footer()}
     {#if results}
-      <Button variant="ghost" onclick={onclose}>{t('common.close')}</Button>
+      <Button variant="secondary" onclick={onclose}>{t('common.close')}</Button>
       <Button variant="primary" onclick={backToEditing}>{t('members.edit.backToEditing')}</Button>
     {:else}
       {#if progress}<span class="progress">{progress}</span>{/if}
-      <Button variant="ghost" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
+      <Button variant="secondary" onclick={onclose} disabled={saving}>{t('common.cancel')}</Button>
       <Button
         variant={destructive ? 'danger' : 'primary'}
         disabled={!canSave}
         loading={saving}
         onclick={submit}
       >
-        {destructive ? 'Remove all access' : 'Save changes'}
+        {destructive ? t('members.edit.removeAll') : t('roles.saveChanges')}
       </Button>
     {/if}
   {/snippet}
@@ -617,16 +623,16 @@
     gap: 8px;
   }
   .id-name {
-    font-size: 13.5px;
-    font-weight: 600;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .id-email {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .lede {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text-muted);
     margin-bottom: 14px;
   }
@@ -662,24 +668,9 @@
     flex: 1;
   }
   .lbl {
-    font-size: 12.5px;
-    font-weight: 560;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--text-muted);
-  }
-  .sel {
-    padding: 10px 13px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text);
-    font-size: 13.5px;
-    outline: none;
-    height: 40px;
-    width: 100%;
-  }
-  .sel option {
-    background: var(--surface);
-    color: var(--text);
   }
   .unmatched {
     display: flex;
@@ -691,7 +682,7 @@
     border-radius: var(--radius);
   }
   .u-note {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .u-row {
@@ -701,11 +692,11 @@
     gap: 10px;
   }
   .u-row code {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .empty {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     padding: 6px 0;
   }
@@ -716,7 +707,7 @@
     border-top: 1px solid var(--border);
   }
   .note {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     margin-top: 10px;
   }
@@ -727,23 +718,17 @@
     margin-top: 12px;
   }
   .p-add {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .warning {
-    font-size: 12.5px;
-    color: var(--warning);
-    background: var(--warning-soft);
-    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
-    border-radius: var(--radius);
-    padding: 8px 12px;
     margin-top: 10px;
   }
   .preview .warning {
     margin-top: 0;
   }
   .progress {
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     margin-inline-end: auto;
     align-self: center;
@@ -766,11 +751,11 @@
     min-width: 0;
   }
   .r-label {
-    font-size: 13px;
+    font-size: var(--text-sm);
     color: var(--text);
   }
   .r-msg {
-    font-size: 12px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .head-msg {
@@ -778,6 +763,6 @@
   }
   .err-msg {
     color: var(--error);
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
 </style>

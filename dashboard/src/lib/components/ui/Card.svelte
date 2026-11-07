@@ -8,8 +8,13 @@
   import type { Snippet } from 'svelte';
   import Icon from './Icon.svelte';
 
+  /**
+   * The Quiet section: no fill, no border, no shadow — a title row over flush
+   * content, set off from what is above it by one hairline. (A framed `boxed`
+   * variant was dropped once nothing used it: stack traces, JSON trees and
+   * side rails all read fine as sections.)
+   */
   interface Props {
-    padding?: 'none' | 'sm' | 'md' | 'lg';
     title?: string;
     class?: string;
     header?: Snippet;
@@ -36,7 +41,6 @@
   }
 
   let {
-    padding = 'md',
     title,
     class: klass = '',
     header,
@@ -79,39 +83,40 @@
       {#if actions}<div class="head-actions">{@render actions()}</div>{/if}
     </header>
   {/if}
-  <div id={bodyId} class="card-body pad-{padding}" hidden={!shown}>
+  <div id={bodyId} class="card-body" hidden={!shown}>
     {@render children()}
   </div>
   {#if footer && shown}{@render footer()}{/if}
 </section>
 
 <style>
+  /* A section reads as a section through its title and one hairline above
+     it, not through a box. Boxes everywhere were the single biggest source of
+     visual noise: a page of eight cards drew sixteen borders around content
+     that needed none of them. */
   .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
-    overflow: hidden;
+    min-width: 0;
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
   }
   .card-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    padding: 14px 18px;
-    border-bottom: 1px solid var(--border);
+    min-height: 28px;
+    margin-bottom: 12px;
   }
   .card-title {
-    font-size: 14.5px;
-    font-weight: 620;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
   }
   .head-left {
     min-width: 0;
   }
-  /* A folded card is just its head: the divider under it would draw a second
-     bottom edge against the card's own border. */
+  /* A folded card is just its head: no gap under it. */
   .collapsed .card-head {
-    border-bottom-color: transparent;
+    margin-bottom: 0;
   }
   .card-toggle {
     display: flex;
@@ -130,7 +135,8 @@
   .chev {
     display: inline-flex;
     flex-shrink: 0;
-    color: var(--text-muted);
+    color: var(--text-faint);
+    transition: transform 0.12s ease;
   }
   .collapsed .chev {
     transform: rotate(-90deg);
@@ -142,17 +148,5 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-  .pad-none {
-    padding: 0;
-  }
-  .pad-sm {
-    padding: 12px;
-  }
-  .pad-md {
-    padding: 18px;
-  }
-  .pad-lg {
-    padding: 24px;
   }
 </style>

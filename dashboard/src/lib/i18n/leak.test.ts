@@ -22,6 +22,39 @@ const TEXT_ATTRS =
   /\b(label|title|placeholder|aria-label|description|confirmLabel|cancelLabel|heading|subtitle|tooltip|caption|hint|emptyText|message|alt)="([^"{}]{2,})"/g;
 
 /**
+ * A component prop that carries text by its NAME: `createLabel`, `emptyText`,
+ * `errorTitle`… The fixed list above missed every camelCase prop a component
+ * invented, which is how the Topbar's `createLabel="New project"` shipped.
+ */
+const TEXT_PROPS = /\s([a-z][A-Za-z]*(?:Label|Text|Title|Hint|Message|Placeholder))="([^"{}]{2,})"/g;
+
+/** Where a `{…}` expression stood, in `withMarkers`' output. */
+const MARK = '\u00a7';
+
+/**
+ * Replace every `{…}` (balanced, so `{t('x', { n })}` is one) with a marker.
+ *
+ * `TEXT_NODE` cannot cross a brace, so before this a run like
+ * `{formatPercent(x)} drop-off` was never read at all: every sentence built
+ * around a value was invisible, which is where most leaks were left.
+ */
+function withMarkers(markup: string): string {
+  let out = '';
+  let depth = 0;
+  for (const ch of markup) {
+    if (ch === '{') {
+      if (depth === 0) out += MARK;
+      depth += 1;
+    } else if (ch === '}' && depth > 0) {
+      depth -= 1;
+    } else if (depth === 0) {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/**
  * A text node: the run between `>` and the next `<`.
  *
  * Deliberately NOT anchored on a leading capital. An earlier version was, and
@@ -34,7 +67,20 @@ const TEXT_ATTRS =
  * contain at least two words of three or more letters to count, which keeps
  * out stray fragments and punctuation without hiding sentences.
  */
-const TEXT_NODE = />([^<>{}]{6,}?)</g;
+const TEXT_NODE = />([^<>]{2,}?)</g;
+
+/** The same, for a file read without markers: runs with no `{…}` in them. */
+const PLAIN_TEXT_NODE = />([^<>{}]{6,}?)</g;
+
+/**
+ * Files the value-aware scan (`withMarkers`) does not read yet, with why.
+ *
+ * Docs' prose is assembled from catalogue fragments with English joining words
+ * left between them ("the", "and", "(needs a"); translating it means rewriting
+ * those paragraphs as whole sentences, which is its own piece of work. It still
+ * gets the plain text-node and attribute checks. Remove it when that lands.
+ */
+const VALUE_SCAN_PENDING = new Set(['src/pages/Docs.svelte']);
 
 /**
  * Strip everything that is not rendered prose: `<script>`, `<style>`, HTML
@@ -72,11 +118,15 @@ function repoPath(globKey: string): string {
 }
 
 function looksTranslatable(value: string): boolean {
-  const s = value.trim();
+  // Markers and HTML entities (`&rarr;`) are not words.
+  const s = value.split(MARK).join(' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
   if (s.length < 3) return false;
   // Two or more real words. One word is usually an identifier, a unit, or a
-  // fragment of markup; two is a phrase somebody wrote to be read.
-  if ((s.match(/[A-Za-z]{3,}/g) ?? []).length < 2) return false;
+  // fragment of markup; two is a phrase somebody wrote to be read. One word
+  // beside an interpolated value (`Fetch {title}`, `{n} continued`) is a
+  // sentence too.
+  const words = (s.match(/[A-Za-z]{3,}/g) ?? []).length;
+  if (words < 2 && !(words === 1 && value.includes(MARK))) return false;
   if (/^[A-Z_]{2,}$/.test(s)) return false; // CONSTANT_CASE
   if (/^(https?:|\/|#|\{|\.)/.test(s)) return false;
   if (/^[\d\s.,:%+-]+$/.test(s)) return false;
@@ -159,7 +209,12 @@ describe('no untranslated strings in markup', () => {
       const markup = markupOf(source);
       const found = new Set<string>();
       for (const m of markup.matchAll(TEXT_ATTRS)) found.add(m[2]);
-      for (const m of markup.matchAll(TEXT_NODE)) found.add(m[1]);
+      for (const m of markup.matchAll(TEXT_PROPS)) found.add(m[2]);
+      if (VALUE_SCAN_PENDING.has(repoPath(path))) {
+        for (const m of markup.matchAll(PLAIN_TEXT_NODE)) found.add(m[1]);
+      } else {
+        for (const m of withMarkers(markup).matchAll(TEXT_NODE)) found.add(m[1]);
+      }
       for (const value of found) {
         const flat = value.replace(/\s+/g, ' ').trim();
         if (!looksTranslatable(flat) || ALLOWED.has(flat)) continue;

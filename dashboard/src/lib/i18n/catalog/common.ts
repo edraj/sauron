@@ -26,6 +26,38 @@ export const common = {
   'common.search': { en: 'Search', ar: 'بحث' },
   'common.refresh': { en: 'Refresh', ar: 'تحديث' },
   'common.retry': { en: 'Retry', ar: 'إعادة المحاولة' },
+
+  // Load failures: the title names the thing, the reason says what happened in
+  // words a person can act on, and the raw text survives under "Details".
+  'common.couldntLoad': { en: "Couldn't load {thing}", ar: 'تعذّر تحميل {thing}' },
+  'common.loadError.network': {
+    en: "Couldn't reach the server. Check your connection and retry.",
+    ar: 'تعذّر الوصول إلى الخادم. تحقّق من اتصالك وأعد المحاولة.',
+  },
+  'common.loadError.timeout': {
+    en: 'The server took too long to answer.',
+    ar: 'استغرق الخادم وقتًا طويلًا للرد.',
+  },
+  'common.loadError.server': { en: 'The server ran into a problem.', ar: 'واجه الخادم مشكلة.' },
+  'common.loadError.rateLimited': {
+    en: 'Too many requests. Wait a moment and retry.',
+    ar: 'طلبات كثيرة جدًا. انتظر قليلًا ثم أعد المحاولة.',
+  },
+  'common.loadError.forbidden': { en: "You don't have access to this.", ar: 'ليست لديك صلاحية الوصول إلى هذا.' },
+  'common.loadError.notFound': { en: 'This no longer exists.', ar: 'لم يعد هذا موجودًا.' },
+  'common.loadError.details': { en: 'Details', ar: 'التفاصيل' },
+
+  // Empty states: three wordings, chosen by what the page actually knows.
+  // "yet" only where the list is not time-bound — a windowed page cannot know
+  // that nothing ever existed.
+  'common.empty.match': { en: 'No {things} match these filters', ar: 'لا توجد {things} تطابق عوامل التصفية هذه' },
+  'common.empty.matchHint': {
+    en: 'Clear or change the filters to see more.',
+    ar: 'امسح عوامل التصفية أو غيّرها لرؤية المزيد.',
+  },
+  'common.empty.range': { en: 'No {things} in this time range', ar: 'لا توجد {things} في هذا النطاق الزمني' },
+  'common.empty.rangeHint': { en: 'Widen the time range to see more.', ar: 'وسّع النطاق الزمني لرؤية المزيد.' },
+  'common.empty.yet': { en: 'No {things} yet', ar: 'لا توجد {things} بعد' },
   'common.copy': { en: 'Copy', ar: 'نسخ' },
   'common.copied': { en: 'Copied', ar: 'تم النسخ' },
   'common.copyToClipboard': { en: 'Copy to clipboard', ar: 'نسخ إلى الحافظة' },

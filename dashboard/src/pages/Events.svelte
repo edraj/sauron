@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
   import { untrack } from 'svelte';
   import { querystring, replace } from 'svelte-spa-router';
@@ -6,6 +7,9 @@
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import TimeSeriesChart from '../lib/components/TimeSeriesChart.svelte';
   import BarList from '../lib/components/BarList.svelte';
   import DataTable from '../lib/components/DataTable.svelte';
@@ -113,8 +117,13 @@
    * — they are different endpoints, so there is no collision there — which is
    * what `streamWindowParams` below translates between.
    */
-  const STREAM_TIME_FIELDS: TimeField[] = [{ key: 'occurred_at', label: 'Occurred' }];
   const STREAM_TIME_FIELD = 'occurred_at';
+  /** Wire identity only — what `fromParams` validates the URL against. */
+  const STREAM_TIME_FIELD_KEYS: TimeField[] = [{ key: STREAM_TIME_FIELD, label: STREAM_TIME_FIELD }];
+  /** The same field with its label, derived so it follows a language switch. */
+  const STREAM_TIME_FIELDS: TimeField[] = $derived([
+    { key: STREAM_TIME_FIELD, label: t('issue.field.occurred') },
+  ]);
 
   /** URL shape (`stream_days`) -> model shape (`since_days`). */
   function readStreamWindow(sp: URLSearchParams): TimeFilterState {
@@ -123,7 +132,7 @@
     shifted.delete('stream_days');
     shifted.delete('since_days');
     if (d) shifted.set('since_days', d);
-    return fromParams(shifted, STREAM_TIME_FIELDS, STREAM_TIME_FIELD, 365);
+    return fromParams(shifted, STREAM_TIME_FIELD_KEYS, STREAM_TIME_FIELD, 365);
   }
 
   /** Model shape -> URL shape. The inverse of `readStreamWindow`. */
@@ -205,7 +214,12 @@
   let series = $state<SeriesPoint[]>([]);
   let loadingTop = $state(true);
   let loadingSeries = $state(true);
-  let error = $state<string | null>(null);
+  /**
+   * The failure itself, kept whole so the error state can say what KIND it
+   * was; the text is derived from it, so the two can never disagree.
+   */
+  let errorRaw = $state<unknown>(null);
+  const error = $derived(errorRaw === null ? null : errorMessage(errorRaw));
   let refreshing = $state(false);
 
   // Raw event stream state.
@@ -240,13 +254,15 @@
    */
   const streamNextCursor = $derived(streamPage?.next_cursor ?? null);
   let loadingStream = $state(true);
-  let streamError = $state<string | null>(null);
+  /** The stream's failure itself; its text and status are derived from it. */
+  let streamErrorRaw = $state<unknown>(null);
+  const streamError = $derived(streamErrorRaw === null ? null : errorMessage(streamErrorRaw));
   /**
    * The status behind `streamError`, so a rejected QUERY can be told apart
    * from a broken server. A 400 belongs on the search input; a 500 belongs on
    * the page's error card, and the two read much alike as prose.
    */
-  let streamErrorStatus = $state<number | null>(null);
+  const streamErrorStatus = $derived(streamErrorRaw === null ? null : errorStatus(streamErrorRaw));
 
   /**
    * The planner narrowed the window. Events runs over the largest table in the
@@ -349,13 +365,13 @@
 
   async function loadTop(appId: string, win: DateRangeValue) {
     loadingTop = true;
-    error = null;
+    errorRaw = null;
     try {
       // Five, not twelve: the list sits beside the volume chart and the pair is
       // one row, so a long list is what made the two cards different heights.
       top = await topEvents(appId, { ...rangeToParams(win), limit: 5 });
     } catch (err) {
-      error = errorMessage(err);
+      errorRaw = err;
       top = [];
     } finally {
       loadingTop = false;
@@ -370,7 +386,7 @@
         name: name ?? undefined,
       });
     } catch (err) {
-      error = errorMessage(err);
+      errorRaw = err;
       series = [];
     } finally {
       loadingSeries = false;
@@ -416,8 +432,7 @@
       pageKey(l.page),
     );
     loadingStream = true;
-    streamError = null;
-    streamErrorStatus = null;
+    streamErrorRaw = null;
     try {
       const envelope = await listEvents(appId, {
         filters: filterList,
@@ -438,8 +453,7 @@
       streamKey = key;
     } catch (err) {
       if (gen !== streamGen) return;
-      streamError = errorMessage(err);
-      streamErrorStatus = errorStatus(err);
+      streamErrorRaw = err;
       // Keep the rows ONLY when the request that failed was for the very inputs
       // that produced them — a Refresh or a Retry of what is already on screen.
       // Then the rows are still a true answer, merely older than asked for, and
@@ -654,6 +668,23 @@
     void loadStream(aid, enc, s, tf, next);
   });
 
+  /** Retry of exactly what is on screen — the stale notice and the error state. */
+  function retryStream() {
+    const aid = sessionStore.currentAppId;
+    if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
+  }
+
+  function retryCards() {
+    const aid = sessionStore.currentAppId;
+    if (aid) {
+      loadTop(aid, range);
+      loadSeries(aid, range, selectedTopEvent);
+    }
+  }
+
+  /** "Nothing here" wording: a chip or search first, then the window. */
+  const streamFiltered = $derived(appliedSearch !== '' || filters.length > 0);
+
   function selectTopEvent(name: string) {
     const rest = filters.filter((f) => !(f.field === 'name' && f.op === 'eq'));
     filters = [...rest, { field: 'name', op: 'eq', value: name }];
@@ -679,18 +710,16 @@
   }
 </script>
 
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('overview.stat.events')}</h1>
-      <p class="muted sub">{t('events.subtitle')}</p>
-    </div>
-    <div class="controls">
+  <PageHeader title={t('events.title')} subtitle={t('events.subtitle')}>
+    {#snippet freshness()}
       <RollupChip />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || refreshing} />
-    </div>
-  </div>
+    {/snippet}
+  </PageHeader>
 
-  <p class="hint muted">{t('events.filterBy')} <code>{t('events.tag')}</code> (key = value); the search box also matches tag &amp; payload content.</p>
+  <p class="hint">{t('events.filterBy')} <code>{t('events.tag')}</code> {t('events.filterHintTail')}</p>
   <!--
     `appId`/`context` are what make the search box's autocomplete work at all:
     without them `fetchSchema` bails on its own `if (!appId)` guard and the
@@ -709,24 +738,7 @@
   <SearchDisclosure {clamped} />
 
   {#if error && top.length === 0 && series.length === 0}
-    <Card>
-      <EmptyState title={t('events.error.analytics')} description={error} icon="triangle-alert">
-        {#snippet action()}
-          <Button
-            variant="secondary"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) {
-                loadTop(aid, range);
-                loadSeries(aid, range, selectedTopEvent);
-              }
-            }}
-          >
-            {t('common.retry')}
-          </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+    <ErrorState title={t('events.error.analytics')} error={errorRaw} onretry={retryCards} />
   {:else}
     <div class="grid">
       <!--
@@ -738,14 +750,14 @@
         does not shift it.
 
         On the top list an empty `top` is exactly when the caption earns its
-        place: "No events yet" under an active filter reads as the filter
-        having emptied the list, and it did not.
+        place: "No events in this time range" under an active filter reads as
+        the filter having emptied the list, and it did not.
       -->
       <Card title={t('overview.card.eventVolume')}>
         {#if loadingSeries}
           <Skeleton rows={6} />
         {:else}
-          <TimeSeriesChart data={series} height={220} color="var(--primary)" />
+          <TimeSeriesChart data={series} height={220} color="var(--chart-1)" />
         {/if}
         <p class="scope-note">{volumeNote ?? ''}</p>
       </Card>
@@ -754,20 +766,26 @@
         {#if loadingTop}
           <Skeleton rows={6} />
         {:else if top.length === 0}
-          <EmptyState title={t('events.empty.title')} description={t('events.empty.body')} icon="chart-column" />
+          <!-- The top list ignores the chips (see `topNote`), so only the
+               window can have emptied it. -->
+          <EmptyState
+            size="section"
+            title={t('common.empty.range', { things: t('events.things') })}
+            description={t('common.empty.rangeHint')}
+          />
         {:else}
-          <p class="hint muted">{t('events.clickToFilter')}</p>
+          <p class="hint">{t('events.clickToFilter')}</p>
           <BarList items={top} selected={selectedTopEvent} onselect={selectTopEvent} />
         {/if}
         <p class="scope-note">{topNote ?? ''}</p>
       </Card>
     </div>
 
-    <Card padding="none" title={t('events.card.stream')}>
+    <Card title={t('events.card.stream')}>
       {#snippet actions()}
         <!-- Governs the stream only; the two cards above follow the FilterBar's
-             range. Placed on the table's own card so the two windows read as
-             the separate things they are. -->
+             range. Placed on the table's own section so the two windows read
+             as the separate things they are. -->
         <TimeFilter
           fields={STREAM_TIME_FIELDS}
           value={streamWindow}
@@ -778,53 +796,40 @@
         A refresh or retry of THESE rows failed. They stay, and so does the
         pager — losing page 4 of a walk to one bad poll is a worse outcome than
         rows a minute old, and `loadStream` only keeps them when the failed
-        request asked for exactly what is on screen. `role="status"`, not
-        `alert`: nothing on screen is broken or needs interrupting.
+        request asked for exactly what is on screen. A status, not an alert:
+        nothing on screen is broken or needs interrupting.
       -->
       {#if staleStreamError}
-        <p class="stale-banner" role="status">
-          <Icon name="triangle-alert" size={14} />
-          <span>Showing the last results that loaded — refreshing failed: {streamError}</span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onclick={() => {
-              const aid = sessionStore.currentAppId;
-              if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
-            }}
-          >
-            {t('ui.tryAgain')}
-          </Button>
-        </p>
+        <div class="stale">
+          <InlineNotice tone="warning">
+            {t('ui.staleResults', { error: loadErrorText(streamErrorRaw) })}
+            {#snippet action()}
+              <Button variant="ghost" size="sm" onclick={retryStream}>{t('common.retry')}</Button>
+            {/snippet}
+          </InlineNotice>
+        </div>
       {/if}
       {#if loadingStream && streamEvents.length === 0}
         <Skeleton rows={6} />
       {:else if fatalStreamError}
-        <EmptyState title={t('events.error.load')} description={streamError ?? undefined} icon="triangle-alert">
-          {#snippet action()}
-            <Button
-              variant="secondary"
-              onclick={() => {
-                const aid = sessionStore.currentAppId;
-                if (aid) loadStream(aid, encodeFilters(filters), appliedSearch, streamWindow, list);
-              }}
-            >
-              {t('common.retry')}
-            </Button>
-          {/snippet}
-        </EmptyState>
+        <ErrorState
+          size="section"
+          title={t('events.error.load')}
+          error={streamErrorRaw}
+          onretry={retryStream}
+        />
       {:else if emptyPastFirstPage}
         <!--
           Deliberately not the copy below. That one answers "are there any events
           at all?" and the answer here is yes — `streamTotal` says so in the
           pager underneath. What happened is that this page of the walk no longer
-          holds any of them, so "No raw events in this range yet" under a caption
+          holds any of them, so "No events in this time range" under a caption
           reading "1,204+ events · Page 4" would be the pager lying in prose.
         -->
         <EmptyState
+          size="section"
           title={t('list.stale.title')}
           description={t('list.stale.eventsBody')}
-          icon="search"
         >
           {#snippet action()}
             <Button variant="secondary" onclick={goPrev} disabled={loadingStream}>
@@ -834,11 +839,11 @@
         </EmptyState>
       {:else if streamEvents.length === 0}
         <EmptyState
-          title={t('events.empty.none')}
-          description={search || filters.length > 0
-            ? 'No events match the current filters.'
-            : 'No raw events in this range yet.'}
-          icon="search"
+          size="section"
+          title={streamFiltered
+            ? t('common.empty.match', { things: t('events.things') })
+            : t('common.empty.range', { things: t('events.things') })}
+          description={streamFiltered ? t('common.empty.matchHint') : t('common.empty.rangeHint')}
         />
       {:else}
         <DataTable>
@@ -869,7 +874,7 @@
                       {ev.distinct_id}
                     </a>
                   {:else}
-                    <span class="muted">anonymous</span>
+                    <span class="muted">{t('session.meta.anonymous')}</span>
                   {/if}
                 </td>
                 <td>
@@ -951,70 +956,34 @@
   {/if}
 
 <style>
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
   .grid {
     display: grid;
     grid-template-columns: 1.6fr 1fr;
-    gap: 18px;
-    margin-bottom: 18px;
+    gap: var(--page-gap);
+    margin-bottom: var(--page-gap);
     /* Deliberately NOT `align-items: start`: the volume chart has a fixed 220px
        plot and the top-events list is as tall as its rows, so sizing each to its
        own content leaves the pair ragged. Stretching keeps the row square. */
   }
   .hint {
-    font-size: 12px;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
     margin-bottom: 12px;
   }
   /* Disclosure line under a header card. `min-height` is the whole trick: the
      element stays in the flow when `panelScopeNote` returns null, so the
      caption appearing is a text swap and never a reflow. */
   .scope-note {
-    font-size: 12px;
+    font-size: var(--text-xs);
     line-height: 16px;
     min-height: 16px;
     color: var(--text-faint);
     margin: 10px 0 0;
   }
 
-  /* Sits INSIDE the card, above the rows it qualifies, so the sentence and the
-     stale data it describes cannot be read separately. `padding: none` on the
-     Card means this supplies its own. Matches Issues'. */
-  .stale-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    padding: 10px 14px;
-    font-size: 12.5px;
-    line-height: 18px;
-    color: var(--text-muted);
-    background: var(--warning-soft);
-    border-bottom: 1px solid var(--border);
-  }
-  .stale-banner :global(svg) {
-    color: var(--warning);
-    flex: none;
-  }
-  .stale-banner span {
-    flex: 1;
-    min-width: 0;
+  /* The stale-rows notice sits above the rows it qualifies, not flush on them. */
+  .stale {
+    margin-bottom: 10px;
   }
 
   /* Event stream table.
@@ -1040,7 +1009,7 @@
   }
   .ev-caret {
     display: inline-block;
-    font-size: 8px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
     transition: transform 0.12s ease;
     margin-inline-end: 7px;
@@ -1049,7 +1018,7 @@
     transform: rotate(90deg);
   }
   .ev-name {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
     color: var(--text);
   }
   .link {
@@ -1068,7 +1037,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     vertical-align: middle;
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .props-prev {
     display: inline-block;
@@ -1077,7 +1046,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     vertical-align: middle;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
   }
   .detail-row :global(td) {
@@ -1089,8 +1058,8 @@
     align-items: center;
     gap: 5px;
     margin-bottom: 10px;
-    font-size: 12px;
-    font-weight: 550;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     color: var(--primary);
   }
   .screen-link:hover {

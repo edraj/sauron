@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { loadErrorText } from '../lib/models/load-error';
   import { t } from '../lib/i18n';
   import { push } from 'svelte-spa-router';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
@@ -7,6 +8,11 @@
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import Input from '../lib/components/ui/Input.svelte';
+  import Select from '../lib/components/ui/Select.svelte';
+  import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import Badge from '../lib/components/ui/Badge.svelte';
   import RefreshButton from '../lib/components/ui/RefreshButton.svelte';
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
@@ -15,7 +21,6 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
   import { lockedBy } from '../lib/models/page-access';
-  import { lockTip } from '../lib/actions/lock-tip';
   import { createProject, updateProject, deleteProject } from '../lib/api/projects';
   import { listApps, createApp } from '../lib/api/apps';
   import { errorMessage } from '../lib/api/client';
@@ -27,6 +32,10 @@
   // Apps loaded per project (lazily on expand).
   let appsByProject = $state<Record<string, App[]>>({});
   let loadingApps = $state<Record<string, boolean>>({});
+  // The last failed app-list load per project. `stale` says there were rows
+  // to keep (a failed refresh), so the section shows them with a notice rather
+  // than replacing them with the error.
+  let appsError = $state<Record<string, { error: unknown; stale: boolean }>>({});
   let openProject = $state<Record<string, boolean>>({});
 
   // New project form
@@ -42,12 +51,16 @@
   // Delete confirm state
   let confirmDeleteId = $state<string | null>(null);
   let deletingId = $state<string | null>(null);
+  const confirmDeleteProject = $derived(
+    confirmDeleteId ? (sessionStore.projects.find((p) => p.id === confirmDeleteId) ?? null) : null,
+  );
 
   // New app form, keyed by project
   let newAppFor = $state<string | null>(null);
   let newAppName = $state('');
   let newAppType = $state<AppType>('web');
   let creatingApp = $state(false);
+  const appTypeOptions = APP_TYPES.map((o) => ({ value: o.value, label: o.label }));
 
   // projects.rs:102 authorizes creation at the org — a project- or app-scoped
   // grant carrying `project:create` cannot satisfy it, hence `level: 'org'`.
@@ -80,14 +93,17 @@
     if (!force && viewCache.isFresh(key)) return;
     // Only a cache MISS shows the spinner; a revalidate leaves the rows up.
     loadingApps[projectId] = cached === undefined;
+    delete appsError[projectId];
     try {
       const apps = await viewCache.dedupe(key, () => listApps(projectId), force);
       viewCache.set(key, apps);
       appsByProject[projectId] = [...apps];
     } catch (err) {
-      toastStore.error(errorMessage(err));
-      // Only blank the row when there was nothing to keep. A failed refresh over
-      // good rows leaves them up — they are still a true answer, merely older.
+      // Said inside the project's own section (ErrorState, with Retry), not in
+      // a toast that is gone before anyone reads it. Only blank the row when
+      // there was nothing to keep: a failed refresh over good rows leaves them
+      // up — they are still a true answer, merely older.
+      appsError[projectId] = { error: err, stale: cached !== undefined };
       if (cached === undefined) appsByProject[projectId] = [];
     } finally {
       loadingApps[projectId] = false;
@@ -142,7 +158,7 @@
       showNewProject = false;
       openProject[p.id] = true;
       appsByProject[p.id] = [];
-      toastStore.success('Project created.');
+      toastStore.success(t('projects.toast.created'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -162,7 +178,7 @@
       const updated = await updateProject(projectId, { name: renameValue.trim() });
       sessionStore.upsertProject(updated, false);
       renamingId = null;
-      toastStore.success('Project renamed.');
+      toastStore.success(t('projects.toast.renamed'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -181,7 +197,7 @@
       // served to an id the server would now 404.
       viewCache.invalidate(viewKey('projects.apps', projectId));
       confirmDeleteId = null;
-      toastStore.success('Project deleted.');
+      toastStore.success(t('projects.toast.deleted'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -207,7 +223,7 @@
       viewCache.invalidate(viewKey('projects.apps', projectId));
       if (projectId === sessionStore.currentProjectId) sessionStore.upsertApp(a, false);
       newAppFor = null;
-      toastStore.success('App created.');
+      toastStore.success(t('projects.toast.appCreated'));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -227,50 +243,58 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1 class="page-title">{t('projects.title')}</h1>
-      <p class="muted sub">{t('projects.subtitle')}</p>
-    </div>
-    <div class="head-actions">
+  <PageHeader title={t('projects.title')} subtitle={t('projects.subtitle')}>
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy} />
-    <Button
-      variant="primary"
-      lockedReason={createProjectLock}
-      onclick={() => (showNewProject = !showNewProject)}
-    >
-      {showNewProject ? 'Cancel' : 'New project'}
-    </Button>
-    </div>
-  </div>
+    {/snippet}
+    {#snippet primary()}
+      <!-- Hidden while the form is open: the form's own Cancel closes it, and
+           "Create project" is then the view's one primary. -->
+      {#if !showNewProject}
+        <Button
+          variant="primary"
+          lockedReason={createProjectLock}
+          onclick={() => (showNewProject = true)}
+        >
+          {t('projects.new')}
+        </Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
 
   {#if showNewProject}
-    <Card class="new-project">
-      <form class="inline-form" onsubmit={submitNewProject}>
-        <Input label={t('projects.name')} bind:value={newProjectName} placeholder={t('auth.placeholder.projectName')} required />
-        <Button type="submit" variant="primary" loading={creatingProject}>{t('projects.create')}</Button>
-      </form>
-    </Card>
+    <div class="new-project">
+      <Card title={t('projects.new')}>
+        <form class="inline-form" onsubmit={submitNewProject}>
+          <Input label={t('projects.name')} bind:value={newProjectName} placeholder={t('auth.placeholder.projectName')} required />
+          <div class="form-actions">
+            <Button variant="secondary" onclick={() => (showNewProject = false)}>{t('common.cancel')}</Button>
+            <Button type="submit" variant="primary" loading={creatingProject}>{t('projects.create')}</Button>
+          </div>
+        </form>
+      </Card>
+    </div>
   {/if}
 
   {#if sessionStore.projects.length === 0}
-    <Card>
-      <EmptyState
-        title={t('projects.empty.title')}
-        description={t('projects.empty.body')}
-        icon="folders"
-      >
-        {#snippet action()}
+    <EmptyState
+      title={t('projects.empty.title')}
+      description={t('projects.empty.body')}
+      icon="folders"
+    >
+      {#snippet action()}
+        {#if !showNewProject}
+          <!-- `secondary`: the header already holds this view's one primary. -->
           <Button
-            variant="primary"
+            variant="secondary"
             lockedReason={createProjectLock}
             onclick={() => (showNewProject = true)}
           >
             {t('projects.new')}
           </Button>
-        {/snippet}
-      </EmptyState>
-    </Card>
+        {/if}
+      {/snippet}
+    </EmptyState>
   {:else}
     <div class="project-list">
       {#each sessionStore.projects as project (project.id)}
@@ -278,7 +302,7 @@
         {@const updateLock = lockedBy('project:update', { project: project.id, level: 'project' })}
         {@const deleteLock = lockedBy('project:delete', { project: project.id, level: 'project' })}
         {@const createAppLock = lockedBy('app:create', { project: project.id, level: 'project' })}
-        <Card padding="none" class="project-card">
+        <Card class="project-card">
           <div class="project-row">
             <button
               class="expander"
@@ -299,8 +323,8 @@
                   }}
                 >
                   <Input bind:value={renameValue} required />
+                  <Button variant="secondary" size="sm" onclick={() => (renamingId = null)}>{t('common.cancel')}</Button>
                   <Button type="submit" variant="primary" size="sm" loading={savingRename}>{t('common.save')}</Button>
-                  <Button variant="ghost" size="sm" onclick={() => (renamingId = null)}>{t('common.cancel')}</Button>
                 </form>
               {:else}
                 <button class="p-name-btn" onclick={() => toggleProject(project.id)}>
@@ -332,30 +356,31 @@
             {/if}
           </div>
 
-          {#if confirmDeleteId === project.id}
-            <div class="confirm">
-              <span class="confirm-text">
-                {t('common.delete')} <strong>{project.name}</strong> {t('prose.projects.confirmDelete')}
-              </span>
-              <div class="confirm-actions">
-                <Button
-                  variant="danger"
-                  size="sm"
-                  loading={deletingId === project.id}
-                  onclick={() => doDelete(project.id)}
-                >
-                  {t('projects.confirmDelete')}
-                </Button>
-                <Button variant="ghost" size="sm" onclick={() => (confirmDeleteId = null)}>{t('common.cancel')}</Button>
-              </div>
-            </div>
-          {/if}
-
           {#if openProject[project.id]}
+            {@const appsFailure = appsError[project.id]}
             <div class="apps">
               {#if loadingApps[project.id]}
                 <div class="apps-loading"><Skeleton rows={2} /></div>
+              {:else if appsFailure && !appsFailure.stale}
+                <ErrorState
+                  size="section"
+                  title={t('common.couldntLoad', { thing: t('projects.appsThing') })}
+                  error={appsFailure.error}
+                  onretry={() => loadApps(project.id, true)}
+                />
               {:else}
+                {#if appsFailure}
+                  <div class="apps-stale">
+                    <InlineNotice tone="warning">
+                      {t('ui.staleResults', { error: loadErrorText(appsFailure.error) })}
+                      {#snippet action()}
+                        <Button variant="ghost" size="sm" onclick={() => loadApps(project.id, true)}>
+                          {t('common.retry')}
+                        </Button>
+                      {/snippet}
+                    </InlineNotice>
+                  </div>
+                {/if}
                 {#each appsByProject[project.id] ?? [] as app (app.id)}
                   <div class="app-row">
                     <span class="a-icon" aria-hidden="true"><Icon name={appTypeIcon(app.app_type)} size={15} /></span>
@@ -364,10 +389,10 @@
                       <span class="a-type muted">{appTypeLabel(app.app_type)}</span>
                     </div>
                     <Badge tone={app.ingest_enabled ? 'success' : 'neutral'} size="sm" dot>
-                      {app.ingest_enabled ? 'ingesting' : 'paused'}
+                      {app.ingest_enabled ? t('projects.ingesting') : t('projects.paused')}
                     </Badge>
                     <div class="a-actions">
-                      <Button variant="subtle" size="sm" onclick={() => openApp(project.id, app.id)}>
+                      <Button variant="ghost" size="sm" onclick={() => openApp(project.id, app.id)}>
                         {t('projects.open')}
                       </Button>
                       <Button
@@ -386,11 +411,13 @@
                   {#if newAppFor === project.id}
                     <form class="new-app-form" onsubmit={(e) => submitNewApp(e, project.id)}>
                       <Input bind:value={newAppName} placeholder={t('projects.appName')} required />
-                      <select class="type-select" bind:value={newAppType} aria-label={t('projects.appType')}>
-                        {#each APP_TYPES as opt (opt.value)}
-                          <option value={opt.value}>{opt.label}</option>
-                        {/each}
-                      </select>
+                      <Select
+                        value={newAppType}
+                        options={appTypeOptions}
+                        ariaLabel={t('projects.appType')}
+                        onchange={(v) => (newAppType = v as AppType)}
+                      />
+                      <Button variant="secondary" size="sm" onclick={() => (newAppFor = null)}>{t('common.cancel')}</Button>
                       <Button
                         type="submit"
                         variant="primary"
@@ -400,18 +427,18 @@
                       >
                         {t('projects.createApp')}
                       </Button>
-                      <Button variant="ghost" size="sm" onclick={() => (newAppFor = null)}>{t('common.cancel')}</Button>
                     </form>
                   {:else}
-                    <button
-                      class="add-app"
-                      use:lockTip={createAppLock}
-                      onclick={() => startNewApp(project.id)}
-                    >
-                      {#if createAppLock}<span class="add-lock" aria-hidden="true"
-                          ><Icon name="lock" size={12} /></span
-                        >{:else}+&nbsp;{/if}New app
-                    </button>
+                    <div class="add-app">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        lockedReason={createAppLock}
+                        onclick={() => startNewApp(project.id)}
+                      >
+                        {t('projects.newApp')}
+                      </Button>
+                    </div>
                   {/if}
               {/if}
             </div>
@@ -420,28 +447,22 @@
       {/each}
     </div>
   {/if}
+
+  <ConfirmDialog
+    open={confirmDeleteProject !== null}
+    title={t('projects.confirmDeleteTitle')}
+    message={t('projects.confirmDeleteBody', { name: confirmDeleteProject?.name ?? '' })}
+    confirmLabel={t('projects.deleteAction')}
+    danger
+    loading={deletingId !== null && deletingId === confirmDeleteId}
+    onconfirm={() => confirmDeleteId && doDelete(confirmDeleteId)}
+    oncancel={() => (confirmDeleteId = null)}
+  />
 </AdminShell>
 
 <style>
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 3px;
-  }
-  :global(.new-project) {
-    margin-bottom: 16px;
+  .new-project {
+    margin-bottom: var(--page-gap);
   }
   .inline-form {
     display: flex;
@@ -453,16 +474,19 @@
     flex: 1;
     min-width: 220px;
   }
+  .form-actions {
+    display: flex;
+    gap: 8px;
+  }
   .project-list {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
   }
   .project-row {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 14px 16px;
   }
   .expander {
     background: none;
@@ -474,8 +498,7 @@
   }
   .chevron {
     display: inline-block;
-    transition: transform 0.15s ease;
-    font-size: 12px;
+    transition: transform 0.12s ease;
   }
   .chevron.open {
     transform: rotate(90deg);
@@ -495,12 +518,12 @@
     min-width: 0;
   }
   .p-name {
-    font-weight: 600;
-    font-size: 14.5px;
+    font-weight: var(--weight-strong);
+    font-size: var(--text-md);
     color: var(--text);
   }
   .p-slug {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .rename-form {
@@ -516,28 +539,14 @@
     gap: 4px;
     flex-shrink: 0;
   }
-  .confirm {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 12px 16px;
-    background: var(--error-soft);
-    border-top: 1px solid color-mix(in srgb, var(--error) 25%, transparent);
-    flex-wrap: wrap;
-  }
-  .confirm-text {
-    font-size: 13px;
-  }
-  .confirm-actions {
-    display: flex;
-    gap: 8px;
-  }
   .apps {
-    border-top: 1px solid var(--border);
-    padding: 6px 16px 14px 42px;
+    margin-top: 10px;
+    padding-inline-start: 32px;
     display: flex;
     flex-direction: column;
+  }
+  .apps-stale {
+    margin: 6px 0;
   }
   .apps-loading {
     padding: 16px 0;
@@ -553,7 +562,7 @@
     border-bottom: none;
   }
   .a-icon {
-    font-size: 16px;
+    font-size: var(--text-md);
     line-height: 1;
     width: 22px;
     text-align: center;
@@ -566,18 +575,18 @@
     min-width: 0;
   }
   .a-name {
-    font-weight: 560;
-    font-size: 13.5px;
+    font-weight: var(--weight-medium);
+    font-size: var(--text-sm);
   }
   .a-type {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   .a-actions {
     display: flex;
     gap: 4px;
   }
   .no-apps {
-    font-size: 13px;
+    font-size: var(--text-sm);
     padding: 10px 0;
   }
   .new-app-form {
@@ -590,42 +599,8 @@
   .new-app-form :global(.field) {
     min-width: 180px;
   }
-  .type-select {
-    padding: 9px 11px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text);
-    font-size: 13.5px;
-    outline: none;
-  }
-  .type-select option {
-    background: var(--surface);
-    color: var(--text);
-  }
   .add-app {
     align-self: flex-start;
     margin-top: 10px;
-    background: none;
-    border: 1px dashed var(--border-strong);
-    border-radius: var(--radius);
-    color: var(--text-muted);
-    padding: 8px 14px;
-    font-size: 13px;
-    font-weight: 540;
-    transition: all 0.13s ease;
-  }
-  .add-app:not(:disabled):hover {
-    color: var(--text);
-    border-color: var(--text-faint);
-  }
-  .add-app:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-  .add-lock {
-    display: inline-flex;
-    vertical-align: -2px;
-    margin-inline-end: 6px;
   }
 </style>

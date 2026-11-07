@@ -1,6 +1,6 @@
 <script lang="ts">
   import { t } from '../../i18n';
-  import Card from '../ui/Card.svelte';
+  import DataTable from '../DataTable.svelte';
   import Badge from '../ui/Badge.svelte';
   import RowActionsMenu from '../ui/RowActionsMenu.svelte';
   import { sessionStore } from '../../stores/session.svelte';
@@ -59,7 +59,8 @@
     /** Same shape and same reason as `onresetpassword`: at most one of the two
         email-change actions is ever offered for a given row. */
     onemailchange: (member: Member, action: 'request' | 'withdraw') => void;
-    onremovegrant: (grantId: string) => void;
+    /** Asks to remove one scope; the page confirms before anything is deleted. */
+    onremovegrant: (grantId: string, context: { member: string; scope: string }) => void;
   }
 
   let {
@@ -93,25 +94,27 @@
   }
 
   function scopeLabel(member: MemberGrant): string {
-    if (member.scope_type === 'org') return 'Org';
+    if (member.scope_type === 'org') return t('members.scope.org');
     if (member.scope_type === 'project') {
-      return `Project: ${projectName(member.scope_id) ?? member.scope_id.slice(0, 8)}`;
+      return t('members.scope.project', {
+        name: projectName(member.scope_id) ?? member.scope_id.slice(0, 8),
+      });
     }
     if (member.scope_type === 'env') {
       // scope_id carries no FK, and — unlike project/app — an env may simply
       // never have been fetched yet (see envsByApp's doc comment above), not
       // only deleted. Either way the fallback is the same truncated id.
       const env = envsById[member.scope_id];
-      if (!env) return `Env: ${member.scope_id.slice(0, 8)}`;
+      if (!env) return t('members.scope.env', { name: member.scope_id.slice(0, 8) });
       const a = appsById[env.app_id];
-      return a ? `Env: ${a.name} / ${env.name}` : `Env: ${env.name}`;
+      return t('members.scope.env', { name: a ? `${a.name} / ${env.name}` : env.name });
     }
     // Grants can point at a deleted project/app — delete_project/delete_app
     // don't cascade to role_grants — so every lookup falls back a step.
     const a = appsById[member.scope_id];
-    if (!a) return `App: ${member.scope_id.slice(0, 8)}`;
+    if (!a) return t('members.scope.app', { name: member.scope_id.slice(0, 8) });
     const p = projectName(a.project_id);
-    return p ? `App: ${p} / ${a.name}` : `App: ${a.name}`;
+    return t('members.scope.app', { name: p ? `${p} / ${a.name}` : a.name });
   }
 
   function scopeTone(type: ScopeType): 'primary' | 'info' | 'neutral' | 'success' {
@@ -122,18 +125,16 @@
   }
 </script>
 
-<Card padding="none">
-  <div class="table-scroll">
-    <table class="members">
-      <thead>
+<DataTable>
+  {#snippet head()}
         <tr>
           <th>{t('members.column.member')}</th>
           <th>{t('members.column.role')}</th>
           <th>{t('members.column.scope')}</th>
           <th class="col-act"></th>
         </tr>
-      </thead>
-      <tbody>
+  {/snippet}
+  {#snippet children()}
         {#each grouped as member (member.user_id)}
           <tr class:inactive={!member.is_active}>
             <td>
@@ -181,11 +182,12 @@
                       type="button"
                       class="chip-remove"
                       class:removing={removingId === grant.id}
-                      aria-label={`Remove ${scopeLabel(grant)} access`}
+                      aria-label={t('members.removeScopeAccess', { scope: scopeLabel(grant) })}
                       title={t('members.removeAccess')}
                       use:lockTip={manageLock}
                       disabled={removingId !== null}
-                      onclick={() => onremovegrant(grant.id)}
+                      onclick={() =>
+                        onremovegrant(grant.id, { member: member.name || member.email, scope: scopeLabel(grant) })}
                     >
                       ×
                     </button>
@@ -194,7 +196,7 @@
               </div>
             </td>
               <td class="col-act">
-                <RowActionsMenu label={`Actions for ${member.email}`}>
+                <RowActionsMenu label={t('roles.actionsFor', { name: member.email })}>
                   {#snippet children(close)}
                     <button
                       type="button"
@@ -208,7 +210,7 @@
                     >
                       {#if manageLock}<span class="ram-lock" aria-hidden="true"
                           ><Icon name="lock" size={12} /></span
-                        >{/if}Edit
+                        >{/if}{t('common.edit')}
                     </button>
                     <!-- The helpers are called with `true` for the permission
                          so they answer only the member-state question (self?
@@ -228,7 +230,7 @@
                       >
                         {#if credentialLock}<span class="ram-lock" aria-hidden="true"
                             ><Icon name="lock" size={12} /></span
-                          >{/if}Reset password
+                          >{/if}{t('members.reset.action')}
                       </button>
                     {:else if canCancelPasswordReset(member, currentUserId, true)}
                       <button
@@ -243,7 +245,7 @@
                       >
                         {#if credentialLock}<span class="ram-lock" aria-hidden="true"
                             ><Icon name="lock" size={12} /></span
-                          >{/if}Cancel password reset
+                          >{/if}{t('members.menu.cancelReset')}
                       </button>
                     {/if}
                     <!-- Same `true` + lock treatment as the pair above: the
@@ -298,7 +300,7 @@
                       >
                         {#if revokeLock}<span class="ram-lock" aria-hidden="true"
                             ><Icon name="lock" size={12} /></span
-                          >{/if}Sign out all devices
+                          >{/if}{t('members.menu.signOutAll')}
                       </button>
                     {/if}
                     <button
@@ -314,46 +316,17 @@
                     >
                       {#if manageLock}<span class="ram-lock" aria-hidden="true"
                           ><Icon name="lock" size={12} /></span
-                        >{/if}{member.is_active ? 'Deactivate' : 'Reactivate'}
+                        >{/if}{member.is_active ? t('members.deactivate') : t('members.menu.reactivate')}
                     </button>
                   {/snippet}
                 </RowActionsMenu>
               </td>
           </tr>
         {/each}
-      </tbody>
-    </table>
-  </div>
-</Card>
+  {/snippet}
+</DataTable>
 
 <style>
-  .table-scroll {
-    overflow-x: auto;
-  }
-  table.members {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13.5px;
-  }
-  thead th {
-    text-align: start;
-    padding: 12px 16px;
-    font-size: 11px;
-    font-weight: 650;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  td {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: middle;
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
   tr.inactive td:not(.col-act) {
     opacity: 0.58;
   }
@@ -373,10 +346,10 @@
     border-radius: 50%;
     display: grid;
     place-items: center;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 11px;
-    font-weight: 650;
+    background: var(--surface-3);
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
     flex-shrink: 0;
   }
   .m-meta {
@@ -391,10 +364,10 @@
     gap: 8px;
   }
   .m-name {
-    font-weight: 560;
+    font-weight: var(--weight-medium);
   }
   .m-email {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .chip-list {
@@ -418,7 +391,7 @@
     border-radius: 50%;
     background: transparent;
     color: var(--text-faint);
-    font-size: 13px;
+    font-size: var(--text-sm);
     line-height: 1;
     cursor: pointer;
   }

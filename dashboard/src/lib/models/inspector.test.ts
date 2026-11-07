@@ -10,20 +10,24 @@ import {
   defaultEnvEnrollmentId,
   inspectorTabFromQuery,
   inspectorTabRoute,
+  scanStatusLabel,
+  maskStatusLabel,
+  targetTypeLabel,
 } from './inspector';
+import { t } from '../i18n';
 
 describe('UNREACHABLE_COPY', () => {
   // One source, rendered verbatim in the MaskDialog, in the Audit tab detail
   // and in the wiki — so support answers and the product cannot diverge.
   it('leads with the hot-Postgres headline', () => {
     expect(UNREACHABLE_COPY[0].headline).toBe(true);
-    expect(UNREACHABLE_COPY[0].what).toMatch(/hot Postgres only/i);
+    expect(t(UNREACHABLE_COPY[0].whatKey)).toMatch(/hot Postgres only/i);
   });
 
   it('carries all twelve enumerated rows beneath the headline', () => {
     // A dropped row is a promise the dialog stops making.
     expect(UNREACHABLE_COPY.filter((r) => !r.headline)).toHaveLength(12);
-    const subjects = UNREACHABLE_COPY.map((r) => r.what.toLowerCase()).join(' | ');
+    const subjects = UNREACHABLE_COPY.map((r) => t(r.whatKey).toLowerCase()).join(' | ');
     for (const must of [
       'cold parquet',
       'tier_hot_days',
@@ -45,12 +49,14 @@ describe('UNREACHABLE_COPY', () => {
   });
 
   it('never claims a mask is permanent or removed', () => {
-    const all = UNREACHABLE_COPY.map((r) => `${r.what} ${r.why} ${r.bounded}`).join(' ');
+    const all = UNREACHABLE_COPY.map(
+      (r) => `${t(r.whatKey)} ${t(r.whyKey)} ${t(r.boundedKey)}`,
+    ).join(' ');
     expect(all).not.toMatch(/permanently removed/i);
   });
 
   it('marks the active-users row as read-before-confirm', () => {
-    const row = UNREACHABLE_COPY.find((r) => r.what.toLowerCase().includes('active-user'));
+    const row = UNREACHABLE_COPY.find((r) => t(r.whatKey).toLowerCase().includes('active-user'));
     expect(row?.readFirst).toBe(true);
   });
 });
@@ -292,5 +298,30 @@ describe('inspector tab ↔ URL', () => {
       const route = inspectorTabRoute(t, '');
       expect(inspectorTabFromQuery(route.split('?')[1] ?? '')).toBe(t);
     }
+  });
+});
+
+describe('inspector status words', () => {
+  it('names every scan status in words', () => {
+    expect(
+      (['queued', 'running', 'succeeded', 'failed', 'cancelled'] as const).map(scanStatusLabel),
+    ).toEqual(['Queued', 'Running', 'Succeeded', 'Failed', 'Cancelled']);
+  });
+
+  it('names every mask-action status in words', () => {
+    expect(
+      (
+        ['preview', 'previewed', 'pending', 'running', 'cancelling', 'done', 'failed', 'cancelled'] as const
+      ).map(maskStatusLabel),
+    ).toEqual(['Previewing', 'Previewed', 'Pending', 'Running', 'Cancelling', 'Done', 'Failed', 'Cancelled']);
+  });
+
+  it('names every policy target type in words', () => {
+    expect(['project', 'app', 'app_env'].map(targetTypeLabel)).toEqual(['Project', 'App', 'Environment']);
+  });
+
+  it('prints a value it does not know as sent, and ignores inherited names', () => {
+    expect(targetTypeLabel('org')).toBe('org');
+    expect(targetTypeLabel('constructor')).toBe('constructor');
   });
 });

@@ -88,7 +88,7 @@
       >
         <span
           class="swatch"
-          style="background:{metric === 'latency' ? 'var(--primary)' : 'var(--warning)'}"
+          style="background:{metric === 'latency' ? 'var(--chart-1)' : 'var(--warning)'}"
         ></span>
         {secondaryLabel}
       </button>
@@ -131,7 +131,7 @@
     margin-bottom: 4px;
   }
   .lede {
-    font-size: 13px;
+    font-size: var(--text-sm);
     margin: 0;
   }
   .toggle {
@@ -140,7 +140,7 @@
     gap: 8px;
     padding: 6px 12px;
     font: inherit;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     color: var(--text-muted);
     background: var(--surface-2);
     border: 1px solid var(--border);
@@ -181,13 +181,13 @@
     gap: 3px;
   }
   .facts dt {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--text-faint);
   }
   .facts dd {
     margin: 0;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--text-md);
+    font-weight: var(--weight-strong);
     color: var(--text);
     font-variant-numeric: tabular-nums;
   }

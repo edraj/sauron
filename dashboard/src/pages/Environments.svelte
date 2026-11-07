@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { t } from '../lib/i18n';
+  import { loadErrorText } from '../lib/models/load-error';
+  import { formatNumber, t } from '../lib/i18n';
   import AdminShell from '../lib/components/layout/AdminShell.svelte';
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
@@ -8,6 +9,9 @@
   import Icon from '../lib/components/ui/Icon.svelte';
   import Input from '../lib/components/ui/Input.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import InlineNotice from '../lib/components/ui/InlineNotice.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
   import CopyButton from '../lib/components/ui/CopyButton.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
   import Modal from '../lib/components/ui/Modal.svelte';
@@ -73,8 +77,6 @@
   const view = new CachedView<EnvironmentsPayload>();
   const loading = $derived(view.loading);
   const revalidating = $derived(view.revalidating);
-  let actionError = $state<string | null>(null);
-  const error = $derived(actionError ?? view.error);
   let showRetired = $state(false);
   // Holds either a catalogue id (rename/retire in flight) or an enrollment id
   // (mute/promote/rotate in flight) — the two id spaces never collide, so one
@@ -202,7 +204,7 @@
   });
 
   function appNameFor(appId: string): string {
-    return appById[appId]?.name ?? 'this app';
+    return appById[appId]?.name ?? t('environments.thisApp');
   }
 
   function rowsFor(environmentId: string): AppEnvironment[] {
@@ -392,11 +394,9 @@
       creating = false;
       const refreshed = await refetchAll(pid);
       if (refreshed) {
-        toastStore.success(`"${created.name}" added to every app in this project.`);
+        toastStore.success(t('environments.toast.created', { name: created.name }));
       } else {
-        toastStore.success(
-          `"${created.name}" added to every app in this project. Reload to see its ingest keys.`,
-        );
+        toastStore.success(t('environments.toast.createdReload', { name: created.name }));
       }
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -418,7 +418,7 @@
         r.environment_id === renamed.id ? { ...r, name: renamed.name } : r,
       );
       renaming = null;
-      toastStore.success(`Renamed to "${renamed.name}" for every app in this project.`);
+      toastStore.success(t('environments.toast.renamed', { name: renamed.name }));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -433,7 +433,9 @@
       mergeEnrollment(await updateAppEnvironment(row.id, { ingest_enabled: !row.ingest_enabled }));
       const appLabel = appNameFor(row.app_id);
       toastStore.success(
-        row.ingest_enabled ? `Ingest muted for ${appLabel}.` : `Ingest resumed for ${appLabel}.`,
+        row.ingest_enabled
+          ? t('environments.toast.muted', { app: appLabel })
+          : t('environments.toast.resumed', { app: appLabel }),
       );
     } catch (err) {
       toastStore.error(errorMessage(err));
@@ -460,7 +462,9 @@
             : e,
       );
       invalidatePage();
-      toastStore.success(`"${row.name}" is now ${appNameFor(row.app_id)}'s default environment.`);
+      toastStore.success(
+        t('environments.toast.promoted', { name: row.name, app: appNameFor(row.app_id) }),
+      );
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -475,9 +479,7 @@
     try {
       mergeEnrollment(await rotateAppEnvironmentKey(target.id));
       confirmRotate = null;
-      toastStore.success(
-        `Key rotated for ${appNameFor(target.app_id)}. Update this environment’s DSN everywhere it's configured.`,
-      );
+      toastStore.success(t('environments.toast.rotated', { app: appNameFor(target.app_id) }));
     } catch (err) {
       toastStore.error(errorMessage(err));
     } finally {
@@ -506,7 +508,7 @@
           : r,
       );
       confirmRetire = null;
-      toastStore.success(`"${target.name}" retired project-wide. Its data stays queryable.`);
+      toastStore.success(t('environments.toast.retired', { name: target.name }));
     } catch (err) {
       // A race with another admin can still trip the backend's "last live"
       // or "still some app's default" 409 even though isDefaultSomewhere
@@ -520,32 +522,47 @@
 </script>
 
 <AdminShell>
-  <div class="head">
-    <div>
-      <h1 class="page-title">
-        {t('environments.title')}
-        <Freshness fetchedAt={view.fetchedAt} {revalidating} />
-      </h1>
-      <p class="muted sub">
-        Defined by {sessionStore.currentProject?.name ?? 'this project'} and shared by every app in
-        it — creating, renaming or retiring one below changes it for all of them. Each app's ingest
-        key, mute switch and default stay its own, set per app below.
-      </p>
-    </div>
-    <div class="head-actions">
+  <PageHeader
+    title={t('environments.title')}
+    subtitle={sessionStore.currentProject?.name
+      ? t('environments.subtitle', { project: sessionStore.currentProject.name })
+      : t('environments.subtitleNoProject')}
+  >
+    {#snippet freshness()}
+      <Freshness fetchedAt={view.fetchedAt} {revalidating} />
+    {/snippet}
+    {#snippet refresh()}
       <RefreshButton onclick={refresher.run} loading={refresher.busy || revalidating} />
+    {/snippet}
+    {#snippet primary()}
+      {#if catalogueReadable}
+        <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
+          {t('environments.new')}
+        </Button>
+      {/if}
+    {/snippet}
+  </PageHeader>
+
+  {#if view.error && view.data !== undefined}
+    <!-- A forced Refresh failed over rows we already had: they stay. -->
+    <div class="stale">
+      <InlineNotice tone="warning">
+        {t('ui.staleResults', { error: loadErrorText(view) })}
+        {#snippet action()}
+          <Button variant="ghost" size="sm" onclick={refresher.run}>{t('common.retry')}</Button>
+        {/snippet}
+      </InlineNotice>
     </div>
-    {#if catalogueReadable}
-      <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
-        {t('environments.new')}
-      </Button>
-    {/if}
-  </div>
+  {/if}
 
   {#if loading}
     <Skeleton rows={6} />
-  {:else if error}
-    <Card><p class="err-msg">{error}</p></Card>
+  {:else if view.error && view.data === undefined}
+    <ErrorState
+      title={t('common.couldntLoad', { thing: t('environments.thing') })}
+      error={view}
+      onretry={refresher.run}
+    />
   {:else if catalogueReadable && catalogue.length === 0}
     <EmptyState
       title={t('environments.empty.title')}
@@ -553,7 +570,8 @@
       icon="layers"
     >
       {#snippet action()}
-        <Button variant="primary" lockedReason={createLock} onclick={() => (creating = true)}>
+        <!-- `secondary`: the header already holds this view's one primary. -->
+        <Button variant="secondary" lockedReason={createLock} onclick={() => (creating = true)}>
           {t('environments.new')}
         </Button>
       {/snippet}
@@ -588,11 +606,11 @@
              assumes a view it does not have. -->
         {@const canRetire =
           activeCatalogue.length > 1 && (!enrollmentViewComplete || !isDefaultSomewhere(env.id))}
-        <Card padding="none">
+        <Card>
           {#snippet header()}
             <div class="env-title">
-              <span class="name">{env.name}</span>
-              <span class="when muted">created <TimeValue value={env.created_at} /></span>
+              <h3 class="name">{env.name}</h3>
+              <span class="when muted">{t('environments.created')} <TimeValue value={env.created_at} /></span>
             </div>
           {/snippet}
           {#snippet actions()}
@@ -660,7 +678,7 @@
                       lockedReason={updateLock}
                       onclick={() => toggleIngest(row)}
                     >
-                      {row.ingest_enabled ? 'Mute ingest' : 'Resume ingest'}
+                      {row.ingest_enabled ? t('environments.muteIngest') : t('environments.resumeIngest')}
                     </Button>
                     {#if !row.is_default}
                       <Button
@@ -707,7 +725,7 @@
                      on the project effect, and there is no partial refetch. -->
                 <p class="no-apps muted partial">
                   {t('prose.env.someFailed.a')}
-                  <em>are</em> {t('prose.env.someFailed.b')}
+                  <em>{t('environments.someFailedAre')}</em> {t('prose.env.someFailed.b')}
                 </p>
               {/if}
             </div>
@@ -743,7 +761,7 @@
       <div class="retired-toggle">
         <Button variant="ghost" size="sm" onclick={() => (showRetired = !showRetired)}>
           <Icon name={showRetired ? 'chevron-down' : 'chevron-right'} size={14} />
-          {retiredCatalogue.length} retired
+          {t('environments.retiredCount', { n: formatNumber(retiredCatalogue.length) })}
         </Button>
       </div>
       {#if showRetired}
@@ -753,7 +771,7 @@
               <div class="retired-head">
                 <span class="name">{env.name}</span>
                 <Badge tone="neutral" size="sm">{t('environments.retired')}</Badge>
-                <span class="when muted">retired <TimeValue value={env.retired_at} /></span>
+                <span class="when muted">{t('environments.retiredAt')} <TimeValue value={env.retired_at} /></span>
               </div>
               <p class="muted note">
                 {t('environments.mutedNote')}
@@ -776,8 +794,8 @@
       <Button variant="secondary" disabled={createBusy} onclick={() => (creating = false)}>
         {t('common.cancel')}
       </Button>
-      <Button loading={createBusy} disabled={!newName.trim()} onclick={submitCreate}>
-        {t('common.create')}
+      <Button variant="primary" loading={createBusy} disabled={!newName.trim()} onclick={submitCreate}>
+        {t('environments.createAction')}
       </Button>
     {/snippet}
   </Modal>
@@ -797,8 +815,8 @@
       <Button variant="secondary" onclick={() => (renaming = null)} disabled={renameBusy}>
         {t('common.cancel')}
       </Button>
-      <Button loading={renameBusy} disabled={!renameValue.trim()} onclick={submitRename}>
-        {t('common.save')}
+      <Button variant="primary" loading={renameBusy} disabled={!renameValue.trim()} onclick={submitRename}>
+        {t('environments.renameAction')}
       </Button>
     {/snippet}
   </Modal>
@@ -806,8 +824,12 @@
   <ConfirmDialog
     open={confirmRotate !== null}
     title={t('environments.confirmRotate')}
-    message={`Anything ${appNameFor(confirmRotate?.app_id ?? '')} reports to "${confirmRotate?.name ?? ''}" stops until its DSN is updated. There is no grace period.`}
-    confirmLabel={t('environments.rotate')}
+    message={t('environments.confirmRotateBody', {
+      app: appNameFor(confirmRotate?.app_id ?? ''),
+      name: confirmRotate?.name ?? '',
+    })}
+    confirmLabel={t('environments.rotateKey')}
+    danger
     loading={busyId !== null && busyId === confirmRotate?.id}
     onconfirm={doRotate}
     oncancel={() => (confirmRotate = null)}
@@ -816,8 +838,8 @@
   <ConfirmDialog
     open={confirmRetire !== null}
     title={t('environments.confirmRetire')}
-    message={`"${confirmRetire?.name ?? ''}" will be removed from every app in this project. All of their keys for it stop working immediately and it leaves every picker. Existing data stays queryable and is archived to cold storage on the normal schedule. This cannot be undone.`}
-    confirmLabel={t('environments.retire')}
+    message={t('environments.confirmRetireBody', { name: confirmRetire?.name ?? '' })}
+    confirmLabel={t('environments.retireAction')}
     danger
     loading={busyId !== null && busyId === confirmRetire?.id}
     onconfirm={doRetire}
@@ -826,31 +848,11 @@
 </AdminShell>
 
 <style>
-  .head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-    flex-wrap: wrap;
-  }
-  .sub {
-    font-size: 13.5px;
-    margin-top: 4px;
-    max-width: 64ch;
-    line-height: 1.55;
-  }
-  .err-msg {
-    color: var(--error);
-    font-size: 13.5px;
+  .stale {
+    margin-bottom: 16px;
   }
   .catalogue-note {
-    font-size: 13px;
+    font-size: var(--text-sm);
     line-height: 1.55;
     margin-bottom: 14px;
   }
@@ -860,7 +862,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: var(--page-gap);
   }
   .env-title {
     display: flex;
@@ -869,18 +871,18 @@
     flex-wrap: wrap;
   }
   .name {
-    font-weight: 600;
-    font-size: 14.5px;
+    font-weight: var(--weight-strong);
+    font-size: var(--text-md);
   }
   .when {
-    font-size: 0.8rem;
+    font-size: var(--text-sm);
   }
   .app-rows {
     display: flex;
     flex-direction: column;
   }
   .app-row {
-    padding: 12px 18px;
+    padding: 12px 0;
     border-bottom: 1px solid var(--border);
     display: flex;
     flex-direction: column;
@@ -899,8 +901,8 @@
     flex-wrap: wrap;
   }
   .app-name {
-    font-weight: 560;
-    font-size: 13.5px;
+    font-weight: var(--weight-medium);
+    font-size: var(--text-sm);
   }
   .dsn {
     display: flex;
@@ -916,7 +918,7 @@
     background: var(--surface-2);
     border-radius: var(--radius-sm);
     padding: 6px 8px;
-    font-size: 0.8rem;
+    font-size: var(--text-sm);
   }
   .row-actions {
     display: flex;
@@ -924,8 +926,8 @@
     flex-wrap: wrap;
   }
   .no-apps {
-    font-size: 13px;
-    padding: 14px 18px;
+    font-size: var(--text-sm);
+    padding: 12px 0;
     line-height: 1.55;
   }
   /* Sits under real rows rather than replacing them, so it needs the same
@@ -934,27 +936,27 @@
     border-top: 1px solid var(--border);
   }
   .retired-toggle {
-    margin-top: 14px;
+    margin-top: var(--page-gap);
   }
   .retired {
     margin-top: 8px;
+    gap: 0;
   }
   .env {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 0.75rem;
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 6px;
   }
   .retired-head {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 8px;
     flex-wrap: wrap;
   }
   .note {
-    font-size: 0.8rem;
+    font-size: var(--text-sm);
     margin: 0;
   }
 </style>

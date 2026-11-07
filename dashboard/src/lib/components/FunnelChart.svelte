@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatNumber } from '../i18n';
+  import { formatNumber, t } from '../i18n';
   import type { FunnelResult } from '../models';
   import { formatPercent } from '../utils/format';
 
@@ -29,8 +29,13 @@
       {#if i > 0 && dropoff > 0.0001}
         <div class="fdrop">
           <span class="drop-ic">↓</span>
-          {formatPercent(dropoff)} drop-off
-          <span class="faint">· {formatNumber(step.count)} of {formatNumber(result.steps[i - 1].count)} continued</span>
+          {t('funnels.dropOff', { pct: formatPercent(dropoff) })}
+          <span class="faint"
+            >· {t('funnels.continued', {
+              n: formatNumber(step.count),
+              total: formatNumber(result.steps[i - 1].count),
+            })}</span
+          >
         </div>
       {/if}
     </div>
@@ -58,8 +63,8 @@
     display: flex;
     align-items: center;
     gap: 9px;
-    font-size: 13.5px;
-    font-weight: 560;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     min-width: 0;
   }
   .fnum {
@@ -68,10 +73,10 @@
     width: 20px;
     height: 20px;
     border-radius: 50%;
-    background: var(--primary-soft);
-    color: var(--primary);
-    font-size: 11px;
-    font-weight: 680;
+    background: var(--surface-2);
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     flex-shrink: 0;
   }
   .fstat {
@@ -82,11 +87,11 @@
     font-variant-numeric: tabular-nums;
   }
   .fcount {
-    font-size: 14px;
-    font-weight: 640;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-strong);
   }
   .fconv {
-    font-size: 12px;
+    font-size: var(--text-xs);
   }
   .ftrack {
     width: 100%;
@@ -101,14 +106,16 @@
     align-items: center;
     justify-content: flex-end;
     padding-inline-end: 8px;
-    background: linear-gradient(90deg, var(--primary-active), var(--primary));
+    /* The solid fill, not `--chart-1`: the bar carries its white percentage,
+       and dark-theme `--chart-1` gives that label only 3.26:1. */
+    background: var(--primary-solid);
     border-radius: var(--radius-sm);
     transition: width 0.4s ease;
     min-width: 2px;
   }
   .fbar-label {
-    font-size: 11px;
-    font-weight: 640;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-strong);
     color: var(--primary-contrast);
   }
   .fdrop {
@@ -116,10 +123,10 @@
     align-items: center;
     gap: 6px;
     padding: 4px 0 10px 29px;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     color: var(--error);
   }
   .drop-ic {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
 </style>

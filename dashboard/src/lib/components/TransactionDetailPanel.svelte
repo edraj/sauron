@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { t } from '../i18n';
+  import { t, formatNumber } from '../i18n';
   /**
    * Everything stored about one span: its fields, its tags, its extra blob.
    *
@@ -17,8 +17,9 @@
    */
   import Icon from './ui/Icon.svelte';
   import Badge from './ui/Badge.svelte';
+  import InlineNotice from './ui/InlineNotice.svelte';
   import JsonTree from './JsonTree.svelte';
-  import { detailRows, isTruncated, truncatedBytesLabel } from '../models/transaction-detail';
+  import { detailRows, isTruncated } from '../models/transaction-detail';
   import type { Transaction } from '../models';
 
   interface Props {
@@ -26,17 +27,21 @@
   }
 
   let { transaction }: Props = $props();
+
+  // The same two cases `truncatedBytesLabel` distinguishes, worded through
+  // the catalog so the notice is not English in an Arabic UI.
+  const truncatedNote = $derived.by(() => {
+    const bytes = transaction.extra?._bytes;
+    return typeof bytes === 'number' && bytes >= 0
+      ? t('tx.truncated.bytes', { bytes: formatNumber(bytes) })
+      : t('tx.truncated.unserializable');
+  });
 </script>
 
 {#if isTruncated(transaction)}
-  <p class="truncated" role="status">
-    <Icon name="info" size={14} />
-    <span>
-      The SDK capped this payload at 16 KB and sent a marker instead
-      ({truncatedBytesLabel(transaction)}). The span and its timing are accurate; only the
-      attached data was dropped.
-    </span>
-  </p>
+  <div class="truncated">
+    <InlineNotice tone="info">{truncatedNote}</InlineNotice>
+  </div>
 {/if}
 
 <div class="meta-block">
@@ -99,13 +104,12 @@
   .meta-block + .meta-block {
     margin-top: 14px;
   }
+  /* The house `.section-label`: sentence case, quiet. */
   .meta-block h4 {
     margin: 0 0 8px;
-    font-size: 11.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+    color: var(--text-faint);
   }
   .tag-list {
     display: flex;
@@ -142,15 +146,15 @@
     grid-column: 1 / -1;
   }
   .detail dt {
-    font-size: 12px;
-    color: var(--muted);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
     /* Labels are short, known, and read as a column — wrapping "Transaction id"
        onto two lines would ripple the baseline of every row beside it. */
     white-space: nowrap;
   }
   .detail dd {
     margin: 0;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
     min-width: 0;
     /* Long urls, uuids and release strings have few break opportunities, so
        normal wrapping leaves them overflowing. `anywhere` breaks mid-token.
@@ -164,20 +168,12 @@
     align-items: center;
     gap: 8px;
     margin: 14px 0 0;
-    font-size: 12.5px;
+    font-size: var(--text-xs);
   }
   .withheld {
-    color: var(--muted);
+    color: var(--text-muted);
   }
   .truncated {
-    display: flex;
-    align-items: center;
-    gap: 8px;
     margin: 0 0 14px;
-    padding: 8px 12px;
-    border-radius: var(--radius);
-    background: var(--info-soft);
-    color: var(--info);
-    font-size: 12.5px;
   }
 </style>

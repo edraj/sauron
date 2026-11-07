@@ -4,7 +4,22 @@
 // `(schedule_days >> EXTRACT(DOW FROM ts)) & 1` — so BIT 0 IS SUNDAY, exactly
 // as Postgres numbers DOW. Keep the two in sync.
 
-export const WEEKDAYS: string[] = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+import type { MessageKey } from '../i18n';
+
+/**
+ * Short weekday names as catalog keys, Sunday first (index = DOW = bit).
+ * Translate with `t()` at render time; the index, not the name, is what maps
+ * to the `schedule_days` bit.
+ */
+export const WEEKDAY_KEYS: MessageKey[] = [
+  'inspector.weekday.sun',
+  'inspector.weekday.mon',
+  'inspector.weekday.tue',
+  'inspector.weekday.wed',
+  'inspector.weekday.thu',
+  'inspector.weekday.fri',
+  'inspector.weekday.sat',
+];
 
 /**
  * A short list of IANA zones for the picker. Any zone Postgres accepts is

@@ -9,24 +9,58 @@
 // `inspectorDetectors.test.ts` asserts this list against `detect.rs`'s source
 // the same way `permissions.test.ts` asserts against `rbac.rs`.
 
+import { t, type MessageKey } from '../i18n';
+
 export interface DetectorOption {
   /** The wire id. Must equal a `Detector::id()` arm in `detect.rs`. */
   id: string;
-  label: string;
-  /** What the value shape is, for the hint under the checkbox. */
-  hint: string;
+  /** Catalog key for the checkbox label; translated at render time. */
+  labelKey: MessageKey;
+  /**
+   * A literal value of the shape, shown as-is in every language: like the
+   * format-example placeholders, its shape IS the instruction.
+   */
+  example?: string;
+  /** Catalog key for what the value shape is, for the hint under the checkbox. */
+  hintKey?: MessageKey;
 }
 
 export const DETECTORS: DetectorOption[] = [
-  { id: 'email', label: 'Email address', hint: 'jane@acme.co.uk — requires a dot-separated host' },
-  { id: 'phone_e164', label: 'Phone (E.164)', hint: '+213551234567 — international form only' },
-  { id: 'ipv4', label: 'IPv4 address', hint: '203.0.113.7' },
-  { id: 'ipv6', label: 'IPv6 address', hint: '2001:db8::1' },
-  { id: 'jwt', label: 'JWT', hint: 'A signed three-segment token' },
-  { id: 'iban', label: 'IBAN', hint: 'Bank account number, checksum-validated' },
-  { id: 'ssn_us', label: 'US SSN', hint: '123-45-6789' },
-  { id: 'credit_card', label: 'Credit card', hint: 'Luhn-validated, so order ids do not match' },
+  {
+    id: 'email',
+    labelKey: 'inspector.detector.email',
+    example: 'jane@acme.co.uk',
+    hintKey: 'inspector.detectorHint.email',
+  },
+  {
+    id: 'phone_e164',
+    labelKey: 'inspector.detector.phoneE164',
+    example: '+213551234567',
+    hintKey: 'inspector.detectorHint.phoneE164',
+  },
+  { id: 'ipv4', labelKey: 'inspector.detector.ipv4', example: '203.0.113.7' },
+  { id: 'ipv6', labelKey: 'inspector.detector.ipv6', example: '2001:db8::1' },
+  { id: 'jwt', labelKey: 'inspector.detector.jwt', hintKey: 'inspector.detectorHint.jwt' },
+  { id: 'iban', labelKey: 'inspector.detector.iban', hintKey: 'inspector.detectorHint.iban' },
+  { id: 'ssn_us', labelKey: 'inspector.detector.ssnUs', example: '123-45-6789' },
+  {
+    id: 'credit_card',
+    labelKey: 'inspector.detector.creditCard',
+    hintKey: 'inspector.detectorHint.creditCard',
+  },
 ];
+
+/**
+ * The tooltip for a detector checkbox: the example, the translated hint, or
+ * both joined by an em dash ("jane@acme.co.uk — requires a dot-separated
+ * host"). Calls `t()`, so call it from markup or `$derived` to follow a
+ * language switch.
+ */
+export function detectorHint(d: DetectorOption): string {
+  const hint = d.hintKey ? t(d.hintKey) : '';
+  if (d.example && hint) return `${d.example} — ${hint}`;
+  return d.example ?? hint;
+}
 
 /**
  * The starting configuration offered to someone creating their first policy.

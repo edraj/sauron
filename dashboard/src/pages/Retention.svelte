@@ -3,6 +3,11 @@
   import Card from '../lib/components/ui/Card.svelte';
   import Skeleton from '../lib/components/ui/Skeleton.svelte';
   import EmptyState from '../lib/components/ui/EmptyState.svelte';
+  import ErrorState from '../lib/components/ui/ErrorState.svelte';
+  import SegmentedControl from '../lib/components/ui/SegmentedControl.svelte';
+  import Icon from '../lib/components/ui/Icon.svelte';
+  import PageHeader from '../lib/components/layout/PageHeader.svelte';
+  import TimeValue from '../lib/components/TimeValue.svelte';
   import CodeBlock from '../lib/components/ui/CodeBlock.svelte';
   import Button from '../lib/components/ui/Button.svelte';
   import RollupChip from '../lib/components/ui/RollupChip.svelte';
@@ -52,6 +57,17 @@
     gridMode = gridMode === 'rate' ? 'count' : 'rate';
   }
 
+  const granularityOptions = $derived([
+    { value: 'day', label: t('retention.granularity.day') },
+    { value: 'week', label: t('retention.granularity.week') },
+  ]);
+  // `%` and `#` are the cell values themselves, not words; the count segment
+  // keeps its explanatory tooltip.
+  const gridModeOptions = $derived([
+    { value: 'rate', label: '%' },
+    { value: 'count', label: '#', title: t('retention.mode.countTitle') },
+  ]);
+
   // Grid and lifecycle ride the house SWR view cache: at 51k persons the grid
   // is ~0.9 s and lifecycle ~1.8 s server-side, so returning to this page
   // repaints the cached answer instantly and refreshes behind the
@@ -76,6 +92,7 @@
   const gridError = $derived(gridView.error);
   const life = $derived(lifeView.data ?? null);
   const lifeLoading = $derived(lifeView.loading);
+  const lifeError = $derived(lifeView.error);
 
   // Churn accumulates pages through a cursor, which a keyed whole-view cache
   // models badly — and at ~40 ms server-side it does not need one.
@@ -241,95 +258,84 @@
 
 </script>
 
+<PageHeader title={t('retention.title')} subtitle={t('retention.subtitle')}>
+  {#snippet freshness()}
+    <RollupChip />
+    {#if gridRevalidating}<span class="updating">{t('retention.updating')}</span>{/if}
+  {/snippet}
+  {#snippet refresh()}
+    <RefreshButton
+      onclick={refresher.run}
+      loading={refresher.busy || gridRevalidating || lifeView.revalidating}
+    />
+  {/snippet}
+  {#snippet actions()}
+    {#if !notReady}
+      <Button
+        variant="secondary"
+        disabled={!grid || grid.cohorts.length === 0}
+        onclick={exportCsv}
+      >
+        <Icon name="download" size={15} />
+        {t('retention.export')}
+      </Button>
+    {/if}
+  {/snippet}
+</PageHeader>
+
 <div class="page">
-  <header class="head">
-    <div>
-      <h1>{t('retention.title')}</h1>
-      <p class="sub">{t('retention.subtitle')}</p>
-    </div>
-    <div class="controls">
-      <RefreshButton
-        onclick={refresher.run}
-        loading={refresher.busy || gridRevalidating || lifeView.revalidating}
-      />
-      <RollupChip />
-      {#if gridRevalidating}<span class="updating">{t('retention.updating')}</span>{/if}
-      <div class="seg-group" role="group">
-        <button
-          type="button"
-          class:active={granularity === 'day'}
-          onclick={() => (granularity = 'day')}
-        >
-          {t('retention.granularity.day')}
-        </button>
-        <button
-          type="button"
-          class:active={granularity === 'week'}
-          onclick={() => (granularity = 'week')}
-        >
-          {t('retention.granularity.week')}
-        </button>
-      </div>
-      <label class="split-toggle">
-        <input type="checkbox" bind:checked={split} />
-        {t('retention.errorSplit.toggle')}
-      </label>
-      <label class="split-toggle" title={t('retention.identifiedOnly.hint')}>
-        <input type="checkbox" bind:checked={identifiedOnly} />
-        {t('retention.identifiedOnly.toggle')}
-      </label>
-    </div>
-  </header>
+  <div class="filters">
+    <SegmentedControl
+      value={granularity}
+      options={granularityOptions}
+      ariaLabel={t('retention.granularity.label')}
+      onchange={(v) => (granularity = v as Granularity)}
+    />
+    <label class="check">
+      <input type="checkbox" bind:checked={split} />
+      {t('retention.errorSplit.toggle')}
+    </label>
+    <label class="check" title={t('retention.identifiedOnly.hint')}>
+      <input type="checkbox" bind:checked={identifiedOnly} />
+      {t('retention.identifiedOnly.toggle')}
+    </label>
+  </div>
 
   {#if notReady}
-    <Card>
-      <h2 class="not-ready-title">{t('retention.notReady.title')}</h2>
+    <Card title={t('retention.notReady.title')}>
       <p>{t('retention.notReady.body')}</p>
-      <p class="sub">{t('retention.notReady.allApps')}</p>
+      <p class="note">{t('retention.notReady.allApps')}</p>
       <CodeBlock code={BACKFILL_COMMAND} language="bash" />
     </Card>
   {:else}
-    <Card title={t('retention.title')}>
+    <Card title={t('retention.card.cohorts')}>
       {#snippet actions()}
-        <div class="seg-group grid-mode" role="group" aria-label={t('retention.mode.label')}>
-          <button
-            type="button"
-            class="seg"
-            class:active={gridMode === 'rate'}
-            aria-pressed={gridMode === 'rate'}
-            onclick={() => (gridMode = 'rate')}
-          >
-            %
-          </button>
-          <button
-            type="button"
-            class="seg"
-            class:active={gridMode === 'count'}
-            aria-pressed={gridMode === 'count'}
-            title={t('retention.mode.countTitle')}
-            onclick={() => (gridMode = 'count')}
-          >
-            #
-          </button>
-        </div>
-        <Button
+        <SegmentedControl
           size="sm"
-          variant="ghost"
-          disabled={!grid || grid.cohorts.length === 0}
-          onclick={exportCsv}
-        >
-          {t('retention.export')}
-        </Button>
+          value={gridMode}
+          options={gridModeOptions}
+          ariaLabel={t('retention.mode.label')}
+          onchange={(v) => (gridMode = v as GridMode)}
+        />
       {/snippet}
       {#if gridLoading}
         <Skeleton rows={6} />
       {:else if gridError}
-        <EmptyState title={String(gridError)} />
+        <ErrorState
+          title={t('retention.error.grid')}
+          error={gridView}
+          onretry={() => void gridView.reload()}
+          size="section"
+        />
       {:else if !grid || grid.cohorts.length === 0}
-        <EmptyState title={t('retention.empty.title')} description={t('retention.empty.body')} />
+        <EmptyState
+          size="section"
+          title={t('common.empty.range', { things: t('retention.noun') })}
+          description={t('retention.empty.body')}
+        />
       {:else}
         {#if split}
-          <h3 class="split-head">{t('retention.errorSplit.exposed')}</h3>
+          <p class="section-label split-head">{t('retention.errorSplit.exposed')}</p>
         {/if}
         <RetentionGrid
           cohorts={grid.cohorts}
@@ -338,7 +344,7 @@
           onmodetoggle={toggleGridMode}
         />
         {#if split && grid.clean}
-          <h3 class="split-head">{t('retention.errorSplit.clean')}</h3>
+          <p class="section-label split-head">{t('retention.errorSplit.clean')}</p>
           <RetentionGrid
             cohorts={grid.clean}
             {granularity}
@@ -375,10 +381,21 @@
     <Card title={t('retention.lifecycle.title')}>
       {#if lifeLoading}
         <Skeleton rows={4} />
+      {:else if lifeError && !life}
+        <ErrorState
+          title={t('retention.error.lifecycle')}
+          error={lifeView}
+          onretry={() => void lifeView.reload()}
+          size="section"
+        />
       {:else if !life || life.points.length === 0}
-        <EmptyState title={t('retention.empty.title')} description={t('retention.empty.body')} />
+        <EmptyState
+          size="section"
+          title={t('common.empty.range', { things: t('retention.noun') })}
+          description={t('retention.empty.body')}
+        />
       {:else}
-        <p class="sub">{t('retention.lifecycle.subtitle')}</p>
+        <p class="note">{t('retention.lifecycle.subtitle')}</p>
         <LifecycleChart points={life.points} />
       {/if}
     </Card>
@@ -387,9 +404,9 @@
       {#if churnLoading}
         <Skeleton rows={4} />
       {:else if churnPeople.length === 0}
-        <EmptyState title={t('retention.empty.title')} description={t('retention.empty.body')} />
+        <EmptyState size="section" title={t('retention.churn.empty')} />
       {:else}
-        <p class="sub">
+        <p class="note">
           {t('retention.churn.subtitle', { days: String(churnSilentDays) })}
         </p>
         <DataTable>
@@ -399,13 +416,13 @@
               <SortableTh key="last_seen" sort={churnSort} onsort={onChurnSort}>
                 {t('retention.churn.lastSeen')}
               </SortableTh>
-              <SortableTh key="events" sort={churnSort} onsort={onChurnSort}>
+              <SortableTh key="events" class="num" sort={churnSort} onsort={onChurnSort}>
                 {t('retention.churn.events')}
               </SortableTh>
-              <SortableTh key="errors" sort={churnSort} onsort={onChurnSort}>
+              <SortableTh key="errors" class="num" sort={churnSort} onsort={onChurnSort}>
                 {t('retention.churn.errors')}
               </SortableTh>
-              <SortableTh key="sessions" sort={churnSort} onsort={onChurnSort}>
+              <SortableTh key="sessions" class="num" sort={churnSort} onsort={onChurnSort}>
                 {t('retention.churn.sessions')}
               </SortableTh>
             </tr>
@@ -427,10 +444,10 @@
                     {p.distinct_id}
                   </a>
                 </td>
-                <td>{p.last_seen}</td>
-                <td>{formatNumber(p.events_count)}</td>
-                <td>{formatNumber(p.errors_count)}</td>
-                <td>{formatNumber(p.sessions_count)}</td>
+                <td><TimeValue value={p.last_seen} muted /></td>
+                <td class="num">{formatNumber(p.events_count)}</td>
+                <td class="num">{formatNumber(p.errors_count)}</td>
+                <td class="num">{formatNumber(p.sessions_count)}</td>
               </tr>
               {#if open}
                 <tr class="churn-detail">
@@ -452,7 +469,7 @@
                       </div>
                       <div>
                         <span class="detail-label">{t('retention.churn.firstSeen')}</span>
-                        <span class="detail-value">{p.first_seen.slice(0, 10)}</span>
+                        <span class="detail-value"><TimeValue value={p.first_seen} /></span>
                       </div>
                       <div>
                         <span class="detail-label">{t('retention.churn.errors')}</span>
@@ -490,86 +507,44 @@
   .page {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: var(--page-gap);
   }
 
-  .head {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    align-items: flex-start;
-    justify-content: space-between;
-  }
-
-  h1 {
-    margin: 0;
-    font-size: 1.25rem;
-  }
-
-  .sub {
-    margin: 4px 0 0;
-    color: var(--muted-fg);
-    font-size: 0.8125rem;
-  }
-
-  .controls {
+  .filters {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 8px 16px;
     flex-wrap: wrap;
   }
 
-  .seg-group {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
-  }
-
-  .seg-group button {
-    background: transparent;
-    border: 0;
-    padding: 5px 12px;
-    font: inherit;
-    font-size: 0.8125rem;
-    color: var(--muted-fg);
-    cursor: pointer;
-  }
-
-  .seg-group button.active {
-    background: var(--primary);
-    color: var(--primary-fg, #fff);
-  }
-
-  .split-toggle {
+  .check {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 0.8125rem;
-    color: var(--muted-fg);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+  }
+
+  /* A muted lede inside a section, under its title. */
+  .note {
+    margin: 0 0 10px;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
   }
 
   .split-head {
     margin: 12px 0 6px;
-    font-size: 0.8125rem;
-    color: var(--muted-fg);
-    font-weight: 500;
   }
 
   .caveat {
     margin: 10px 0 0;
-    font-size: 0.75rem;
-    color: var(--muted-fg);
-  }
-
-  .not-ready-title {
-    margin: 0 0 6px;
-    font-size: 1rem;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .updating {
-    font-size: 0.75rem;
-    color: var(--muted-fg);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 
   .load-more {
@@ -585,7 +560,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    font-size: 0.875rem;
+    font-size: var(--text-sm);
   }
 
   .insights li {
@@ -608,8 +583,8 @@
      never as a second finding — muted and one step down in size. */
   .action {
     margin: 0;
-    font-size: 0.8125rem;
-    color: var(--muted-fg);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
   }
 
   .action a {
@@ -627,11 +602,11 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--muted-fg);
+    background: var(--text-muted);
   }
 
   .insights li[data-tone='bad'] .dot {
-    background: var(--danger);
+    background: var(--error);
   }
 
   .insights li[data-tone='warn'] .dot {
@@ -655,8 +630,11 @@
     text-decoration: underline;
   }
 
+  /* `--surface-2`, the same well as the other expanded rows (Transactions'
+     detail row). This read `--muted`, an undefined token, and the token fix
+     mapped it to a TEXT colour, which painted the panel a solid mid-grey. */
   .churn-detail td {
-    background: var(--muted);
+    background: var(--surface-2);
   }
 
   .detail-grid {
@@ -665,11 +643,11 @@
     gap: 8px 28px;
     align-items: baseline;
     padding: 4px 0;
-    font-size: 0.8125rem;
+    font-size: var(--text-sm);
   }
 
   .detail-label {
-    color: var(--muted-fg);
+    color: var(--text-muted);
     margin-inline-end: 6px;
   }
 
@@ -678,6 +656,6 @@
   }
 
   .detail-value[data-tone='bad'] {
-    color: var(--danger);
+    color: var(--error);
   }
 </style>
