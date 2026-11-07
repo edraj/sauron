@@ -69,7 +69,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # `string/date-time` and `string/uuid`. Those two types appear in the majority
 # of the API's DTOs, so omitting the features produces a document that looks
 # complete and describes almost nothing.
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
 # `default-features = false` + `vendored` is load-bearing, NOT tidiness.
 #
 # `utoipa-swagger-ui`'s build script downloads the Swagger UI release archive
@@ -84,7 +84,7 @@ utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 # both proxies pointed at a closed port. If you change these features, re-run
 # that check — the failure mode is a build that works on a developer laptop and
 # fails in the package builder.
-utoipa-swagger-ui = { version = "9", default-features = false, features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "10", default-features = false, features = ["axum", "vendored"] }
 
 # --- cli / benchmarking (crebain) ---
 clap = { version = "4", features = ["derive"] }

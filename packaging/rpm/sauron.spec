@@ -377,6 +377,10 @@ fi
 - Dashboard: Inter and Noto Sans Arabic are bundled rather than fetched.
 - follow-redirects 1.16.2 (via axios) for GHSA-q3jh-wrc6-jgq8, GHSA-8r9p-f939-6h3c
   and GHSA-mrwp-f3q8-3g9p.
+- utoipa 6 / utoipa-swagger-ui 10 and duckdb 1.10506.1 (still DuckDB 1.5.6), which
+  move their build-time zip to 9.4.1 for GHSA-m665-v7pm-7grj, GHSA-q7v9-x93c-xqv3 and
+  GHSA-9hj8-73fh-9963. The OpenAPI document is unchanged apart from the order of
+  `oneOf` members on nullable fields.
 
 * Tue Sep 01 2026 Kefah Issa <kefah@oodi.iq> - 1.8.1-1
 - Licence scope corrected. 1.8.0 relicensed the whole tree LGPL-3.0-only; only the
