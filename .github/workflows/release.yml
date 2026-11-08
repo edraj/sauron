@@ -121,9 +121,13 @@ jobs:
         shell: bash
     env:
       # sccache-backed compilation cache, shared across matrix legs and runs.
+      # RUSTC_WRAPPER / SCCACHE_GHA_ENABLED are NOT set here: they are exported
+      # by "Use sccache if it installed" below, only once sccache exists. Set
+      # job-wide, every cargo invocation hard-required a binary the action
+      # downloads from GitHub's release-asset endpoint — which returned 504 for
+      # every repo for long stretches on 2026-11-08. A cache must never be able
+      # to fail the build it is only meant to speed up.
       CARGO_INCREMENTAL: "0"
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
     steps:
       - name: Install build toolchain (rpm)
         if: matrix.family == 'rpm'
@@ -202,7 +206,19 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Use sccache if it installed
+        run: |
+          if [ "${{ steps.sccache.outcome }}" = "success" ] && command -v sccache >/dev/null 2>&1; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "sccache: $(sccache --version)"
+          else
+            echo "::warning::sccache could not be installed (its GitHub release download failed); building without the compile cache"
+          fi
 
       - name: Cache cargo registry (not target — sccache owns compiled objects)
         uses: Swatinem/rust-cache@v2
@@ -422,19 +438,55 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      SYFT_VERSION: "1.18.1"
     steps:
       - uses: actions/checkout@v4
+      # syft, cached on its pinned version (the Security Gate's scanners use the
+      # same shape). Restored here, saved below with `always()` — the plain
+      # `actions/cache` post-step saves only when the job succeeds.
+      - name: Restore syft
+        id: syft-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .syft-bin
+          key: syft-${{ env.SYFT_VERSION }}
       - name: Install syft
         # Pin the installer to a tag (not the moving `main`) and download-then-run.
+        #
+        # The installer resolves the tag on github.com/anchore/syft/releases and
+        # downloads the release asset — both on GitHub's release endpoint, which
+        # returned 504 for every repo for long stretches on 2026-11-08 and failed
+        # this job at "received HTTP status=504". If it fails, the SAME version
+        # is taken from syft's official image on ghcr.io, which kept serving.
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.18.1/install.sh -o syft-install.sh
-          sh syft-install.sh -b "$HOME/.local/bin" v1.18.1
+          set -euo pipefail
+          mkdir -p .syft-bin
+          if [ ! -x .syft-bin/syft ]; then
+            if ! { curl -fsSL --retry 3 --retry-delay 10 \
+                     "https://raw.githubusercontent.com/anchore/syft/v${SYFT_VERSION}/install.sh" -o syft-install.sh \
+                   && sh syft-install.sh -b .syft-bin "v${SYFT_VERSION}"; }; then
+              echo "::warning::syft installer failed; taking v${SYFT_VERSION} from ghcr.io/anchore/syft"
+              img="ghcr.io/anchore/syft:v${SYFT_VERSION}"
+              for _ in 1 2 3; do docker pull -q "$img" >/dev/null && break; sleep 10; done
+              cid=$(docker create "$img")
+              docker cp "$cid:/syft" .syft-bin/syft
+              docker rm "$cid" >/dev/null
+            fi
+          fi
+          .syft-bin/syft version | head -2
+      - name: Save syft
+        if: ${{ always() && steps.syft-cache.outputs.cache-hit != 'true' && hashFiles('.syft-bin/syft') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .syft-bin
+          key: ${{ steps.syft-cache.outputs.cache-primary-key }}
       - name: Generate SBOM
         env:
           VER: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          "$HOME/.local/bin/syft" dir:backend -o "cyclonedx-json@1.6"="sauron-${VER}.cdx.json" -q
+          .syft-bin/syft dir:backend -o "cyclonedx-json@1.6"="sauron-${VER}.cdx.json" -q
           n=$(grep -c '"purl"' "sauron-${VER}.cdx.json" || true)
           echo "SBOM components: $n"
           [ "${n:-0}" -ge 1 ]
