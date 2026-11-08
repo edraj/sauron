@@ -15,6 +15,8 @@
 # Flags / env:
 #   --target <triple>   default: x86_64-unknown-linux-gnu (aarch64-… also mapped)
 #   --dir <cache>       default: $DUCKDB_VENDOR_DIR, else <repo>/.cache/duckdb
+#   --print-version     print the derived DuckDB version and exit (no download);
+#                       CI keys its download cache on this, not on Cargo.lock
 #
 # Progress is written to stderr; the extraction directory (containing
 # libduckdb.so + duckdb.h) is printed as the only stdout line.
@@ -22,12 +24,14 @@ set -euo pipefail
 
 target="x86_64-unknown-linux-gnu"
 cache="${DUCKDB_VENDOR_DIR:-}"
+print_version=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) target="$2"; shift 2 ;;
         --dir)    cache="$2"; shift 2 ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^#\s\?//'; exit 0 ;;
-        *) echo "unknown argument: $1 (accepts --target and --dir)" >&2; exit 2 ;;
+        --print-version) print_version=1; shift ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^#\s\?//'; exit 0 ;;
+        *) echo "unknown argument: $1 (accepts --target, --dir and --print-version)" >&2; exit 2 ;;
     esac
 done
 
@@ -45,6 +49,10 @@ encoded="$(awk '
 ' "$lock")"
 [ -n "${encoded:-}" ] || { echo "could not find libduckdb-sys version in $lock" >&2; exit 1; }
 ver="$(( encoded / 10000 )).$(( (encoded / 100) % 100 )).$(( encoded % 100 ))"
+if [ "$print_version" -eq 1 ]; then
+    printf '%s\n' "$ver"
+    exit 0
+fi
 
 case "$target" in
     x86_64-unknown-linux-gnu)  asset="libduckdb-linux-amd64.zip" ;;
@@ -67,7 +75,14 @@ echo ">>   $url" >&2
 
 mkdir -p "$dir"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-curl --proto '=https' --tlsv1.2 -fSL "$url" -o "$tmp/$asset"
+# Retried: GitHub's release-asset endpoint has returned 504 for every repo
+# for stretches of minutes while the rest of github.com (and its status page)
+# stayed green — measured 2026-11-08, when it failed CI's backend and source-RPM
+# jobs at this line with curl exit 22. `--retry` treats 408/429/5xx as
+# transient, so a short outage rides through; a long one still fails here,
+# which is why CI caches this download (keyed on --print-version) too.
+curl --proto '=https' --tlsv1.2 -fSL --retry 8 --retry-delay 20 --connect-timeout 30 \
+    "$url" -o "$tmp/$asset"
 unzip -o -q "$tmp/$asset" -d "$dir"
 
 [ -f "$lib" ] || { echo "archive did not contain libduckdb.so:" >&2; ls -la "$dir" >&2; exit 1; }

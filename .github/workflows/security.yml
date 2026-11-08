@@ -69,14 +69,32 @@ jobs:
 
       - name: Prepare
         run: |
-          mkdir -p .cigate/bin .cigate/out
+          mkdir -p .cigate/bin .cigate/out .cigate/dl
           echo "0" > .cigate/rc
+
+      # The scanner tarballs, keyed on their pinned versions: GitHub's
+      # release-asset endpoint returned 504 for every repo for a stretch on
+      # 2026-11-08 and failed this gate at the gitleaks download for a change
+      # that touched no dependency. A cached tarball is never re-fetched.
+      - name: Cache scanner downloads
+        uses: actions/cache@v4
+        with:
+          path: .cigate/dl
+          key: cigate-dl-gitleaks-${{ env.GITLEAKS_VERSION }}-trivy-${{ env.TRIVY_VERSION }}
 
       - name: Gitleaks (secrets)
         run: |
-          GLT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o "$GLT" \
-            || { echo "::error::gitleaks download failed"; echo 1 > .cigate/rc; exit 1; }
+          # In the workspace (never a shared /tmp: the self-hosted runner shares
+          # it across users), where the cache step above keeps it. `-f` so an
+          # HTTP error fails HERE as a download failure — without it a 504 page
+          # was saved as the tarball and reported as "extract failed". Retried
+          # because 408/429/5xx from the release endpoint are transient.
+          GLT=".cigate/dl/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          if [ ! -s "$GLT" ]; then
+            curl -fsSL --retry 8 --retry-delay 20 --connect-timeout 30 \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o "$GLT" \
+              || { rm -f "$GLT"; echo "::error::gitleaks download failed"; echo 1 > .cigate/rc; exit 1; }
+          fi
           tar xzf "$GLT" -C .cigate/bin gitleaks \
             || { echo "::error::gitleaks extract failed"; echo 1 > .cigate/rc; exit 1; }
           echo "::group::gitleaks detect"
@@ -110,9 +128,13 @@ jobs:
 
       - name: Trivy (dependency CVEs)
         run: |
-          TVT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
-          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$TVT" \
-            || { echo "::error::trivy download failed"; echo 1 > .cigate/rc; exit 1; }
+          # Same shape and reasons as the gitleaks download above.
+          TVT=".cigate/dl/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          if [ ! -s "$TVT" ]; then
+            curl -fsSL --retry 8 --retry-delay 20 --connect-timeout 30 \
+              "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$TVT" \
+              || { rm -f "$TVT"; echo "::error::trivy download failed"; echo 1 > .cigate/rc; exit 1; }
+          fi
           tar xzf "$TVT" -C .cigate/bin trivy \
             || { echo "::error::trivy extract failed"; echo 1 > .cigate/rc; exit 1; }
           UNFIXED=""

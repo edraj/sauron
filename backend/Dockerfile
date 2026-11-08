@@ -24,6 +24,9 @@ RUN apt-get update \
 # mismatched one. libduckdb-sys encodes it as 1.<MMmmpp>.x, e.g. 1.10504.0 => 1.5.4.
 # Copied ahead of the sources so this layer is reused until Cargo.lock changes.
 COPY Cargo.lock ./
+# The libduckdb download is retried (--retry, as in packaging/rpm/fetch-libduckdb.sh):
+# GitHub's release-asset endpoint has 504'd for minutes at a time while the rest of
+# github.com stayed up.
 RUN set -eux; \
     encoded="$(awk '\
         $1=="name" && $3=="\"libduckdb-sys\""{f=1; next} \
@@ -37,7 +40,7 @@ RUN set -eux; \
     esac; \
     echo ">> fetching libduckdb $ver ($asset)"; \
     mkdir -p /opt/duckdb; \
-    curl --proto '=https' --tlsv1.2 -fSL \
+    curl --proto '=https' --tlsv1.2 -fSL --retry 8 --retry-delay 20 --connect-timeout 30 \
         "https://github.com/duckdb/duckdb/releases/download/v${ver}/${asset}" \
         -o /tmp/libduckdb.zip; \
     unzip -o -q /tmp/libduckdb.zip -d /opt/duckdb; \
