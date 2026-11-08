@@ -137,6 +137,9 @@ pub struct PersonProfile {
     pub user: Option<PersonRow>,
     pub events: Vec<AnalyticsEvent>,
     pub errors: Vec<ErrorEvent>,
+    /// Some of this person's archived (Parquet) rows could not be read, so the
+    /// lists hold only what Postgres had. The page still renders; it says so.
+    pub archive_incomplete: bool,
 }
 
 #[utoipa::path(
@@ -163,13 +166,14 @@ pub async fn person(
     let limit = q.limit.clamp(1, 200);
 
     let user = repo::get_event_user(&mut conn, scope.clone(), &distinct_id).await?;
-    let (events, errors) = person_timeline(&mut conn, scope, &perms, &distinct_id, limit).await?;
+    let rows = person_timeline(&state, &mut conn, scope, &perms, &distinct_id, limit).await?;
 
     Ok(Json(PersonProfile {
         distinct_id,
         user,
-        events,
-        errors,
+        events: rows.events,
+        errors: rows.errors,
+        archive_incomplete: rows.archive_incomplete,
     }))
 }
 
@@ -205,18 +209,34 @@ async fn authorize_person_read(
 /// One person's most recent events and errors, the errors gated for `perms`.
 ///
 /// Shared by [`person`] and [`person_timeline_section`] so the gates exist once.
+///
+/// Both tiers: Postgres first, then whatever the archive must add
+/// (`tier_read::person_rows`), on this same connection — never a second
+/// checkout while this one is held. Without the archive a person older than
+/// `tier.hot_days` opened on "no activity" beside a Users row counting it.
 async fn person_timeline(
+    state: &AppState,
     conn: &mut sauron_db::AsyncPgConnection,
     scope: sauron_db::scope::ReadScope,
     perms: &std::collections::HashSet<String>,
     distinct_id: &str,
     limit: i64,
-) -> Result<(Vec<AnalyticsEvent>, Vec<ErrorEvent>), ApiError> {
+) -> Result<crate::tier_read::PersonRows, ApiError> {
     let events = repo::events_for_person(conn, scope.clone(), distinct_id, limit).await?;
-    let mut errors = repo::error_events_for_person(conn, scope, distinct_id, limit).await?;
-    crate::symbolicate::gate_source_context(perms, &mut errors);
-    crate::symbolicate::gate_event_body(perms, &mut errors);
-    Ok((events, errors))
+    let errors = repo::error_events_for_person(conn, scope.clone(), distinct_id, limit).await?;
+    let mut rows = crate::tier_read::person_rows(
+        state,
+        conn,
+        &scope,
+        distinct_id,
+        events,
+        errors,
+        limit as usize,
+    )
+    .await?;
+    crate::symbolicate::gate_source_context(perms, &mut rows.errors);
+    crate::symbolicate::gate_event_body(perms, &mut rows.errors);
+    Ok(rows)
 }
 
 // --- person, one section at a time -------------------------------------------
@@ -259,6 +279,9 @@ pub async fn person_summary(
 pub struct PersonTimeline {
     pub events: Vec<AnalyticsEvent>,
     pub errors: Vec<ErrorEvent>,
+    /// Some of this person's archived (Parquet) rows could not be read, so the
+    /// lists hold only what Postgres had. The page still renders; it says so.
+    pub archive_incomplete: bool,
 }
 
 #[utoipa::path(
@@ -280,8 +303,12 @@ pub async fn person_timeline_section(
     let mut conn = db(&state).await?;
     let (scope, perms) = authorize_person_read(&mut conn, auth.user_id, app_id, &raw_query).await?;
     let limit = q.limit.clamp(1, 200);
-    let (events, errors) = person_timeline(&mut conn, scope, &perms, &distinct_id, limit).await?;
-    Ok(Json(PersonTimeline { events, errors }))
+    let rows = person_timeline(&state, &mut conn, scope, &perms, &distinct_id, limit).await?;
+    Ok(Json(PersonTimeline {
+        events: rows.events,
+        errors: rows.errors,
+        archive_incomplete: rows.archive_incomplete,
+    }))
 }
 
 // ---------------------------------------------------------------------------

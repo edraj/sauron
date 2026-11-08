@@ -69,7 +69,6 @@
   const userLoading = $derived(view.loading && !view.hasData);
   const events = $derived(timelineView.data?.events ?? []);
   const errors = $derived(timelineView.data?.errors ?? []);
-  const timelineLoading = $derived(timelineView.loading && !timelineView.hasData);
   const revalidating = $derived(view.revalidating || timelineView.revalidating);
   // The page as a whole fails only when it has NOTHING to show. One section
   // failing beside one that loaded is reported inside that section.
@@ -162,6 +161,46 @@
     }
     return ids.size;
   });
+
+  /**
+   * The three tiles: the person's TOTALS from the summary — the person rollup,
+   * the same numbers the Users list shows for them — never a count of the
+   * timeline's rows. The timeline is capped at `LIMIT` per kind, so counting it
+   * read "100" for a person with thousands; and before the timeline read the
+   * archive, a person older than the deployment's hot window read "0" beside a
+   * Users row saying 21.
+   *
+   * Never FEWER than the timeline lists, though. On an app whose person
+   * rollup was never backfilled, the summary still counts the rows Postgres
+   * holds, while the timeline also reads the archive — taken alone, the
+   * totals would read "0" above a list of archived rows, the very
+   * contradiction this replaced.
+   *
+   * A person with no profile row (`user: null`) has no totals, so the tiles
+   * fall back to what the timeline holds. `null` until there is something to
+   * show either way.
+   */
+  const totals = $derived.by(() => {
+    const listed = timelineView.hasData
+      ? { events: events.length, errors: errors.length, sessions: sessionCount }
+      : null;
+    if (user) {
+      return {
+        events: Math.max(user.events_count, listed?.events ?? 0),
+        errors: Math.max(user.errors_count, listed?.errors ?? 0),
+        sessions: Math.max(user.sessions_count, listed?.sessions ?? 0),
+      };
+    }
+    if (view.hasData && listed) return listed;
+    return null;
+  });
+  /** The server could not read some archived rows; the lists are Postgres's. */
+  const archiveIncomplete = $derived(timelineView.data?.archive_incomplete === true);
+  const totalsLoading = $derived(!totals && (view.loading || timelineView.loading));
+  /** The timeline lists fewer rows than the totals count — say so under it. */
+  const timelineCapped = $derived(
+    !!user && timelineView.hasData && (user.events_count > events.length || user.errors_count > errors.length),
+  );
 
   const hasTraits = $derived(!!user?.properties && Object.keys(user.properties).length > 0);
 
@@ -260,24 +299,24 @@
   {:else if error}
     <ErrorState title={t('person.error.load')} error={failedView} onretry={refresher.run} />
   {:else}
-    <!-- The three counts come off the timeline. First and last seen are the
-         profile's, and sit in the header's meta line. -->
+    <!-- The three counts are the profile's totals (see `totals`). First and
+         last seen are the profile's too, and sit in the header's meta line. -->
     <StatTiles min={140}>
       <StatTile
         label={t('explore.column.events')}
-        value={timelineView.hasData ? formatNumber(events.length) : '—'}
-        loading={timelineLoading}
+        value={totals ? formatNumber(totals.events) : '—'}
+        loading={totalsLoading}
       />
       <StatTile
         label={t('explore.column.errors')}
-        value={timelineView.hasData ? formatNumber(errors.length) : '—'}
-        tone={errors.length > 0 ? 'error' : 'neutral'}
-        loading={timelineLoading}
+        value={totals ? formatNumber(totals.errors) : '—'}
+        tone={(totals?.errors ?? 0) > 0 ? 'error' : 'neutral'}
+        loading={totalsLoading}
       />
       <StatTile
         label={t('explore.column.sessions')}
-        value={sessionCount > 0 ? formatNumber(sessionCount) : '—'}
-        loading={timelineLoading}
+        value={totals ? formatNumber(totals.sessions) : '—'}
+        loading={totalsLoading}
       />
     </StatTiles>
 
@@ -309,6 +348,9 @@
             {/if}
           {/snippet}
           <ViewSection view={timelineView} rows={8}>
+          {#if archiveIncomplete}
+            <p class="tl-capped" role="status">{t('timeline.archiveIncomplete')}</p>
+          {/if}
           {#if timeline.length === 0}
             <EmptyState size="section" title={t('person.empty.title')} description={t('person.empty.body')} />
           {:else}
@@ -370,6 +412,14 @@
                 </li>
               {/each}
             </ol>
+            {#if timelineCapped}
+              <p class="tl-capped">
+                {t('person.timeline.capped', {
+                  events: formatNumber(events.length),
+                  errors: formatNumber(errors.length),
+                })}
+              </p>
+            {/if}
           {/if}
           </ViewSection>
         </Card>
@@ -498,6 +548,11 @@
     font-size: var(--text-xs);
     color: var(--text-faint);
     margin-inline-start: auto;
+  }
+  .tl-capped {
+    margin: 12px 0 0;
+    font-size: var(--text-xs);
+    color: var(--text-faint);
   }
   /* Tabular figures so the column of offsets stays aligned as the digits
      change; `min-width` keeps the timestamp beside it from shifting when a

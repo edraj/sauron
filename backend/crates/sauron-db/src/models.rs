@@ -12,6 +12,46 @@ use uuid::Uuid;
 
 use crate::schema::*;
 
+// ---------------------------------------------------------------------------
+// Decode-only defaults for rows read back out of cold Parquet.
+//
+// `AnalyticsEvent`, `ErrorEvent` and `Transaction` derive `Deserialize` only for
+// the archived-row reader (`sauron_tier::rows` → `tier_read` in sauron-api).
+// Parquet files are immutable, so a month exported BEFORE a column was added
+// does not have that column at all, and a month mixing older and newer files
+// carries NULL for it (`union_by_name`). Postgres backfilled those rows with
+// the column's DEFAULT when the column was added; these functions apply the
+// same default on the way back in, so an archived row decodes — and
+// serializes — exactly as its Postgres self would have.
+//
+// Only fields added after tiering began (migration 0010, 2026-07-14) need one;
+// each use names its migration. A NOT NULL column added later needs the same
+// treatment, or every month archived before it stops decoding.
+// ---------------------------------------------------------------------------
+
+/// `'{}'::jsonb`, the default of every JSON-object column added since tiering.
+fn empty_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+/// Absent or NULL → `{}`; anything else as stored.
+fn object_or_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+    Ok(match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => empty_object(),
+        Some(v) => v,
+    })
+}
+
+/// `error_events.symbolication_status`'s default (migration 0014).
+fn pending_status() -> String {
+    "pending".to_string()
+}
+
+/// Absent or NULL → `"pending"`.
+fn status_or_pending<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_else(pending_status))
+}
+
 /// Serialize a client IP in coarsened form.
 ///
 /// Raw end-user IPs are personal data, and every read endpoint that returns
@@ -353,7 +393,9 @@ pub struct IssueLatestFrames {
     pub stacktrace_symbolicated: Option<Value>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
+// `Deserialize` is for rows read back out of cold Parquet (`sauron_tier::rows`),
+// which arrive as JSON objects; see `tier_read::archived` in sauron-api.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize, utoipa::ToSchema)]
 #[diesel(table_name = error_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct ErrorEvent {
@@ -384,12 +426,15 @@ pub struct ErrorEvent {
     /// Server-symbolicated frames (no source-context lines); null until resolved.
     pub stacktrace_symbolicated: Option<Value>,
     /// pending | symbolicated | partial | no_artifacts | not_applicable | failed.
+    #[serde(default = "pending_status", deserialize_with = "status_or_pending")] // 0014
     pub symbolication_status: String,
     /// Dart debug header (`build_id`, `dso_base`, `arch`, `os`, `raw_stacktrace`).
     pub debug_meta: Option<Value>,
     /// Dev-supplied structured context blocks (distinct from machine `context`).
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0016
     pub contexts: Value,
     /// Dev-supplied freeform JSON.
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0016
     pub extra: Value,
     /// Whether the SDK saw this error caught (`Some(true)`) or uncaught (`Some(false)`).
     /// `None` for rows ingested before this column existed — never backfilled.
@@ -482,7 +527,9 @@ pub struct NewErrorEvent {
 // Analytics events & people (keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
+// `Deserialize` is for rows read back out of cold Parquet (`sauron_tier::rows`),
+// which arrive as JSON objects; see `tier_read::archived` in sauron-api.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize, utoipa::ToSchema)]
 #[diesel(table_name = analytics_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AnalyticsEvent {
@@ -501,9 +548,12 @@ pub struct AnalyticsEvent {
     pub received_at: DateTime<Utc>,
     pub device_key: Option<String>,
     pub screen: Option<String>,
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0017
     pub tags: Value,
     /// Dev-supplied structured context blocks (distinct from machine `context`).
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0017
     pub contexts: Value,
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0017
     pub extra: Value,
 }
 
@@ -782,7 +832,9 @@ pub struct Workflow {
 // Transactions (performance signal, keyed by app_id)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Queryable, Selectable, Serialize, utoipa::ToSchema)]
+// `Deserialize` is for rows read back out of cold Parquet (`sauron_tier::rows`),
+// which arrive as JSON objects; see `tier_read::archived` in sauron-api.
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize, utoipa::ToSchema)]
 #[diesel(table_name = transactions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Transaction {
@@ -811,9 +863,11 @@ pub struct Transaction {
     /// Dev-supplied flat string tags. Nulled by `strip_transaction_body` for a
     /// caller without `event:read` — see that function for why the free-text
     /// search reach must be narrowed in the same breath.
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0063
     pub tags: Value,
     /// Dev-supplied freeform JSON (request/response bodies and friends).
     /// Gated exactly as `tags` is.
+    #[serde(default = "empty_object", deserialize_with = "object_or_empty")] // 0063
     pub extra: Value,
 }
 
@@ -2060,5 +2114,64 @@ mod openapi_schema_tests {
             "expected the `User` schema to describe its serialized fields; \
              got: {schema}"
         );
+    }
+}
+
+#[cfg(test)]
+mod archived_decode_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An archived analytics row from a month exported before migration 0017:
+    /// no `tags` / `contexts` / `extra` keys at all.
+    #[test]
+    fn a_row_from_before_a_column_existed_decodes_with_its_default() {
+        let row = json!({
+            "id": Uuid::nil(), "app_id": Uuid::nil(), "environment_id": null,
+            "name": "screen_view", "distinct_id": "p1",
+            "properties": {}, "context": {}, "session_id": null, "release": null,
+            "ip_address": null, "occurred_at": "2026-07-15T00:00:00Z",
+            "received_at": "2026-07-15T00:00:01Z", "device_key": null, "screen": null,
+        });
+        let ev: AnalyticsEvent = serde_json::from_value(row).expect("decodes");
+        assert_eq!(ev.tags, json!({}));
+        assert_eq!(ev.contexts, json!({}));
+        assert_eq!(ev.extra, json!({}));
+    }
+
+    /// A month mixing older and newer files: `union_by_name` fills NULL.
+    #[test]
+    fn a_null_from_a_mixed_month_reads_as_the_default_and_values_survive() {
+        let mut row = json!({
+            "id": Uuid::nil(), "app_id": Uuid::nil(), "environment_id": null,
+            "name": "GET /", "op": "http.client", "duration_ms": 1.5, "status": null,
+            "http_method": null, "http_status": null, "url": null, "distinct_id": null,
+            "session_id": null, "device_key": null, "release": null, "ip_address": null,
+            "occurred_at": "2026-08-01T00:00:00Z", "received_at": "2026-08-01T00:00:00Z",
+            "workflow_id": null, "workflow_name": null, "restored_pin_id": null,
+            "finished_at": null, "tags": null, "extra": null,
+        });
+        let tx: Transaction = serde_json::from_value(row.clone()).expect("decodes");
+        assert_eq!((tx.tags, tx.extra), (json!({}), json!({})));
+        row["tags"] = json!({ "k": "v" });
+        let tx: Transaction = serde_json::from_value(row).expect("decodes");
+        assert_eq!(tx.tags, json!({ "k": "v" }));
+    }
+
+    #[test]
+    fn an_error_row_from_before_symbolication_reads_as_pending() {
+        let row = json!({
+            "id": Uuid::nil(), "app_id": Uuid::nil(), "environment_id": null,
+            "issue_id": Uuid::nil(), "fingerprint": "f", "level": "error", "message": "m",
+            "exception_type": "E", "exception_value": "v", "stacktrace": [], "breadcrumbs": [],
+            "context": {}, "tags": {}, "release": null, "distinct_id": null, "event_user": null,
+            "sdk": null, "ip_address": null, "occurred_at": "2026-07-14T12:00:00Z",
+            "received_at": "2026-07-14T12:00:00Z", "session_id": null, "device_key": null,
+            "screen": null, "stacktrace_symbolicated": null, "debug_meta": null,
+            "handled": null, "title": null, "culprit": null,
+        });
+        let e: ErrorEvent = serde_json::from_value(row).expect("decodes");
+        assert_eq!(e.symbolication_status, "pending");
+        assert_eq!((e.contexts, e.extra), (json!({}), json!({})));
     }
 }

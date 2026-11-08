@@ -43,7 +43,7 @@ jobs:
       # Pinned like the other two scanners. An unpinned `pip install --upgrade`
       # is what jumped semgrep 1.38 -> 1.174 and broke the gate everywhere.
       SEMGREP_VERSION: "1.174.0"
-      # .cigate/bin holds the gitleaks/trivy binaries this job just downloaded;
+      # .cigate/bin holds the gitleaks/trivy binaries (downloaded or restored);
       # trivy's gobinary analyzer would otherwise report their embedded Go
       # stdlib CVEs (fixable, so --ignore-unfixed will not hide them) and fail
       # the gate on vulnerabilities that are not in the repository.
@@ -69,16 +69,58 @@ jobs:
 
       - name: Prepare
         run: |
-          mkdir -p .cigate/bin .cigate/out
+          mkdir -p .cigate/bin .cigate/out .cigate/dl
           echo "0" > .cigate/rc
+          # fetch_tool NAME RELEASE_URL IMAGE PATH_IN_IMAGE
+          #
+          # Puts NAME into .cigate/bin unless the cache step below already
+          # restored it: from the pinned release tarball first, else from the
+          # SAME version's official image on ghcr.io. GitHub's release-asset
+          # endpoint returned 504 for every repo for long stretches on
+          # 2026-11-08 (githubstatus green throughout) and failed this gate
+          # twice at the gitleaks download, retries and all, while ghcr.io
+          # served both images the whole time.
+          #
+          # Called as `fetch_tool … || { … }`: inside a `||` context bash
+          # suspends `-e`, so a failed download falls through to the image
+          # instead of killing the step. `-f` on curl so an HTTP error is a
+          # download failure rather than a 504 page saved as the tarball.
+          cat > .cigate/fetch-tool.sh <<'FETCH'
+          fetch_tool() {
+            local name=$1 url=$2 image=$3 path=$4 tgz=".cigate/dl/$1.tar.gz" cid rc
+            [ -x ".cigate/bin/$name" ] && return 0
+            if curl -fsSL --retry 3 --retry-delay 10 --connect-timeout 30 "$url" -o "$tgz" \
+               && tar xzf "$tgz" -C .cigate/bin "$name"; then
+              return 0
+            fi
+            echo "::warning::$name: release download failed; taking it from $image"
+            for _ in 1 2 3; do docker pull -q "$image" >/dev/null && break; sleep 10; done
+            cid=$(docker create "$image") || return 1
+            docker cp "$cid:$path" ".cigate/bin/$name"; rc=$?
+            docker rm "$cid" >/dev/null || true
+            return "$rc"
+          }
+          FETCH
+
+      # The scanner BINARIES (whichever source they came from), keyed on their
+      # pinned versions, so a warm run never touches either source. Restored
+      # here and saved explicitly below with `always()`: the plain
+      # `actions/cache` post-step saves only when the job succeeds, and this
+      # job fails whenever a scanner finds something.
+      - name: Restore scanner binaries
+        id: cigate-tools
+        uses: actions/cache/restore@v4
+        with:
+          path: .cigate/bin
+          key: cigate-tools-gitleaks-${{ env.GITLEAKS_VERSION }}-trivy-${{ env.TRIVY_VERSION }}
 
       - name: Gitleaks (secrets)
         run: |
-          GLT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o "$GLT" \
-            || { echo "::error::gitleaks download failed"; echo 1 > .cigate/rc; exit 1; }
-          tar xzf "$GLT" -C .cigate/bin gitleaks \
-            || { echo "::error::gitleaks extract failed"; echo 1 > .cigate/rc; exit 1; }
+          . .cigate/fetch-tool.sh
+          fetch_tool gitleaks \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            "ghcr.io/gitleaks/gitleaks:v${GITLEAKS_VERSION}" /usr/bin/gitleaks \
+            || { echo "::error::gitleaks download failed (release tarball and ghcr.io image)"; echo 1 > .cigate/rc; exit 1; }
           echo "::group::gitleaks detect"
           # `|| rc=$?`: steps run under `bash -e`, so a bare non-zero exit
           # aborted the step HERE. Everything below was dead code: the
@@ -110,11 +152,11 @@ jobs:
 
       - name: Trivy (dependency CVEs)
         run: |
-          TVT=$(mktemp)   # unique path: the self-hosted runner shares /tmp across users
-          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o "$TVT" \
-            || { echo "::error::trivy download failed"; echo 1 > .cigate/rc; exit 1; }
-          tar xzf "$TVT" -C .cigate/bin trivy \
-            || { echo "::error::trivy extract failed"; echo 1 > .cigate/rc; exit 1; }
+          . .cigate/fetch-tool.sh
+          fetch_tool trivy \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            "ghcr.io/aquasecurity/trivy:${TRIVY_VERSION}" /usr/local/bin/trivy \
+            || { echo "::error::trivy download failed (release tarball and ghcr.io image)"; echo 1 > .cigate/rc; exit 1; }
           UNFIXED=""
           if [ "$IGNORE_UNFIXED" = "true" ]; then UNFIXED="--ignore-unfixed"; fi
           echo "::group::trivy fs"
@@ -128,6 +170,13 @@ jobs:
           echo "::endgroup::"
           if [ "$rc" -ne 0 ]; then echo "::error::Trivy found ${SEVERITY} dependency vulnerabilities"; echo 1 > .cigate/rc; fi
           exit 0
+
+      - name: Save scanner binaries
+        if: ${{ always() && steps.cigate-tools.outputs.cache-hit != 'true' && hashFiles('.cigate/bin/gitleaks') != '' && hashFiles('.cigate/bin/trivy') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cigate/bin
+          key: ${{ steps.cigate-tools.outputs.cache-primary-key }}
 
       - name: Semgrep (SAST)
         run: |

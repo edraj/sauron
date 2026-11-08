@@ -137,6 +137,10 @@ function resetStore() {
   // it awaits `load()` to completion, which always resets it to `null` itself
   // (success or failure), but reset it here too rather than rely on that.
   (sessionStore as unknown as { loadPromise: Promise<void> | null }).loadPromise = null;
+  // A shared-link seed is one-shot and consumed by `load()`, but a test that
+  // seeds and then fails before loading would otherwise leak it forward.
+  (sessionStore as unknown as { seed: unknown }).seed = null;
+  sessionStore.linkScopeUnmet = [];
 }
 
 beforeEach(() => {
@@ -1405,5 +1409,190 @@ describe('reachableProjectCount', () => {
     // ...and the shell can still tell that projects exist elsewhere, which is
     // what keeps it out of onboarding.
     expect(sessionStore.reachableProjectCount).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shared links: the scope a link names (`models/scope-url.ts`) beats the
+// remembered selection on the FIRST load only, through the same validation a
+// stored value gets — and the store says which levels it could not honour.
+// ---------------------------------------------------------------------------
+describe('seedFromUrl (shared links)', () => {
+  const org = (id: string) => ({
+    id,
+    name: id,
+    slug: id,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    project_count: 1,
+    can_create_project: true,
+  });
+  const project = (id: string, orgId: string) => ({
+    id,
+    org_id: orgId,
+    name: id,
+    slug: id,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  });
+
+  beforeEach(() => {
+    mockListOrgs.mockResolvedValue([org('org-1'), org('org-2')]);
+    mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
+    mockListProjects.mockImplementation(async (orgId: string) =>
+      orgId === 'org-2'
+        ? [project('proj-2a', 'org-2'), project('proj-2b', 'org-2')]
+        : [project('proj-1', 'org-1')],
+    );
+    mockListApps.mockImplementation(async (projectId: string) =>
+      projectId === 'proj-2b'
+        ? [makeApp('app-x', { project_id: projectId }), makeApp('app-y', { project_id: projectId })]
+        : [makeApp('app-1', { project_id: projectId })],
+    );
+    mockListEnvironments.mockResolvedValue([
+      makeEnv('env-default', { is_default: true }),
+      makeEnv('env-prod'),
+    ]);
+    mockListReleases.mockResolvedValue([makeRelease('v1'), makeRelease('v2.0.71+2071')]);
+    // A remembered selection somewhere else entirely.
+    window.localStorage.setItem(ORG_KEY, 'org-1');
+    window.localStorage.setItem(PROJECT_KEY, 'proj-1');
+    window.localStorage.setItem(APP_KEY, 'app-1');
+    window.localStorage.setItem(ENV_KEY, 'env-default');
+  });
+
+  it('lands on every level the link names, over the remembered selection', async () => {
+    sessionStore.seedFromUrl({
+      org: 'org-2',
+      project: 'proj-2b',
+      app: 'app-y',
+      release: 'v2.0.71+2071',
+      env: 'env-prod',
+    });
+
+    await sessionStore.load();
+
+    expect(sessionStore.scopeSelection).toEqual({
+      org: 'org-2',
+      project: 'proj-2b',
+      app: 'app-y',
+      release: 'v2.0.71+2071',
+      env: 'env-prod',
+    });
+    expect(sessionStore.linkScopeUnmet).toEqual([]);
+    // Persisted, so a reload of the same tab without the link stays put.
+    expect(window.localStorage.getItem(APP_KEY)).toBe('app-y');
+    expect(window.localStorage.getItem(ENV_KEY)).toBe('env-prod');
+    expect(window.localStorage.getItem('sauron.release:app-y')).toBe('v2.0.71+2071');
+  });
+
+  it('reads a link with no env / release as "all", not as the app default', async () => {
+    sessionStore.seedFromUrl({
+      org: 'org-2',
+      project: 'proj-2b',
+      app: 'app-y',
+      release: null,
+      env: null,
+    });
+
+    await sessionStore.load();
+
+    expect(sessionStore.currentEnvId).toBeNull();
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(sessionStore.linkScopeUnmet).toEqual([]);
+  });
+
+  it('falls back when the link names an app this member cannot open, and says so', async () => {
+    sessionStore.seedFromUrl({
+      org: 'org-2',
+      project: 'proj-2b',
+      app: 'app-gone',
+      release: 'v1',
+      env: 'env-prod',
+    });
+
+    await sessionStore.load();
+
+    expect(sessionStore.currentAppId).toBe('app-x');
+    // The link's env / release belonged to the app it could not reach, so the
+    // fallback app keeps its own default rather than inheriting them.
+    expect(sessionStore.currentEnvId).toBe('env-default');
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(sessionStore.linkScopeUnmet).toEqual(['app', 'release', 'env']);
+  });
+
+  it('falls back on a release the app never reported', async () => {
+    sessionStore.seedFromUrl({ org: 'org-2', project: 'proj-2b', app: 'app-y', release: 'v9', env: null });
+
+    await sessionStore.load();
+
+    expect(sessionStore.currentAppId).toBe('app-y');
+    expect(sessionStore.currentRelease).toBeNull();
+    expect(sessionStore.linkScopeUnmet).toEqual(['release']);
+  });
+
+  it('is one-shot: a later forced reload follows the store, not the link', async () => {
+    sessionStore.seedFromUrl({ org: 'org-2', project: 'proj-2b', app: 'app-y', release: null, env: null });
+    await sessionStore.load();
+    await sessionStore.setApp('app-x');
+
+    await sessionStore.load(true);
+
+    expect(sessionStore.currentAppId).toBe('app-x');
+  });
+
+  it('keeps the link\'s environment pending through a failed list fetch, and settles it on retry', async () => {
+    mockListEnvironments.mockRejectedValueOnce(new Error('502'));
+    sessionStore.seedFromUrl({
+      org: 'org-2',
+      project: 'proj-2b',
+      app: 'app-y',
+      release: null,
+      env: 'env-prod',
+    });
+
+    await sessionStore.load();
+
+    // Unresolved, not "unavailable": no toast-worthy miss yet.
+    expect(sessionStore.environmentsError).toBe(true);
+    expect(sessionStore.linkScopeUnmet).toEqual([]);
+
+    // The Topbar's self-heal retries — and lands on the LINK's environment,
+    // not the remembered `env-default`.
+    await sessionStore.ensureEnvironmentsLoaded();
+    expect(sessionStore.currentEnvId).toBe('env-prod');
+    expect(sessionStore.linkScopeUnmet).toEqual([]);
+    expect(window.localStorage.getItem(ENV_KEY)).toBe('env-prod');
+  });
+
+  it('reports a pending level the retry cannot honour', async () => {
+    mockListEnvironments.mockRejectedValueOnce(new Error('502'));
+    sessionStore.seedFromUrl({ org: 'org-2', project: 'proj-2b', app: 'app-y', env: 'env-retired' });
+    await sessionStore.load();
+    expect(sessionStore.linkScopeUnmet).toEqual([]);
+
+    await sessionStore.ensureEnvironmentsLoaded();
+    expect(sessionStore.currentEnvId).toBe('env-default');
+    expect(sessionStore.linkScopeUnmet).toEqual(['env']);
+  });
+
+  it('drops a pending level once the user switches explicitly', async () => {
+    mockListEnvironments.mockRejectedValueOnce(new Error('502'));
+    sessionStore.seedFromUrl({ org: 'org-2', project: 'proj-2b', app: 'app-y', env: 'env-prod' });
+    await sessionStore.load();
+
+    sessionStore.setEnvironment(null);
+    await sessionStore.ensureEnvironmentsLoaded();
+
+    expect(sessionStore.currentEnvId).not.toBe('env-prod');
+  });
+
+  it('is ignored once the store has loaded', async () => {
+    await sessionStore.load();
+    sessionStore.seedFromUrl({ org: 'org-2', project: 'proj-2b', app: 'app-y' });
+
+    await sessionStore.load(true);
+
+    expect(sessionStore.currentOrgId).toBe('org-1');
   });
 });

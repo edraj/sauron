@@ -26,6 +26,13 @@ export const refreshB = {
   'timeline.offset.sincePrevious': { en: 'Since the previous entry', ar: 'منذ الإدخال السابق' },
   'timeline.offset.sinceSessionStart': { en: 'Since the session started', ar: 'منذ بدء الجلسة' },
   'timeline.mode.sincePrevious': { en: 'Since previous', ar: 'منذ السابق' },
+  // Person and session timelines read archived (Parquet) rows as well as
+  // Postgres. When the archive cannot be read the server still answers with
+  // what Postgres holds and says so; this is that note.
+  'timeline.archiveIncomplete': {
+    en: "Some older activity is archived and couldn't be read just now, so only recent rows are listed. Refresh to try again.",
+    ar: 'تعذّرت قراءة بعض النشاط الأقدم المؤرشف الآن، لذا تُعرض الصفوف الحديثة فقط. حدّث الصفحة للمحاولة مجددًا.',
+  },
   'timeline.category.navigation': { en: 'Navigation', ar: 'التنقّل' },
   'timeline.category.transaction': { en: 'Transactions', ar: 'المعاملات' },
   'timeline.category.event': { en: 'Events', ar: 'الأحداث' },

@@ -142,6 +142,12 @@ export const explore = {
     en: 'This person has no recorded events or errors.',
     ar: 'لا توجد أحداث أو أخطاء مسجّلة لهذا الشخص.',
   },
+  // Under the timeline when the tiles' totals exceed what it lists — it pulls
+  // the newest N of each kind, so a busy person's history is longer than this.
+  'person.timeline.capped': {
+    en: 'Showing the latest {events} events and {errors} errors.',
+    ar: 'يُعرض أحدث {events} من الأحداث و{errors} من الأخطاء.',
+  },
 
   // --- devices -------------------------------------------------------------
   'devices.title': { en: 'Devices', ar: 'الأجهزة' },

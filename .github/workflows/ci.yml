@@ -124,11 +124,21 @@ jobs:
           # Adding this changed the key once, so the first run after it merges
           # restores nothing and rebuilds the dependency graph cold.
           shared-key: backend
+      - name: libduckdb version (the download cache's key)
+        id: duckdb
+        run: echo "version=$(bash "$GITHUB_WORKSPACE/packaging/rpm/fetch-libduckdb.sh" --print-version)" >> "$GITHUB_OUTPUT"
       - name: Cache libduckdb download
         uses: actions/cache@v4
         with:
           path: .cache/duckdb
-          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
+          # Keyed on the DuckDB VERSION, not on Cargo.lock: any lockfile change
+          # (a one-line dev-dependency) used to miss this cache and re-download
+          # ~60 MB from GitHub releases — which is how a 504 outage of that
+          # endpoint failed CI on 2026-11-08 for a change that never touched
+          # DuckDB. The restore key also matches the old lockfile-hash entries;
+          # fetch-libduckdb.sh checks for its exact version dir either way.
+          key: libduckdb-v${{ steps.duckdb.outputs.version }}
+          restore-keys: libduckdb-
       - name: Fetch prebuilt libduckdb (DuckDB is linked unbundled)
         # DUCKDB_LIB_DIR lets sauron-tier link the prebuilt lib; LD_LIBRARY_PATH
         # lets the test binaries load it at runtime.
@@ -629,11 +639,21 @@ jobs:
       - name: rpmlint (report-only)
         continue-on-error: true
         run: rpmlint packaging/rpm/sauron.spec
+      - name: libduckdb version (the download cache's key)
+        id: duckdb
+        run: echo "version=$(bash "$GITHUB_WORKSPACE/packaging/rpm/fetch-libduckdb.sh" --print-version)" >> "$GITHUB_OUTPUT"
       - name: Cache libduckdb download
         uses: actions/cache@v4
         with:
           path: .cache/duckdb
-          key: libduckdb-${{ hashFiles('backend/Cargo.lock') }}
+          # Keyed on the DuckDB VERSION, not on Cargo.lock: any lockfile change
+          # (a one-line dev-dependency) used to miss this cache and re-download
+          # ~60 MB from GitHub releases — which is how a 504 outage of that
+          # endpoint failed CI on 2026-11-08 for a change that never touched
+          # DuckDB. The restore key also matches the old lockfile-hash entries;
+          # fetch-libduckdb.sh checks for its exact version dir either way.
+          key: libduckdb-v${{ steps.duckdb.outputs.version }}
+          restore-keys: libduckdb-
       - name: Source RPM builds (validates SourceN staging + tarball)
         run: ./packaging/rpm/build-rpm.sh --srpm
 

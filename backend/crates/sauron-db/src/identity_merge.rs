@@ -1603,3 +1603,81 @@ pub async fn cold_alias_map(
     .load(conn)
     .await
 }
+
+#[derive(QueryableByName)]
+struct ArchivedId {
+    #[diesel(sql_type = Text)]
+    id: String,
+}
+
+/// Every `distinct_id` whose ARCHIVED rows a profile of `person` should list —
+/// the person-sized counterpart of [`cold_alias_map`], for reading one person's
+/// rows back out of Parquet (`sauron_tier::rows`) rather than counting everyone.
+///
+/// Cold Parquet is immutable, so rows exported before a merge still name the
+/// guest id; the hot rewrite ([`rewrite_hot_rows`]) never reached them. A guest
+/// id therefore belongs to `person` here exactly when it belongs to them in
+/// Postgres: once a fold has COMPLETED for the merge (`completed_at IS NOT
+/// NULL`). Until then — pending, failed, dead — the guest's hot rows, its
+/// `event_users` row and its rollup counts all still sit under the guest, so
+/// its archived rows must too; otherwise one guest's history splits across two
+/// profiles, hot under one and archived under the other. `completed_at`, not
+/// `state = 'done'`, because [`rearm_merge`] moves a finished merge back to
+/// pending to sweep stragglers while its bulk has long since moved; see
+/// [`fold_rollups`] for the same marker chosen for the same reason.
+///
+/// (Aggregates resolve every state through [`cold_alias_map`]: a COUNT must
+/// count one human once whatever the merge's progress. A row listing follows
+/// ownership instead.)
+///
+/// So the set is every completed alias of `person`, plus `person` itself unless
+/// `person` is a completed alias of someone else. The chain guard is
+/// [`cold_alias_map`]'s.
+pub async fn archived_ids_for_person(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    person: &str,
+) -> QueryResult<Vec<String>> {
+    let rows: Vec<ArchivedId> = diesel::sql_query(
+        "SELECT m.alias_id AS id FROM identity_merges m \
+          WHERE m.app_id = $1 AND m.distinct_id = $2 AND m.completed_at IS NOT NULL \
+            AND NOT EXISTS (SELECT 1 FROM identity_merges c \
+                             WHERE c.app_id = m.app_id AND c.alias_id = m.distinct_id) \
+         UNION ALL \
+         SELECT $2 AS id \
+          WHERE NOT EXISTS (SELECT 1 FROM identity_merges \
+                             WHERE app_id = $1 AND alias_id = $2 \
+                               AND completed_at IS NOT NULL)",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<Text, _>(person)
+    .load(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
+/// For each of `ids` that is a completed alias, the person it now belongs to —
+/// the same ownership rule as [`archived_ids_for_person`], applied the other
+/// way round, for pages that list archived rows by something other than the
+/// person (a session's timeline) and must show a guest's archived row under
+/// the identity its Postgres siblings were rewritten to.
+pub async fn archived_alias_owners(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    ids: &[String],
+) -> QueryResult<std::collections::HashMap<String, String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<AliasEntry> = diesel::sql_query(
+        "SELECT m.alias_id AS alias, m.distinct_id AS person FROM identity_merges m \
+          WHERE m.app_id = $1 AND m.alias_id = ANY($2) AND m.completed_at IS NOT NULL \
+            AND NOT EXISTS (SELECT 1 FROM identity_merges c \
+                             WHERE c.app_id = m.app_id AND c.alias_id = m.distinct_id)",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<diesel::sql_types::Array<Text>, _>(ids.to_vec())
+    .load(conn)
+    .await?;
+    Ok(rows.into_iter().map(|e| (e.alias, e.person)).collect())
+}

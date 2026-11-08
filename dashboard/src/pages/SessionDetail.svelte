@@ -24,7 +24,11 @@
   import { sessionStore } from '../lib/stores/session.svelte';
   import { CachedView } from '../lib/stores/cached-view.svelte';
   import { viewKey } from '../lib/stores/view-cache';
-  import { getSessionSummary, getSessionTimeline } from '../lib/api/sessions';
+  import {
+    getSessionSummary,
+    getSessionTimeline,
+    type SessionTimelinePage,
+  } from '../lib/api/sessions';
   import { isNormalizedError } from '../lib/api/client';
   import {
     formatDuration,
@@ -88,7 +92,7 @@
   // page says what the session IS at once and the timeline card shows a
   // skeleton until its own answer lands.
   const view = new CachedView<Session | null>();
-  const timelineView = new CachedView<TimelineItem[]>();
+  const timelineView = new CachedView<SessionTimelinePage>();
 
   const refresher = pageRefresher(async () => {
     await Promise.all([view.reload(), timelineView.reload()]);
@@ -155,7 +159,10 @@
    */
   let timelineFilter = $state<TimelineFilter>(NO_TIMELINE_FILTER);
 
-  const timeline = $derived(timelineView.data ?? []);
+  // `?.items`: the cached page is an object since the timeline gained its
+  // archive flag; anything else cached under the key reads as empty.
+  const timeline = $derived<TimelineItem[]>(timelineView.data?.items ?? []);
+  const archiveIncomplete = $derived(timelineView.data?.archiveIncomplete === true);
   // The card has rows to show only once BOTH have landed: the timeline for the
   // rows, the session for the instant their offsets are measured from.
   const timelineReady = $derived(timelineView.hasData && view.data != null);
@@ -341,6 +348,9 @@
                is four disabled chips over a timeline that already says it has
                nothing in it. -->
           <ViewSection view={timelineView} rows={8} waiting={!s}>
+            {#if archiveIncomplete}
+              <p class="archive-note" role="status">{t('timeline.archiveIncomplete')}</p>
+            {/if}
             {#if s}
               {#if timeline.length > 0}
                 <TimelineFilters
@@ -416,6 +426,11 @@
   </Modal>
 
 <style>
+  .archive-note {
+    margin: 0 0 12px;
+    font-size: var(--text-xs);
+    color: var(--text-faint);
+  }
   /* Links in the header's meta line: plain muted text with an icon, not pills. */
   .meta-link {
     display: inline-flex;

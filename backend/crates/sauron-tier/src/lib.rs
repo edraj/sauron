@@ -8,6 +8,7 @@ pub mod layout;
 pub mod merge;
 pub mod plan;
 pub mod quarantine;
+pub mod rows;
 
 pub use layout::{
     bucket_bounds, cold_copy_dir, cold_partition_glob, parse_cold_path, partition_suffix,
@@ -15,6 +16,7 @@ pub use layout::{
 };
 pub use merge::{merge_day_counts, DayCount};
 pub use plan::{plan, plan_with_restores, MultiTierPlan, TierPlan, TimeRange};
+pub use rows::{RowEnv, RowKey, RowOrder, RowQuery};
 
 /// A table that participates in tiering, keyed on its time column.
 #[derive(Debug, Clone, Copy)]
