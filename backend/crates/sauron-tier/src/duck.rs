@@ -10,7 +10,9 @@ use uuid::Uuid;
 use crate::merge::DayCount;
 
 pub struct DuckEngine {
-    conn: Connection,
+    /// `pub(crate)` for `rows.rs`, the archived-row reader, which lives in its
+    /// own module only because this one is already ~2,000 lines.
+    pub(crate) conn: Connection,
     /// The alias map currently registered as the `alias_map` temp table, or
     /// `None` when its contents are unknown. See [`Self::register_alias_map`]
     /// for why this exists and why it is compared by value.

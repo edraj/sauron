@@ -85,6 +85,13 @@ export const nav = {
   'nav.allReleases': { en: 'All releases', ar: 'كل الإصدارات' },
   'nav.unknownRelease': { en: 'Unknown release', ar: 'إصدار غير معروف' },
   'nav.switchRelease': { en: 'Switch release', ar: 'تبديل الإصدار' },
+  // Toast when a shared link names an org / project / app / release /
+  // environment this member cannot open — the topbar then shows where they
+  // actually landed (`models/scope-url.ts`, `sessionStore.linkScopeUnmet`).
+  'nav.linkScopeUnmet': {
+    en: 'Part of this link’s scope isn’t available to you, so the closest one you can open is shown. Check the selectors above.',
+    ar: 'جزء من نطاق هذا الرابط غير متاح لك، لذا يُعرض أقرب نطاق يمكنك فتحه. تحقّق من المحدِّدات في الأعلى.',
+  },
   'nav.docs': { en: 'Docs', ar: 'الوثائق' },
   'nav.docsTitle': { en: 'Docs & integration guides', ar: 'الوثائق وأدلة التكامل' },
   'nav.refreshAll': { en: 'Refresh all data', ar: 'تحديث كل البيانات' },

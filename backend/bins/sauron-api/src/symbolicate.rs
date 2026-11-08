@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -429,8 +429,8 @@ async fn backfill_culprit_from_stored(state: &AppState, event: &mut ErrorEvent) 
 
     // Same tiering guard as the resolve path: never write into a cold/exported
     // partition. A cold event still gets the value on its response.
-    if event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days) {
-        if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+    if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+        if row_is_still_hot(&mut conn, event.occurred_at).await {
             let _ = sauron_db::repo::update_event_culprit(
                 &mut conn,
                 event.id,
@@ -448,6 +448,29 @@ async fn backfill_culprit_from_stored(state: &AppState, event: &mut ErrorEvent) 
         }
     }
     event.culprit = Some(culprit);
+}
+
+/// Whether a symbolication result may be written back to `occurred_at`'s row:
+/// only while the row still lives in a Postgres partition that has not been
+/// exported to Parquet — i.e. at or above the `error_events` tier watermark.
+///
+/// This used to be `occurred_at > now - cfg.tier_hot_days`, the STATIC config
+/// value. The live hot window is the runtime `tier.hot_days` setting (2 days on
+/// one production host against a configured 30), so rows the worker had already
+/// exported were still written to — a no-op once the partition is gone, and a
+/// silent divergence from the Parquet copy while it waits out its drop grace.
+/// The watermark is the boundary the tiering guard itself uses. A failed
+/// lookup answers "no": the write is a cache of what the response already
+/// carries, so skipping it costs nothing a later view cannot redo.
+async fn row_is_still_hot(
+    conn: &mut sauron_db::AsyncPgConnection,
+    occurred_at: chrono::DateTime<Utc>,
+) -> bool {
+    match sauron_db::repo::get_watermark(conn, "error_events").await {
+        Ok(Some(watermark)) => occurred_at >= watermark,
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut ErrorEvent) {
@@ -515,7 +538,6 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
     // into cold/exported partitions (respects the tiering guard). NOT a "lean"
     // copy: the write below is `serde_json::to_value(&resolved)`, i.e. the full
     // frames INCLUDING source context. See the comment at the write itself.
-    let hot = event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days);
     let was_unresolved = matches!(
         event.symbolication_status.as_str(),
         "pending" | "no_artifacts"
@@ -529,32 +551,34 @@ async fn symbolicate_with(state: &AppState, fetch: &SqlBlobFetch, event: &mut Er
     // the ones this path repairs.
     let culprit = sauron_symbols::culprit_of_resolved(&resolved);
 
-    if hot && was_unresolved {
+    if was_unresolved {
         // Persist WITH context so later views short-circuit to the stored frames.
         if let (Ok(frames_json), Ok(mut conn)) = (
             serde_json::to_value(&resolved),
             sauron_db::conn(&state.pool).await,
         ) {
-            let _ = sauron_db::repo::update_event_symbolication(
-                &mut conn,
-                event.id,
-                event.occurred_at,
-                frames_json,
-                status.as_str(),
-                culprit.as_deref(),
-            )
-            .await;
-            // Best-effort, and deliberately not gated on the write above
-            // reporting a row: both are repairs of a value that is only ever
-            // displayed, and neither failing may cost the caller the response.
-            if let Some(c) = culprit.as_deref() {
-                let _ = sauron_db::repo::update_issue_culprit_if_latest(
+            if row_is_still_hot(&mut conn, event.occurred_at).await {
+                let _ = sauron_db::repo::update_event_symbolication(
                     &mut conn,
-                    event.issue_id,
-                    c,
+                    event.id,
                     event.occurred_at,
+                    frames_json,
+                    status.as_str(),
+                    culprit.as_deref(),
                 )
                 .await;
+                // Best-effort, and deliberately not gated on the write above
+                // reporting a row: both are repairs of a value that is only ever
+                // displayed, and neither failing may cost the caller the response.
+                if let Some(c) = culprit.as_deref() {
+                    let _ = sauron_db::repo::update_issue_culprit_if_latest(
+                        &mut conn,
+                        event.issue_id,
+                        c,
+                        event.occurred_at,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -631,9 +655,8 @@ async fn deobfuscate_type_on_read(state: &AppState, fetch: &SqlBlobFetch, event:
         return;
     }
 
-    let hot = event.occurred_at > Utc::now() - Duration::days(state.cfg.tier_hot_days);
-    if hot {
-        if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+    if let Ok(mut conn) = sauron_db::conn(&state.pool).await {
+        if row_is_still_hot(&mut conn, event.occurred_at).await {
             let _ =
                 sauron_db::repo::update_event_title(&mut conn, event.id, event.occurred_at, &title)
                     .await;

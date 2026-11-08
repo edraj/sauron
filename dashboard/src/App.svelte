@@ -10,8 +10,82 @@
   import Toast from './lib/components/ui/Toast.svelte';
   import Spinner from './lib/components/ui/Spinner.svelte';
   import EyeMark from './lib/components/EyeMark.svelte';
+  import { sessionStore } from './lib/stores/session.svelte';
+  import { toastStore } from './lib/stores/toast.svelte';
+  import { parseScopeSearch, scopeSearch } from './lib/models/scope-url';
 
   let booted = $state(false);
+
+  // The topbar scope travels in the URL (`models/scope-url.ts`): a link copied
+  // from the address bar opens on the same org / project / app / release /
+  // environment for whoever it is pasted to.
+  //
+  // Seeded HERE, at the top of the root component's script, because that runs
+  // before any child mounts — `AppShell`'s `onMount` is what starts the first
+  // `sessionStore.load()`, and Login's `load(true)` comes later still, so the
+  // seed survives a signed-out visitor's detour through /login.
+  sessionStore.seedFromUrl(parseScopeSearch(window.location.search));
+
+  /**
+   * Rewrite `location.search` to the store's scope, in place.
+   *
+   * `history.replaceState`, never a navigation: a scope switch is not a page
+   * change, and the search part is outside the hash router entirely, so no
+   * `hashchange` fires and no page re-reads its own query. The current
+   * `history.state` is passed through because svelte-spa-router keeps its
+   * scroll positions there.
+   *
+   * Not before the first load has resolved the scope — writing the
+   * half-resolved store over the link would erase the link before it is read.
+   *
+   * And when a loaded session ENDS (logout, a password reset — every path that
+   * calls `sessionStore.reset()`), the scope is taken back off the URL: it
+   * belonged to that session. Left in place, a reload of the login page would
+   * seed the next person's first load from it, as if they had followed a link
+   * — landing them in the previous user's org, or toasting about a link they
+   * never opened. A visitor who arrives signed out with a shared link is the
+   * opposite case and is left alone: nothing was mirrored yet, so the link
+   * survives the detour through /login.
+   */
+  let mirrored = false; // plain, not $state: bookkeeping no render reads
+  const NO_SCOPE = { org: null, project: null, app: null, release: null, env: null };
+  function mirrorScopeToUrl(): void {
+    let scope;
+    if (sessionStore.loaded) scope = sessionStore.scopeSelection;
+    else if (mirrored) scope = NO_SCOPE;
+    else return;
+    mirrored = sessionStore.loaded;
+    const next = scopeSearch(window.location.search, scope);
+    if (next === window.location.search) return;
+    window.history.replaceState(
+      window.history.state,
+      '',
+      window.location.pathname + next + window.location.hash,
+    );
+  }
+
+  // Reads `loaded` and all five scope fields, so it re-runs on every switch.
+  $effect(() => {
+    mirrorScopeToUrl();
+  });
+
+  // Back / Forward restores an older history entry, whose search still names
+  // the scope that was current when it was pushed. Within a session the store
+  // is the truth and the URL its mirror, so re-assert the store's scope rather
+  // than leave the address bar showing (and sharing) a stale one.
+  $effect(() => {
+    window.addEventListener('popstate', mirrorScopeToUrl);
+    return () => window.removeEventListener('popstate', mirrorScopeToUrl);
+  });
+
+  // A link that named something this member cannot open lands on the nearest
+  // scope they can — say so once, or a teammate reads "no errors" off the
+  // wrong app with nothing on screen to suggest it.
+  $effect(() => {
+    if (sessionStore.linkScopeUnmet.length === 0) return;
+    toastStore.push(t('nav.linkScopeUnmet'), 'info', 8000);
+    sessionStore.linkScopeUnmet = [];
+  });
 
   // '/reset-password' is DELIBERATELY absent. This array feeds the $effect
   // below that pushes authenticated users to /issues, and a logged-in user

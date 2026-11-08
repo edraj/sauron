@@ -3133,6 +3133,7 @@ dependencies = [
  "chrono",
  "duckdb",
  "libc",
+ "serde_json",
  "thiserror",
  "tracing",
  "uuid",

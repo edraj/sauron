@@ -302,6 +302,9 @@ impl TimelineItem {
 pub struct SessionDetail {
     pub session: Session,
     pub timeline: Vec<TimelineItem>,
+    /// Some of this session's archived (Parquet) rows could not be read, so the
+    /// timeline holds only what Postgres had. The page still renders; it says so.
+    pub archive_incomplete: bool,
 }
 
 // No bespoke query struct: `detail` takes no query parameters of its own —
@@ -332,8 +335,13 @@ pub async fn detail(
         raw_query.as_deref(),
     )
     .await?;
-    let timeline = session_timeline(&state, conn, scope, &perms, app_id, &session_id).await?;
-    Ok(Json(SessionDetail { session, timeline }))
+    let (timeline, archive_incomplete) =
+        session_timeline(&state, conn, scope, &perms, app_id, &session).await?;
+    Ok(Json(SessionDetail {
+        session,
+        timeline,
+        archive_incomplete,
+    }))
 }
 
 /// Authorize a read of one session and load it, or 404.
@@ -388,12 +396,23 @@ async fn session_timeline(
     scope: sauron_db::scope::ReadScope,
     perms: &std::collections::HashSet<String>,
     app_id: Uuid,
-    session_id: &str,
-) -> Result<Vec<TimelineItem>, ApiError> {
+    session: &sauron_db::models::Session,
+) -> Result<(Vec<TimelineItem>, bool), ApiError> {
+    let session_id = session.session_id.as_str();
     let events = repo::events_for_session(&mut conn, scope.clone(), session_id, 500).await?;
-    let mut errors = repo::errors_for_session(&mut conn, scope.clone(), session_id, 500).await?;
-    let mut txns = repo::transactions_for_session(&mut conn, scope, session_id, 500).await?;
+    let errors = repo::errors_for_session(&mut conn, scope.clone(), session_id, 500).await?;
+    let txns = repo::transactions_for_session(&mut conn, scope.clone(), session_id, 500).await?;
+
+    // Both tiers, on this same connection. Raw sessions outlive their events
+    // (`sessions.retention_days` vs `tier.hot_days`), so a session a few days
+    // old used to open on an empty timeline; the archive supplies whatever
+    // Postgres no longer holds.
+    let rows = crate::tier_read::session_rows(
+        state, &mut conn, &scope, session, events, errors, txns, 500,
+    )
+    .await?;
     drop(conn); // release the pooled conn; symbolication checks out its own
+    let (events, mut errors, mut txns) = (rows.events, rows.errors, rows.txns);
 
     // On-read symbolication, as `issues::detail` and `issues::events` do it. An
     // error symbolicated at ingest arrives already resolved and takes the fast
@@ -447,7 +466,7 @@ async fn session_timeline(
     }
     timeline.sort_by_key(|i| i.at());
 
-    Ok(timeline)
+    Ok((timeline, rows.archive_incomplete))
 }
 
 // --- detail, one section at a time -------------------------------------------
@@ -491,6 +510,8 @@ pub async fn detail_summary(
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SessionTimeline {
     pub timeline: Vec<TimelineItem>,
+    /// See [`SessionDetail::archive_incomplete`].
+    pub archive_incomplete: bool,
 }
 
 #[utoipa::path(
@@ -509,7 +530,7 @@ pub async fn detail_timeline(
     Path((app_id, session_id)): Path<(Uuid, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<SessionTimeline>, ApiError> {
-    let (conn, scope, perms, _session) = load_session(
+    let (conn, scope, perms, session) = load_session(
         &state,
         auth.user_id,
         app_id,
@@ -517,8 +538,12 @@ pub async fn detail_timeline(
         raw_query.as_deref(),
     )
     .await?;
-    let timeline = session_timeline(&state, conn, scope, &perms, app_id, &session_id).await?;
-    Ok(Json(SessionTimeline { timeline }))
+    let (timeline, archive_incomplete) =
+        session_timeline(&state, conn, scope, &perms, app_id, &session).await?;
+    Ok(Json(SessionTimeline {
+        timeline,
+        archive_incomplete,
+    }))
 }
 
 #[cfg(test)]

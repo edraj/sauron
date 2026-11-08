@@ -6495,6 +6495,17 @@ pub async fn get_event_user(
     scope: ReadScope,
     distinct_id: &str,
 ) -> QueryResult<Option<PersonRow>> {
+    // Once the app's person rollup is backfilled, answer from it — the same
+    // source, and the same SQL shape, as the Users list (`list_persons_rollup_sql`).
+    // Not just a speed-up: the live shape below counts RAW rows in Postgres,
+    // and the tier worker moves raw events and errors out to Parquet after
+    // `tier.hot_days`. Measured on a deployment at `hot_days = 2`: a person the
+    // list showed with 21 events and 2 errors opened on a profile saying 0 and
+    // 0, its first/last seen surviving only because `sessions` is not tiered.
+    // The rollup never tiers out, so both pages now report the same numbers.
+    if crate::person_env_backfill::is_backfilled(conn, scope.app_id).await? {
+        return get_event_user_rollup(conn, scope, distinct_id).await;
+    }
     let env_sql = scope.env.sql_fragment(3);
 
     // See `list_persons`' membership `EXISTS` doc comment: each leg is
@@ -6555,6 +6566,126 @@ pub async fn get_event_user(
         .bind::<Text, _>(distinct_id.to_string());
     stmt = crate::bind_env!(stmt, &scope.env);
     stmt.get_result(conn).await.optional()
+}
+
+/// [`get_event_user`] for an app whose person rollup is backfilled: one person's
+/// row in exactly the shape `list_persons_rollup_sql` gives them in the list.
+///
+/// * Unscoped (`All`): `event_users` decides existence and supplies
+///   first/last seen (as the list's unscoped shape does); the rollup supplies
+///   the three counts, `COALESCE`d to 0 for a person with no rollup row.
+/// * Scoped: membership, first/last seen and the counts all come from the
+///   rollup rows the filter admits. An aggregate with no `GROUP BY` returns one
+///   row of NULLs when nothing matches, so `first_seen IS NOT NULL` is the
+///   membership test — a person with no signal in this scope is `None`, which
+///   the page renders as "no profile here", same as the live shape.
+async fn get_event_user_rollup(
+    conn: &mut AsyncPgConnection,
+    scope: ReadScope,
+    distinct_id: &str,
+) -> QueryResult<Option<PersonRow>> {
+    let q = if matches!(scope.env, EnvFilter::All) {
+        "SELECT eu.distinct_id, eu.properties, \
+                eu.first_seen AS first_seen, eu.last_seen AS last_seen, \
+                COALESCE(r.events_count, 0)::bigint AS events_count, \
+                COALESCE(r.errors_count, 0)::bigint AS errors_count, \
+                COALESCE(r.sessions_count, 0)::bigint AS sessions_count \
+         FROM event_users eu \
+         LEFT JOIN LATERAL ( \
+             SELECT sum(events_count)::bigint AS events_count, \
+                    sum(errors_count)::bigint AS errors_count, \
+                    sum(sessions_count)::bigint AS sessions_count \
+             FROM event_user_environments r \
+             WHERE r.app_id = $1 AND r.distinct_id = eu.distinct_id \
+         ) r ON TRUE \
+         WHERE eu.app_id = $1 AND eu.distinct_id = $2"
+            .to_string()
+    } else {
+        let env_sql = scope.env.sql_fragment_for("r", 3);
+        format!(
+            "SELECT eu.distinct_id, eu.properties, \
+                    r.first_seen AS first_seen, r.last_seen AS last_seen, \
+                    r.events_count AS events_count, \
+                    r.errors_count AS errors_count, \
+                    r.sessions_count AS sessions_count \
+             FROM ( \
+                 SELECT min(first_seen) AS first_seen, max(last_seen) AS last_seen, \
+                        sum(events_count)::bigint AS events_count, \
+                        sum(errors_count)::bigint AS errors_count, \
+                        sum(sessions_count)::bigint AS sessions_count \
+                 FROM event_user_environments r \
+                 WHERE r.app_id = $1 AND r.distinct_id = $2{env_sql} \
+             ) r \
+             JOIN event_users eu ON eu.app_id = $1 AND eu.distinct_id = $2 \
+             WHERE r.first_seen IS NOT NULL"
+        )
+    };
+    let mut stmt = diesel::sql_query(q)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Text, _>(distinct_id.to_string());
+    stmt = crate::bind_env!(stmt, &scope.env);
+    stmt.get_result(conn).await.optional()
+}
+
+#[derive(QueryableByName)]
+struct ColumnName {
+    #[diesel(sql_type = Text)]
+    column_name: String,
+}
+
+/// The `jsonb` columns of `table`, from the live schema. The archived-row
+/// reader needs them: the tier export writes `jsonb` to Parquet as plain text,
+/// and only Postgres still knows which text columns were JSON.
+pub async fn jsonb_columns(conn: &mut AsyncPgConnection, table: &str) -> QueryResult<Vec<String>> {
+    let rows: Vec<ColumnName> = diesel::sql_query(
+        "SELECT column_name::text AS column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 AND udt_name = 'jsonb' \
+         ORDER BY ordinal_position",
+    )
+    .bind::<Text, _>(table)
+    .load(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.column_name).collect())
+}
+
+#[derive(QueryableByName)]
+struct IngestSpan {
+    #[diesel(sql_type = diesel::sql_types::Nullable<Timestamptz>)]
+    first_seen: Option<DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Timestamptz>)]
+    last_seen: Option<DateTime<Utc>>,
+}
+
+/// The INGEST-time span over which any of `ids` was seen in this app, from
+/// `event_users`, or `None` when none of them has a row.
+///
+/// What bounds an archived read of one person (`sauron_tier::rows`): without it
+/// every profile view of a person with fewer rows than a page would open the
+/// app's entire archive. `event_users` is the right source because it is the
+/// one person table maintained from the very first signal and never tiered —
+/// unlike `event_user_environments`, whose backfill only saw what was still in
+/// Postgres when it ran. Ingest time, so callers widen it by the ingest clamps
+/// (`MAX_CLOCK_LAG` / `MAX_CLOCK_SKEW`) to bound `occurred_at`. A merged guest's
+/// span is already folded into the person's (`fold_rollups` widens with
+/// LEAST/GREATEST).
+pub async fn person_ingest_span(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    ids: &[String],
+) -> QueryResult<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let span: IngestSpan = diesel::sql_query(
+        "SELECT min(first_seen) AS first_seen, max(last_seen) AS last_seen \
+         FROM event_users WHERE app_id = $1 AND distinct_id = ANY($2)",
+    )
+    .bind::<SqlUuid, _>(app_id)
+    .bind::<diesel::sql_types::Array<Text>, _>(ids.to_vec())
+    .get_result(conn)
+    .await?;
+    Ok(span.first_seen.zip(span.last_seen))
 }
 
 /// `analytics_events` carries its own `environment_id` directly, so this is an

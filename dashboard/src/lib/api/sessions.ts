@@ -77,15 +77,27 @@ export async function getSessionSummary(appId: string, sessionId: string): Promi
   return data.session;
 }
 
+/** One session's timeline as the server answers it. */
+export interface SessionTimelinePage {
+  /** Events, errors and transactions, in time order. */
+  items: TimelineItem[];
+  /**
+   * Some of the session's archived (Parquet) rows could not be read, so
+   * `items` holds what Postgres had. The page says so rather than passing a
+   * partial timeline off as the whole one.
+   */
+  archiveIncomplete: boolean;
+}
+
 /** The session's events, errors and transactions, in time order. */
 export async function getSessionTimeline(
   appId: string,
   sessionId: string,
-): Promise<TimelineItem[]> {
-  const { data } = await api.get<{ timeline: TimelineItem[] }>(
+): Promise<SessionTimelinePage> {
+  const { data } = await api.get<{ timeline: TimelineItem[]; archive_incomplete?: boolean }>(
     `/v1/apps/${appId}/sessions/${encodeURIComponent(sessionId)}/timeline`,
   );
-  return data.timeline;
+  return { items: data.timeline, archiveIncomplete: data.archive_incomplete === true };
 }
 
 export async function getSessionAnalytics(

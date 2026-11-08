@@ -80,6 +80,11 @@ export async function getPersonSummary(
 export interface PersonTimeline {
   events: AnalyticsEvent[];
   errors: ErrorEvent[];
+  /**
+   * Some of the person's archived (Parquet) rows could not be read, so the
+   * lists hold what Postgres had. Optional only for an older server.
+   */
+  archive_incomplete?: boolean;
 }
 
 /** The person's most recent `limit` events and `limit` errors. */

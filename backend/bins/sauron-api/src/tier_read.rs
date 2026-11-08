@@ -70,6 +70,36 @@ fn merge_all(parts: Vec<Vec<DayCount>>) -> Vec<DayCount> {
     parts.into_iter().fold(Vec::new(), merge_day_counts)
 }
 
+/// Where one tiered table's archive begins, and the ranges restored back out
+/// of it into Postgres. `None` when the table has never been tiered.
+///
+/// Watermark and restored ranges are read together: they are the two halves of
+/// one question ("which parts of this window live where?"), and reading them
+/// in separate round trips from separate call sites is how readers drift
+/// apart. Every reader in this module asks through here.
+struct TierLayout {
+    watermark: DateTime<Utc>,
+    restored: Vec<TimeRange>,
+}
+
+async fn tier_layout(
+    c: &mut diesel_async::AsyncPgConnection,
+    table: &str,
+) -> anyhow::Result<Option<TierLayout>> {
+    let Some(watermark) = repo::get_watermark(c, table).await? else {
+        return Ok(None);
+    };
+    let restored = repo::restored_ranges(c, table)
+        .await?
+        .into_iter()
+        .map(|(start, end)| TimeRange { start, end })
+        .collect();
+    Ok(Some(TierLayout {
+        watermark,
+        restored,
+    }))
+}
+
 /// Per-day counts for `[from, to)` across both tiers.
 async fn counts_by_day(
     kind: Tiered,
@@ -80,28 +110,18 @@ async fn counts_by_day(
 ) -> anyhow::Result<Vec<DayCount>> {
     let table = kind.table();
 
-    // Watermark and restored ranges are read together: they are the two halves
-    // of one question ("which parts of this window live where?"), and reading
-    // them in separate round trips would let a restore land between them.
-    let (wm, restored) = {
+    let layout = {
         let mut c = conn(&state.pool).await?;
-        let wm = repo::get_watermark(&mut c, table).await?;
-        let restored = repo::restored_ranges(&mut c, table).await?;
-        (wm, restored)
+        tier_layout(&mut c, table).await?
     };
 
     // No watermark ⇒ nothing has ever been tiered, so everything is hot and
     // there is nothing for a restore to have moved.
-    let Some(watermark) = wm else {
+    let Some(layout) = layout else {
         let mut c = conn(&state.pool).await?;
         return Ok(to_dc(hot_counts(kind, &mut c, app_id, from, to).await?));
     };
-
-    let restored: Vec<TimeRange> = restored
-        .into_iter()
-        .map(|(start, end)| TimeRange { start, end })
-        .collect();
-    let split = plan_with_restores(watermark, from, to, &restored);
+    let split = plan_with_restores(layout.watermark, from, to, &layout.restored);
 
     // PG branch: every hot sub-range (which now includes the restored islands)
     // plus, for each COLD sub-range, late arrivals sitting in the `_default`
@@ -253,25 +273,18 @@ pub async fn active_users_by_day(
             return Ok((to_dc(rows), Vec::new()));
         }
     }
-    let (wm, restored) = {
+    let layout = {
         let mut c = conn(&state.pool).await?;
-        let wm = repo::get_watermark(&mut c, "analytics_events").await?;
-        let restored = repo::restored_ranges(&mut c, "analytics_events").await?;
-        (wm, restored)
+        tier_layout(&mut c, "analytics_events").await?
     };
 
     // Nothing tiered ⇒ entirely hot, and no seam is possible.
-    let Some(watermark) = wm else {
+    let Some(layout) = layout else {
         let mut c = conn(&state.pool).await?;
         let rows = repo::active_users_by_day_hot(&mut c, scope, from, to).await?;
         return Ok((to_dc(rows), Vec::new()));
     };
-
-    let restored: Vec<TimeRange> = restored
-        .into_iter()
-        .map(|(start, end)| TimeRange { start, end })
-        .collect();
-    let split = plan_with_restores(watermark, from, to, &restored);
+    let split = plan_with_restores(layout.watermark, from, to, &layout.restored);
 
     let mut hot: Vec<DayCount> = Vec::new();
     {
@@ -345,4 +358,576 @@ pub async fn active_users_by_day(
             .collect(),
         partial,
     ))
+}
+
+// ===========================================================================
+// Archived ROWS — one person's or one session's history across both tiers
+// ===========================================================================
+//
+// Everything above aggregates. A person's profile and a session's timeline
+// list ROWS for one key with no time window, and both used to read Postgres
+// alone — so once the tier worker moved a day out (`tier.hot_days`), that day
+// vanished from both pages while every rollup-backed count still included it.
+//
+// The merge is by row, not by count, and it is deliberately unafraid of
+// overlap. Postgres can hold rows below the watermark for three reasons: a
+// late arrival in `_default` (not in Parquet), a restored range (in BOTH), and
+// an exported partition still waiting out its drop grace (in BOTH). Rather
+// than reproduce each rule, the archive is read for the cold sub-ranges minus
+// restores, and the two sides are unioned by primary key with Postgres
+// winning — a row in both is shown once, a row in either is shown.
+//
+// Three properties every caller relies on:
+//
+// * **No second pool checkout.** The Postgres lookups run on the caller's
+//   connection. A handler that held one connection and waited for another
+//   would, at pool-size concurrency, wait on itself.
+// * **Postgres first, archive only when needed.** The cheap watermark lookup
+//   decides; restores, the jsonb column list and DuckDB are touched only for a
+//   table that actually has to be read.
+// * **The archive never takes a page down.** These pages rendered from
+//   Postgres alone before the archive existed for them. A read that fails (a
+//   truncated file not yet quarantined, an unreadable directory, a row that
+//   will not decode) is logged, the page is served from Postgres, and
+//   `archive_incomplete` says so — instead of a 500.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use sauron_db::models::{AnalyticsEvent, ErrorEvent, Session, Transaction};
+use sauron_db::scope::{EnvFilter, ReadScope};
+use sauron_tier::{RowEnv, RowKey, RowOrder, RowQuery};
+
+/// A row of a tiered table, as the merge needs to see it.
+pub trait TieredRow: serde::de::DeserializeOwned + Send + 'static {
+    const TABLE: &'static str;
+    fn row_id(&self) -> Uuid;
+    fn row_at(&self) -> DateTime<Utc>;
+}
+
+impl TieredRow for AnalyticsEvent {
+    const TABLE: &'static str = "analytics_events";
+    fn row_id(&self) -> Uuid {
+        self.id
+    }
+    fn row_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+}
+
+impl TieredRow for ErrorEvent {
+    const TABLE: &'static str = "error_events";
+    fn row_id(&self) -> Uuid {
+        self.id
+    }
+    fn row_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+}
+
+impl TieredRow for Transaction {
+    const TABLE: &'static str = "transactions";
+    fn row_id(&self) -> Uuid {
+        self.id
+    }
+    fn row_at(&self) -> DateTime<Utc> {
+        self.occurred_at
+    }
+}
+
+/// Whether Postgres's answer already IS the answer, so the archive need not be
+/// opened. Only provable newest-first: every archived row is older than the
+/// watermark, so a full page whose oldest row is at or past it cannot be
+/// displaced. Oldest-first, archived rows sort FIRST, so the caller decides by
+/// whether its window starts before the watermark at all.
+fn hot_is_enough<T: TieredRow>(
+    hot: &[T],
+    order: RowOrder,
+    limit: usize,
+    watermark: DateTime<Utc>,
+) -> bool {
+    match order {
+        RowOrder::NewestFirst => {
+            hot.len() >= limit && hot.last().is_some_and(|r| r.row_at() >= watermark)
+        }
+        RowOrder::OldestFirst => false,
+    }
+}
+
+/// `hot` and `cold` unioned by primary key (Postgres wins a tie — see the
+/// section comment), sorted in `order` with the id as tiebreak, cut to `limit`.
+fn merge_rows<T: TieredRow>(hot: Vec<T>, cold: Vec<T>, order: RowOrder, limit: usize) -> Vec<T> {
+    let seen: std::collections::HashSet<Uuid> = hot.iter().map(TieredRow::row_id).collect();
+    let mut all = hot;
+    all.extend(cold.into_iter().filter(|r| !seen.contains(&r.row_id())));
+    all.sort_by(|a, b| {
+        let k = (a.row_at(), a.row_id()).cmp(&(b.row_at(), b.row_id()));
+        match order {
+            RowOrder::OldestFirst => k,
+            RowOrder::NewestFirst => k.reverse(),
+        }
+    });
+    all.truncate(limit);
+    all
+}
+
+fn row_env(env: &EnvFilter) -> RowEnv {
+    match env {
+        EnvFilter::All => RowEnv::All,
+        EnvFilter::One(id) => RowEnv::One(*id),
+        EnvFilter::Subset(ids) => RowEnv::Subset(ids.clone()),
+        EnvFilter::Unattributed => RowEnv::Unattributed,
+    }
+}
+
+/// `table`'s `jsonb` columns (see `RowQuery::json_columns`), looked up once per
+/// process: the schema only changes with a migration, and a migration means a
+/// restart. `information_schema` is a privilege-checked catalog view — not
+/// something to scan on every page view.
+async fn json_columns(
+    c: &mut diesel_async::AsyncPgConnection,
+    table: &'static str,
+) -> anyhow::Result<Vec<String>> {
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, Vec<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cols) = cache.lock().expect("json column cache").get(table) {
+        return Ok(cols.clone());
+    }
+    let cols = repo::jsonb_columns(c, table).await?;
+    cache
+        .lock()
+        .expect("json column cache")
+        .insert(table, cols.clone());
+    Ok(cols)
+}
+
+/// One table's archived read, or `None` when Postgres's page already is the
+/// answer or nothing in `window` was ever archived.
+#[allow(clippy::too_many_arguments)]
+async fn plan_read<T: TieredRow>(
+    c: &mut diesel_async::AsyncPgConnection,
+    hot: &[T],
+    key: &RowKey,
+    env: &RowEnv,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    order: RowOrder,
+    limit: usize,
+) -> anyhow::Result<Option<RowQuery>> {
+    let Some(layout) = tier_layout(c, T::TABLE).await? else {
+        return Ok(None);
+    };
+    if window.0 >= layout.watermark || hot_is_enough(hot, order, limit, layout.watermark) {
+        return Ok(None);
+    }
+    let split = plan_with_restores(layout.watermark, window.0, window.1, &layout.restored);
+    if split.cold.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RowQuery {
+        key: key.clone(),
+        env: env.clone(),
+        ranges: split.cold,
+        order,
+        limit,
+        json_columns: json_columns(c, T::TABLE).await?,
+    }))
+}
+
+/// Read every planned table's archived rows through ONE DuckDB engine, in one
+/// blocking task, one table after another: a page view costs one engine (and
+/// one memory ceiling), not one per table. Each table's outcome is separate,
+/// so one unreadable table does not discard another's rows.
+async fn read_archives(
+    state: &AppState,
+    app_id: Uuid,
+    plans: Vec<(&'static str, RowQuery)>,
+) -> Vec<(&'static str, anyhow::Result<Vec<String>>)> {
+    if plans.is_empty() {
+        return Vec::new();
+    }
+    let base = state.cfg.tier_cold_path.clone();
+    let tables: Vec<&'static str> = plans.iter().map(|(t, _)| *t).collect();
+    let joined = tokio::task::spawn_blocking(move || {
+        let eng = match DuckEngine::open() {
+            Ok(eng) => eng,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                return plans
+                    .into_iter()
+                    .map(|(t, _)| (t, Err(anyhow::anyhow!("opening DuckDB: {msg}"))))
+                    .collect();
+            }
+        };
+        plans
+            .into_iter()
+            .map(|(t, q)| (t, eng.archived_rows(&base, t, app_id, &q)))
+            .collect::<Vec<_>>()
+    })
+    .await;
+    joined.unwrap_or_else(|e| {
+        let msg = e.to_string();
+        tables
+            .into_iter()
+            .map(|t| (t, Err(anyhow::anyhow!("archive read task failed: {msg}"))))
+            .collect()
+    })
+}
+
+/// `hot` completed with `T`'s archived rows from `reads`, if any were planned.
+/// A failed read or an undecodable row is logged and leaves `hot` as the
+/// answer, raising `incomplete` — see the section comment.
+fn finish<T: TieredRow>(
+    hot: Vec<T>,
+    reads: &mut Vec<(&'static str, anyhow::Result<Vec<String>>)>,
+    order: RowOrder,
+    limit: usize,
+    incomplete: &mut bool,
+) -> Vec<T> {
+    let Some(i) = reads.iter().position(|(t, _)| *t == T::TABLE) else {
+        return hot;
+    };
+    let decoded = reads.swap_remove(i).1.and_then(|raw| {
+        raw.iter()
+            .map(|r| {
+                serde_json::from_str::<T>(r).map_err(|e| {
+                    anyhow::anyhow!("an archived {} row did not decode: {e}", T::TABLE)
+                })
+            })
+            .collect::<anyhow::Result<Vec<T>>>()
+    });
+    match decoded {
+        Ok(cold) => merge_rows(hot, cold, order, limit),
+        Err(e) => {
+            tracing::warn!(
+                table = T::TABLE,
+                error = %format_args!("{e:#}"),
+                "archived rows unavailable; serving Postgres rows only"
+            );
+            *incomplete = true;
+            hot
+        }
+    }
+}
+
+/// A day of slack either side of a span. It keeps a row at the very edge of a
+/// month directory from depending on independently computed timestamps
+/// agreeing to the microsecond; it can only widen which months are opened.
+const SPAN_SLACK: chrono::Duration = chrono::Duration::days(1);
+
+/// The occurred-at window that can hold any row of `ids`, from `event_users`:
+/// the one person table that is maintained from the very first signal and
+/// never tiered. Its first/last seen are INGEST times, and the ingest edge pins
+/// a device time more than `MAX_CLOCK_LAG` in the past or `MAX_CLOCK_SKEW` in
+/// the future to the arrival time, so widening by exactly those bounds every
+/// `occurred_at` the person can have.
+///
+/// Deliberately not `event_user_environments` (event time, so tighter): that
+/// rollup only knows what was still in Postgres when its backfill ran, so any
+/// history tiered out before then lies outside its span and would be silently
+/// skipped. `None` — no `event_users` row at all — reads the whole archive.
+async fn person_window(
+    c: &mut diesel_async::AsyncPgConnection,
+    app_id: Uuid,
+    ids: &[String],
+) -> anyhow::Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let span = repo::person_ingest_span(c, app_id, ids).await?;
+    Ok(span.map_or(
+        (DateTime::<Utc>::UNIX_EPOCH, Utc::now() + SPAN_SLACK),
+        |(first, last)| {
+            (
+                first - sauron_core::envelope::MAX_CLOCK_LAG - SPAN_SLACK,
+                last + sauron_core::envelope::MAX_CLOCK_SKEW + SPAN_SLACK,
+            )
+        },
+    ))
+}
+
+/// A person's page across both tiers.
+pub struct PersonRows {
+    pub events: Vec<AnalyticsEvent>,
+    pub errors: Vec<ErrorEvent>,
+    /// Some archived rows could not be read; the lists hold what Postgres had.
+    pub archive_incomplete: bool,
+}
+
+/// A person's newest `limit` events and errors across both tiers.
+///
+/// `events` / `errors` are Postgres's newest `limit` each for this person in
+/// `scope`, read on `c`, which this keeps using (see the section comment).
+/// Archived rows are read for every id that is this person in cold storage
+/// ([`sauron_db::identity_merge::archived_ids_for_person`]) and shown as the
+/// person — what the merge's hot rewrite already did to their Postgres rows.
+pub async fn person_rows(
+    state: &AppState,
+    c: &mut diesel_async::AsyncPgConnection,
+    scope: &ReadScope,
+    person: &str,
+    events: Vec<AnalyticsEvent>,
+    errors: Vec<ErrorEvent>,
+    limit: usize,
+) -> anyhow::Result<PersonRows> {
+    let app_id = scope.app_id;
+    let order = RowOrder::NewestFirst;
+    // Settle "Postgres is enough" on the watermarks alone before anything
+    // else: most profile views are of people whose newest page is all hot.
+    let ev_need = repo::get_watermark(c, AnalyticsEvent::TABLE)
+        .await?
+        .is_some_and(|w| !hot_is_enough(&events, order, limit, w));
+    let er_need = repo::get_watermark(c, ErrorEvent::TABLE)
+        .await?
+        .is_some_and(|w| !hot_is_enough(&errors, order, limit, w));
+    let ids = if ev_need || er_need {
+        sauron_db::identity_merge::archived_ids_for_person(c, app_id, person).await?
+    } else {
+        Vec::new()
+    };
+    if ids.is_empty() {
+        return Ok(PersonRows {
+            events,
+            errors,
+            archive_incomplete: false,
+        });
+    }
+    let window = person_window(c, app_id, &ids).await?;
+    let key = RowKey::DistinctIds(ids);
+    let env = row_env(&scope.env);
+    let mut plans = Vec::new();
+    if ev_need {
+        if let Some(q) = plan_read(c, &events, &key, &env, window, order, limit).await? {
+            plans.push((AnalyticsEvent::TABLE, q));
+        }
+    }
+    if er_need {
+        if let Some(q) = plan_read(c, &errors, &key, &env, window, order, limit).await? {
+            plans.push((ErrorEvent::TABLE, q));
+        }
+    }
+    let mut reads = read_archives(state, app_id, plans).await;
+    let mut incomplete = false;
+    let mut events = finish(events, &mut reads, order, limit, &mut incomplete);
+    let mut errors = finish(errors, &mut reads, order, limit, &mut incomplete);
+    for e in &mut events {
+        if e.distinct_id != person {
+            e.distinct_id = person.to_string();
+        }
+    }
+    for e in &mut errors {
+        if e.distinct_id.as_deref().is_some_and(|d| d != person) {
+            e.distinct_id = Some(person.to_string());
+        }
+    }
+    Ok(PersonRows {
+        events,
+        errors,
+        archive_incomplete: incomplete,
+    })
+}
+
+/// An hour either side of a session's recorded span, for the same reason as
+/// [`SPAN_SLACK`]; a session's rows all carry its id, so the slack can only
+/// widen which month directories are opened, never which rows are returned.
+const SESSION_SLACK: chrono::Duration = chrono::Duration::hours(1);
+
+/// A session's page across both tiers.
+pub struct SessionRows {
+    pub events: Vec<AnalyticsEvent>,
+    pub errors: Vec<ErrorEvent>,
+    pub txns: Vec<Transaction>,
+    /// Some archived rows could not be read; the lists hold what Postgres had.
+    pub archive_incomplete: bool,
+}
+
+/// A session's oldest `limit` events, errors and transactions across both
+/// tiers. Each list is Postgres's oldest `limit` for this session, read on `c`.
+///
+/// Raw sessions outlive their events by design (`sessions.retention_days`
+/// against `tier.hot_days`), so without this a session a few days old opened
+/// on an empty timeline. A guest id on any row whose merge has completed is
+/// shown as the person, as on the person page.
+#[allow(clippy::too_many_arguments)]
+pub async fn session_rows(
+    state: &AppState,
+    c: &mut diesel_async::AsyncPgConnection,
+    scope: &ReadScope,
+    session: &Session,
+    events: Vec<AnalyticsEvent>,
+    errors: Vec<ErrorEvent>,
+    txns: Vec<Transaction>,
+    limit: usize,
+) -> anyhow::Result<SessionRows> {
+    let app_id = scope.app_id;
+    let order = RowOrder::OldestFirst;
+    let window = (
+        session.started_at - SESSION_SLACK,
+        session.last_event_at + SESSION_SLACK,
+    );
+    let key = RowKey::Session(session.session_id.clone());
+    let env = row_env(&scope.env);
+    let mut plans = Vec::new();
+    if let Some(q) = plan_read(c, &events, &key, &env, window, order, limit).await? {
+        plans.push((AnalyticsEvent::TABLE, q));
+    }
+    if let Some(q) = plan_read(c, &errors, &key, &env, window, order, limit).await? {
+        plans.push((ErrorEvent::TABLE, q));
+    }
+    if let Some(q) = plan_read(c, &txns, &key, &env, window, order, limit).await? {
+        plans.push((Transaction::TABLE, q));
+    }
+    if plans.is_empty() {
+        return Ok(SessionRows {
+            events,
+            errors,
+            txns,
+            archive_incomplete: false,
+        });
+    }
+    let mut reads = read_archives(state, app_id, plans).await;
+    let mut incomplete = false;
+    let mut events = finish(events, &mut reads, order, limit, &mut incomplete);
+    let mut errors = finish(errors, &mut reads, order, limit, &mut incomplete);
+    let mut txns = finish(txns, &mut reads, order, limit, &mut incomplete);
+
+    let mut seen: Vec<String> = events.iter().map(|e| e.distinct_id.clone()).collect();
+    seen.extend(errors.iter().filter_map(|e| e.distinct_id.clone()));
+    seen.extend(txns.iter().filter_map(|t| t.distinct_id.clone()));
+    seen.sort();
+    seen.dedup();
+    let owners = sauron_db::identity_merge::archived_alias_owners(c, app_id, &seen).await?;
+    if !owners.is_empty() {
+        let owner = |d: &str| owners.get(d).cloned();
+        for e in &mut events {
+            if let Some(p) = owner(&e.distinct_id) {
+                e.distinct_id = p;
+            }
+        }
+        for e in &mut errors {
+            if let Some(p) = e.distinct_id.as_deref().and_then(owner) {
+                e.distinct_id = Some(p);
+            }
+        }
+        for t in &mut txns {
+            if let Some(p) = t.distinct_id.as_deref().and_then(owner) {
+                t.distinct_id = Some(p);
+            }
+        }
+    }
+    Ok(SessionRows {
+        events,
+        errors,
+        txns,
+        archive_incomplete: incomplete,
+    })
+}
+
+#[cfg(test)]
+mod archived_row_tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+    struct Row {
+        id: Uuid,
+        at: DateTime<Utc>,
+        tag: String,
+    }
+
+    impl TieredRow for Row {
+        const TABLE: &'static str = "test_rows";
+        fn row_id(&self) -> Uuid {
+            self.id
+        }
+        fn row_at(&self) -> DateTime<Utc> {
+            self.at
+        }
+    }
+
+    fn at(h: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::hours(h)
+    }
+
+    fn row(h: i64, tag: &str) -> Row {
+        Row {
+            id: Uuid::new_v4(),
+            at: at(h),
+            tag: tag.to_string(),
+        }
+    }
+
+    fn tags(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.tag.as_str()).collect()
+    }
+
+    #[test]
+    fn a_row_in_both_tiers_is_shown_once_and_postgres_wins() {
+        let shared = row(5, "hot copy");
+        let mut cold_copy = shared.clone();
+        cold_copy.tag = "cold copy".to_string();
+        let merged = merge_rows(
+            vec![row(9, "hot"), shared],
+            vec![cold_copy, row(1, "cold")],
+            RowOrder::NewestFirst,
+            10,
+        );
+        assert_eq!(tags(&merged), vec!["hot", "hot copy", "cold"]);
+    }
+
+    #[test]
+    fn merges_in_order_and_cuts_to_the_limit() {
+        let hot = vec![row(2, "h2"), row(6, "h6")];
+        let cold = vec![row(4, "c4"), row(1, "c1"), row(3, "c3")];
+        assert_eq!(
+            tags(&merge_rows(
+                hot.clone(),
+                cold.clone(),
+                RowOrder::OldestFirst,
+                3
+            )),
+            vec!["c1", "h2", "c3"]
+        );
+        assert_eq!(
+            tags(&merge_rows(hot, cold, RowOrder::NewestFirst, 3)),
+            vec!["h6", "c4", "c3"]
+        );
+    }
+
+    #[test]
+    fn ties_on_time_are_broken_by_id_so_paging_is_stable() {
+        let (a, b) = (row(3, "a"), row(3, "b"));
+        let lo = if a.id < b.id { "a" } else { "b" };
+        let merged = merge_rows(vec![a], vec![b], RowOrder::OldestFirst, 10);
+        assert_eq!(merged[0].tag, lo);
+    }
+
+    #[test]
+    fn postgres_alone_answers_only_a_full_newest_first_page_above_the_watermark() {
+        let wm = at(10);
+        let full_above = vec![row(12, "a"), row(11, "b")];
+        assert!(hot_is_enough(&full_above, RowOrder::NewestFirst, 2, wm));
+        // One short: an archived row could be the missing one.
+        assert!(!hot_is_enough(&full_above, RowOrder::NewestFirst, 3, wm));
+        // Full, but its oldest row is below the watermark (a late arrival or a
+        // partition in its drop grace): archived rows could sort above it.
+        let full_straddling = vec![row(12, "a"), row(9, "b")];
+        assert!(!hot_is_enough(
+            &full_straddling,
+            RowOrder::NewestFirst,
+            2,
+            wm
+        ));
+        // Oldest-first, archived rows sort FIRST: never provable from Postgres.
+        assert!(!hot_is_enough(&full_above, RowOrder::OldestFirst, 2, wm));
+        // Empty and a zero limit.
+        assert!(!hot_is_enough::<Row>(&[], RowOrder::NewestFirst, 1, wm));
+    }
+
+    #[test]
+    fn every_environment_scope_maps_across() {
+        let id = Uuid::new_v4();
+        assert_eq!(row_env(&EnvFilter::All), RowEnv::All);
+        assert_eq!(row_env(&EnvFilter::One(id)), RowEnv::One(id));
+        assert_eq!(
+            row_env(&EnvFilter::Subset(vec![id])),
+            RowEnv::Subset(vec![id])
+        );
+        assert_eq!(row_env(&EnvFilter::Unattributed), RowEnv::Unattributed);
+    }
 }

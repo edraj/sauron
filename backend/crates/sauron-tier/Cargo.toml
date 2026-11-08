@@ -23,3 +23,7 @@ libc.workspace = true
 # Parquet + the postgres scanner are provided by the official prebuilt lib at
 # runtime, so no duckdb crate feature (json/parquet) is needed here.
 duckdb = { version = "1", default-features = false, features = ["chrono"] }
+
+[dev-dependencies]
+# Archived-row reader tests parse the JSON rows it returns.
+serde_json.workspace = true

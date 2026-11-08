@@ -5,6 +5,7 @@ import { listEnvironments } from '../api/environments';
 import { listReleases } from '../api/releases';
 import { configureScopeBridge } from '../api/scope';
 import { selectableReleases } from '../models/release-switcher';
+import { unmetScope, type ScopeSeed, type ScopeSelection } from '../models/scope-url';
 import type {
   AccessResponse,
   App,
@@ -110,6 +111,28 @@ class SessionStore {
   loaded = $state(false);
   loading = $state(false);
 
+  /**
+   * The scope named by the link the dashboard was opened with
+   * (`models/scope-url.ts`), consulted AHEAD of localStorage by every
+   * `resolveCurrent*` during the first load, then dropped. One-shot on
+   * purpose: within a session the store is the source of truth and the URL
+   * only mirrors it, so a later `load(true)` must not drag the scope back to
+   * whatever link the tab started on.
+   *
+   * Validated exactly like a stored value — a level the member cannot open
+   * here falls through to the remembered selection — and never trusted
+   * blindly: the link is user-supplied text.
+   */
+  private seed: ScopeSeed | null = null;
+
+  /**
+   * The levels of the opening link the first load could NOT honour (see
+   * `unmetScope`). Non-empty means the screen shows a different scope from the
+   * one the link was shared from, which the shell surfaces once — silently
+   * landing elsewhere would let a teammate read "no errors" off the wrong app.
+   */
+  linkScopeUnmet = $state<(keyof ScopeSelection)[]>([]);
+
   constructor() {
     // Wire this store into the axios client's scope bridge (mirrors
     // `configureAuthBridge` in auth.svelte.ts) — `client.ts` must not import
@@ -119,6 +142,90 @@ class SessionStore {
       getCurrentEnvironmentId: () => this.currentEnvId,
       getCurrentRelease: () => this.currentRelease,
     });
+  }
+
+  /** The five topbar levels, as `models/scope-url` reads and writes them. */
+  get scopeSelection(): ScopeSelection {
+    return {
+      org: this.currentOrgId,
+      project: this.currentProjectId,
+      app: this.currentAppId,
+      release: this.currentRelease,
+      env: this.currentEnvId,
+    };
+  }
+
+  /**
+   * Hand the store the scope a link names, before its first load. A no-op
+   * once loaded: see `seed`.
+   */
+  seedFromUrl(seed: ScopeSeed | null): void {
+    if (this.loaded) return;
+    this.seed = seed;
+    this.linkScopeUnmet = [];
+  }
+
+  /**
+   * The seed's value for `level` while a seed is in force, else `undefined`.
+   *
+   * Environment and release only apply to the app the link named: a link
+   * whose app could not be opened must not impose its "all environments" on
+   * whichever app the store fell back to.
+   */
+  private seeded<K extends keyof ScopeSeed>(level: K): ScopeSeed[K] | undefined {
+    const seed = this.seed;
+    if (!seed) return undefined;
+    if ((level === 'env' || level === 'release') && seed.app !== undefined) {
+      if (seed.app !== this.currentAppId) return undefined;
+    }
+    return seed[level];
+  }
+
+  /**
+   * At the end of the first load: record what the link could not reach, then
+   * drop it — except the environment / release when THEIR list failed to load.
+   * Those levels were never resolved at all; judging them now would toast
+   * "not available to you" over a network blip and throw the link's choice
+   * away, so the Topbar's retry (`ensureEnvironmentsLoaded` /
+   * `ensureReleasesLoaded`) would land on the remembered selection instead.
+   * They stay seeded, and the retry settles them ({@link settleSeed}).
+   */
+  private finishSeed(): void {
+    const seed = this.seed;
+    if (!seed) return;
+    const decided: ScopeSeed = { ...seed };
+    const pending: ScopeSeed = { app: seed.app };
+    if (this.environmentsError && seed.env !== undefined) {
+      pending.env = seed.env;
+      delete decided.env;
+    }
+    if (this.releasesError && seed.release !== undefined) {
+      pending.release = seed.release;
+      delete decided.release;
+    }
+    this.linkScopeUnmet = unmetScope(decided, this.scopeSelection);
+    this.seed = pending.env !== undefined || pending.release !== undefined ? pending : null;
+  }
+
+  /**
+   * After the first load, a retried environment / release list has just been
+   * resolved against a level the link still held: record whether it landed,
+   * and drop that level. A no-op during the first load — `finishSeed` decides
+   * there — and once nothing is pending.
+   */
+  private settleSeed(level: 'env' | 'release'): void {
+    const seed = this.seed;
+    if (!this.loaded || !seed || seed[level] === undefined) return;
+    const missed = unmetScope({ [level]: seed[level] }, this.scopeSelection);
+    if (missed.length > 0) this.linkScopeUnmet = [...this.linkScopeUnmet, ...missed];
+    const rest: ScopeSeed = { ...seed };
+    delete rest[level];
+    this.seed = rest.env !== undefined || rest.release !== undefined ? rest : null;
+  }
+
+  /** An explicit switch outranks whatever a link left pending. */
+  private dropSeed(): void {
+    this.seed = null;
   }
 
   get currentOrg(): Organization | null {
@@ -351,21 +458,25 @@ class SessionStore {
         this.currentAppId = null;
         this.currentEnvId = null;
         this.currentRelease = null;
+        this.finishSeed();
         this.loaded = true;
         return;
       }
-      const stored = readStored(ORG_KEY);
-      // A stored org still wins — switching orgs is an explicit choice and
-      // landing somewhere else would undo it. Without one, prefer the first org
-      // that actually HAS a reachable project: `orgs[0]` is creation-ordered,
-      // so blindly taking it drops a member onto an empty org while their
-      // projects sit one org over.
+      // A link's org wins, then a stored one — switching orgs is an explicit
+      // choice and landing somewhere else would undo it. Without either, prefer
+      // the first org that actually HAS a reachable project: `orgs[0]` is
+      // creation-ordered, so blindly taking it drops a member onto an empty
+      // org while their projects sit one org over.
+      const linked = this.seeded('org');
+      const stored =
+        linked && orgs.some((o) => o.id === linked) ? linked : readStored(ORG_KEY);
       this.currentOrgId =
         stored && orgs.some((o) => o.id === stored)
           ? stored
           : (orgs.find((o) => o.project_count > 0) ?? orgs[0]).id;
       writeStored(ORG_KEY, this.currentOrgId);
       await this.loadOrgScope(this.currentOrgId);
+      this.finishSeed();
       this.loaded = true;
     } finally {
       this.loading = false;
@@ -404,6 +515,12 @@ class SessionStore {
   }
 
   private resolveCurrentProject(): void {
+    const linked = this.seeded('project');
+    if (linked && this.projects.some((p) => p.id === linked)) {
+      this.currentProjectId = linked;
+      writeStored(PROJECT_KEY, linked);
+      return;
+    }
     const stored = readStored(PROJECT_KEY);
     if (stored && this.projects.some((p) => p.id === stored)) {
       this.currentProjectId = stored;
@@ -450,6 +567,12 @@ class SessionStore {
   }
 
   private resolveCurrentApp(): void {
+    const linked = this.seeded('app');
+    if (linked && this.apps.some((a) => a.id === linked)) {
+      this.currentAppId = linked;
+      writeStored(APP_KEY, linked);
+      return;
+    }
     const stored = readStored(APP_KEY);
     if (stored && this.apps.some((a) => a.id === stored)) {
       this.currentAppId = stored;
@@ -535,6 +658,7 @@ class SessionStore {
     if (this.isStale(gen)) return;
     this.environments = fetched;
     this.resolveCurrentEnvironment();
+    this.settleSeed('env');
   }
 
   /**
@@ -623,6 +747,7 @@ class SessionStore {
     if (this.isStale(gen)) return;
     this.releases = fetched;
     this.resolveCurrentRelease(appId);
+    this.settleSeed('release');
   }
 
   // Tracks which app id a load has *completed* for (see
@@ -667,6 +792,18 @@ class SessionStore {
   }
 
   private resolveCurrentEnvironment(): void {
+    // A link's environment first. `null` is a real answer here — the link
+    // says "all environments" — not "unsaid", which is `undefined`.
+    const linked = this.seeded('env');
+    if (
+      linked === null ||
+      (linked !== undefined &&
+        (linked === 'none' || this.environments.some((e) => e.id === linked)))
+    ) {
+      this.currentEnvId = linked;
+      writeStored(ENV_KEY, linked);
+      return;
+    }
     const stored = readStored(ENV_KEY);
     // `'none'` (Unattributed) is always a valid selection — it does not name
     // a row in `this.environments` the way a real environment id does.
@@ -695,6 +832,18 @@ class SessionStore {
    * filter.
    */
   private resolveCurrentRelease(appId: string): void {
+    // A link's release first, through the same `selectableReleases` gate as a
+    // stored one. `null` = the link says "all releases".
+    const linked = this.seeded('release');
+    if (
+      linked === null ||
+      (linked !== undefined &&
+        (linked === 'none' || selectableReleases(this.releases).includes(linked)))
+    ) {
+      this.currentRelease = linked;
+      writeStored(releaseKey(appId), linked);
+      return;
+    }
     const stored = readStored(releaseKey(appId));
     if (stored && (stored === 'none' || selectableReleases(this.releases).includes(stored))) {
       this.currentRelease = stored;
@@ -714,6 +863,7 @@ class SessionStore {
 
   async setOrg(id: string): Promise<void> {
     if (id === this.currentOrgId) return;
+    this.dropSeed();
     this.beginAppScopeChange();
     this.currentOrgId = id;
     writeStored(ORG_KEY, id);
@@ -735,6 +885,7 @@ class SessionStore {
 
   async setProject(id: string): Promise<void> {
     if (id === this.currentProjectId) return;
+    this.dropSeed();
     this.beginAppScopeChange();
     this.currentProjectId = id;
     writeStored(PROJECT_KEY, id);
@@ -751,6 +902,7 @@ class SessionStore {
 
   async setApp(id: string): Promise<void> {
     if (id === this.currentAppId) return;
+    this.dropSeed();
     // Before anything else: any load still in flight for the app we are
     // leaving must not land on this one. Note this matters even when the user
     // comes back to an app they just left (A→B→A) — see `loadGen`.
@@ -782,6 +934,7 @@ class SessionStore {
   }
 
   setEnvironment(id: string | null): void {
+    this.dropSeed();
     this.currentEnvId = id;
     writeStored(ENV_KEY, id);
   }
@@ -792,6 +945,7 @@ class SessionStore {
    * comment).
    */
   setRelease(id: string | null): void {
+    this.dropSeed();
     this.currentRelease = id;
     if (this.currentAppId) writeStored(releaseKey(this.currentAppId), id);
     // A release narrows the env list (Topbar); if the current env is not in
