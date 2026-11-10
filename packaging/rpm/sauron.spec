@@ -8,7 +8,7 @@
 %bcond_with prebuilt
 
 Name:           sauron
-Version:        1.9.0
+Version:        1.10.0
 Release:        1%{?dist}
 Summary:        Unified error reporting and product analytics platform
 
@@ -364,6 +364,25 @@ fi
 %{_bindir}/sauron-symcli
 
 %changelog
+* Tue Nov 10 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.10.0-1
+- MCP server: a read-only endpoint at /v1/mcp lets Claude Code and other MCP
+  clients read errors, sessions, releases and performance with the developer's
+  own permissions. Eight tools: list_apps, trending_issues, get_issue,
+  list_issue_events, describe_search, get_session_timeline, list_releases and
+  slow_operations.
+- Personal API keys on the Account page (shown once; 30 days, 90 days, 1 year or
+  never; at most 25 unrevoked) authenticate only /v1/mcp. Ending a member's
+  sessions or forcing a password reset also revokes their keys.
+- Organization setting "AI assistants (MCP)" on the Members page, on by default,
+  lets admins turn MCP access off.
+- Trending ranks issues by events inside the window, from a new hourly per-issue
+  table. Apps created before this release need a one-time
+  "sauron-migrate backfill-issue-stats" (operator-run, safe to repeat).
+- Fix: an issue's stored user count could stay far below the real number after
+  a burst; write-backs held back by the throttle are now flushed within seconds.
+  Run "sauron-migrate backfill-users-seen" once to repair existing counts.
+- Building from source now needs Rust 1.88 or newer.
+
 * Fri Nov 06 2026 Soheyb Merah <merah.soheyb@gmail.com> - 1.9.0-1
 - Dashboard: the Quiet refresh. One type scale, theme tokens and spacing rhythm
   across every page; shared page header, error, select, segmented-control,

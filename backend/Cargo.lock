@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "crebain"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2872,7 +2872,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sauron-alerts"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-alerts-bin"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-api"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-auth"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2983,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-core"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-db"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3028,7 +3028,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-ingest"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-inspector"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-inspector-bin"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-jwt"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-mail"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "lettre",
  "sauron-core",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-migrate"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3120,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-monitor"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3140,7 +3140,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-monitor-core"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "chrono",
  "reqwest",
@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-pipeline"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-purge"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3187,7 +3187,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-query"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "chrono",
  "percent-encoding",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-redis"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -3216,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-store"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-storesync"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-symbols"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "addr2line",
  "gimli",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-symcli"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-telemetry"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -3283,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-tier"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "sauron-tier-bin"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "anyhow",
  "chrono",
