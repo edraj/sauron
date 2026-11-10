@@ -26,6 +26,10 @@ describe('describeAction', () => {
     expect(describeAction('role.update').label).toBe('Updated role');
     expect(describeAction('grant.delete').label).toBe('Deleted access grant');
     expect(describeAction('alert_channel.test').label).toBe('Sent test through alert channel');
+    // The MCP feature's three: personal API keys and the org's AI switch.
+    expect(describeAction('access_key.create').label).toBe('Created personal API key');
+    expect(describeAction('access_key.revoke').label).toBe('Revoked personal API key');
+    expect(describeAction('org.settings_update').label).toBe('Updated settings for organization');
   });
 
   it('marks destructive and credential actions so they do not read like a rename', () => {
@@ -36,6 +40,10 @@ describe('describeAction', () => {
     expect(describeAction('environment.rotate_key').tone).toBe('credential');
     expect(describeAction('pii.reveal').tone).toBe('credential');
     expect(describeAction('project.create').tone).toBe('neutral');
+    // A personal API key is a credential even though `create` alone is not.
+    expect(describeAction('access_key.create').tone).toBe('credential');
+    expect(describeAction('access_key.revoke').tone).toBe('credential');
+    expect(describeAction('org.settings_update').tone).toBe('neutral');
   });
 
   it('degrades to the raw action rather than rendering undefined', () => {

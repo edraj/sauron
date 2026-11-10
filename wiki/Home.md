@@ -74,6 +74,8 @@ scope and resolved as a union down the tree.
 - **[Privacy Inspector](Privacy-Inspector.md)** — find developer-supplied PII in your
   telemetry, mask it in hot Postgres and on all future ingest, and the plainly-stated
   list of places a mask does **not** reach.
+- **[AI assistants (MCP)](AI-Assistants-MCP.md)** — connect Claude Code to Sauron with a
+  personal API key: eight read-only tools, the org switch, revoking keys and the trending backfill.
 - **[Troubleshooting](Troubleshooting.md)** — nothing showing up, disabled no-op mode,
   gzip/retry/queue behavior, scope-leak pitfalls, and the version check.
 

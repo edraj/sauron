@@ -17,6 +17,10 @@ pub struct Config {
     /// `statement_timeout` is derived from it (one second under), so raising
     /// this raises both — a reverse proxy in front must allow at least as much.
     pub api_request_timeout_secs: u64,
+    /// Requests one personal API key may make to `/v1/mcp` per minute
+    /// (`MCP_CALLS_PER_MIN`, default 120, floor 1). Every MCP request counts,
+    /// tool call or not; the window is fixed and keyed on the key id.
+    pub mcp_calls_per_min: u32,
     /// The validated JWT signing secret, or the reason it is unusable.
     ///
     /// Private on purpose: reach it through [`Config::require_jwt_secret`] so a
@@ -324,6 +328,7 @@ impl std::fmt::Debug for Config {
             .field("ingest_port", &self.ingest_port)
             .field("api_port", &self.api_port)
             .field("api_request_timeout_secs", &self.api_request_timeout_secs)
+            .field("mcp_calls_per_min", &self.mcp_calls_per_min)
             .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| R))
             .field("jwt_access_ttl_secs", &self.jwt_access_ttl_secs)
             .field("jwt_refresh_ttl_secs", &self.jwt_refresh_ttl_secs)
@@ -843,6 +848,9 @@ impl Config {
             ingest_port: parse("INGEST_PORT", 8081),
             api_port: parse("API_PORT", 8080),
             api_request_timeout_secs: parse::<u64>("API_REQUEST_TIMEOUT_SECS", 60).clamp(5, 600),
+            // Floored at 1: a `0` would refuse every call, and an operator who
+            // wants MCP off has the per-org switch for that.
+            mcp_calls_per_min: parse::<u32>("MCP_CALLS_PER_MIN", 120).max(1),
             jwt_secret,
             jwt_access_ttl_secs: parse("JWT_ACCESS_TTL_SECS", 900),
             jwt_refresh_ttl_secs: parse("JWT_REFRESH_TTL_SECS", 2_592_000),
@@ -1423,6 +1431,7 @@ mod tests {
             ingest_port: 8081,
             api_port: 8080,
             api_request_timeout_secs: 60,
+            mcp_calls_per_min: 120,
             jwt_secret: Err("unset".to_string()),
             jwt_access_ttl_secs: 900,
             jwt_refresh_ttl_secs: 2_592_000,

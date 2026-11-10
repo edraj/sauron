@@ -19,6 +19,7 @@
   import { adminNavLocks } from '../src/lib/models/admin-nav';
   import { lockedBy } from '../src/lib/models/page-access';
   import { lockTip } from '../src/lib/actions/lock-tip';
+  import OrgAiAccessCard from '../src/lib/components/members/OrgAiAccessCard.svelte';
   import Icon from '../src/lib/components/ui/Icon.svelte';
   import { sessionStore } from '../src/lib/stores/session.svelte';
   import type { Permission, ScopeType } from '../src/lib/models';
@@ -30,6 +31,9 @@
   // Deliberately missing monitor:read and event:read so the SIDEBAR locks too —
   // no preset role produces that, which is exactly the point: custom roles can.
   const NARROW: Permission[] = ['issue:read', 'app:read', 'member:read'];
+
+  // Holds org:manage at ORG level: the AI-access card renders unlocked.
+  const ORG_ADMIN: Permission[] = [...VIEWER, 'org:manage', 'member:manage'];
 
   // Everything an alerting operator for ONE project would plausibly hold.
   const PROJECT_ALERTS: Permission[] = [
@@ -74,6 +78,7 @@
 
     <div class="row">
       <button id="set-viewer" onclick={() => use(VIEWER, 'org', 'org1')}>Viewer grants</button>
+      <button id="set-org-admin" onclick={() => use(ORG_ADMIN, 'org', 'org1')}>Org admin grants</button>
       <button id="set-narrow" onclick={() => use(NARROW, 'org', 'org1')}>Narrow custom role</button>
       <button id="set-project" onclick={() => use(PROJECT_ALERTS, 'project', 'proj1')}>
         Alerting role on one project
@@ -87,6 +92,9 @@
         New alert rule
       </Button>
     </div>
+
+    <h2>Org AI-access card (Members page, org:manage)</h2>
+    <div class="card-wrap"><OrgAiAccessCard /></div>
 
     <h2>Buttons</h2>
     <div class="row">
@@ -149,6 +157,7 @@
   h1 { font-size: 19px; margin: 0 0 18px; }
   h2 { font-size: 14px; margin: 26px 0 10px; color: var(--text-muted); }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .card-wrap { max-width: 640px; }
   .rail { display: flex; flex-direction: column; gap: 2px; width: 220px; }
   .item {
     display: flex; align-items: center; gap: 9px; padding: 7px 10px;

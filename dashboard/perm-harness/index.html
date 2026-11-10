@@ -10,6 +10,11 @@
     <script>
       window.__SAURON_CONFIG__ = { apiBaseUrl: 'http://localhost:3041', ingestBaseUrl: 'http://localhost:3041' };
     </script>
+    <script>
+      // `?lang=ar` seeds the locale BEFORE the store's constructor runs.
+      const l = new URLSearchParams(location.search).get('lang');
+      if (l === 'ar' || l === 'en') localStorage.setItem('sauron.locale', l);
+    </script>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

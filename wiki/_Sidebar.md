@@ -21,6 +21,7 @@
 - [Best Practices](Best-Practices.md)
 - [Notifications](Notifications.md)
 - [Privacy Inspector](Privacy-Inspector.md)
+- [AI assistants (MCP)](AI-Assistants-MCP.md)
 - [Admin: purge & ingest failures](Admin.md)
 - [Troubleshooting](Troubleshooting.md)
 

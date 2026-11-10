@@ -287,6 +287,93 @@ pub async fn access(
     }))
 }
 
+/// Org-level settings. Today just the MCP switch.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct OrgSettings {
+    /// Whether personal API keys and the MCP endpoint work for this org.
+    pub mcp_enabled: bool,
+}
+
+/// Partial update: omitted fields are left alone.
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct UpdateOrgSettings {
+    /// Turn MCP access on or off for the whole organization.
+    pub mcp_enabled: Option<bool>,
+}
+
+#[utoipa::path(
+    get, path = "/v1/orgs/{org_id}/settings", tag = "Organizations",
+    summary = "Read the organization's settings",
+    description = "Any member of the organization may read its settings.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    responses((status = 200, description = "The settings.", body = OrgSettings), (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "No grant in this organization.", body = ErrorResponse)),
+)]
+pub async fn get_org_settings(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(org_id): Path<Uuid>,
+) -> Result<Json<OrgSettings>, ApiError> {
+    let mut conn = db(&state).await?;
+    if repo::user_grants_in_org(&mut conn, auth.user_id, org_id)
+        .await?
+        .is_empty()
+    {
+        return Err(ApiError::Auth(AuthError::Forbidden));
+    }
+    let mcp_enabled = sauron_db::org_settings::mcp_enabled(&mut conn, org_id).await?;
+    Ok(Json(OrgSettings { mcp_enabled }))
+}
+
+#[utoipa::path(
+    patch, path = "/v1/orgs/{org_id}/settings", tag = "Organizations",
+    summary = "Update the organization's settings",
+    description = "\
+Requires `org:manage`. Turning `mcp_enabled` off stops every personal API key \
+from reaching this organization's data over MCP. An empty body is a 400. A \
+change is audited as `org.settings_update`; re-sending the current value is not.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body = UpdateOrgSettings,
+    responses((status = 200, description = "The settings after the update.", body = OrgSettings), (status = 400, description = "No field to update.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires org:manage.", body = ErrorResponse)),
+)]
+pub async fn update_org_settings(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(org_id): Path<Uuid>,
+    Json(req): Json<UpdateOrgSettings>,
+) -> Result<Json<OrgSettings>, ApiError> {
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::ORG_MANAGE).await?;
+    let Some(new) = req.mcp_enabled else {
+        return Err(ApiError::BadRequest("no settings to update".into()));
+    };
+    let old = sauron_db::org_settings::set_mcp_enabled(&mut conn, org_id, new).await?;
+    if old != new {
+        let org_name = repo::get_org(&mut conn, org_id)
+            .await?
+            .map(|o| o.name)
+            .unwrap_or_default();
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            crate::audit::Entry::new(
+                org_id,
+                crate::audit::action::ORG_SETTINGS_UPDATE,
+                crate::audit::entity::ORG,
+            )
+            .target(org_id, &org_name)
+            .changes(crate::audit::diff(
+                crate::audit::entity::ORG,
+                &[("mcp_enabled", json!(old), json!(new))],
+            )),
+        )
+        .await;
+    }
+    Ok(Json(OrgSettings { mcp_enabled: new }))
+}
+
 // --- members / grants -------------------------------------------------------
 
 /// A change to this member's sign-in address, awaiting the new address's
@@ -1389,6 +1476,9 @@ pub async fn revoke_member_sessions(
         Some(auth.user_id),
     )
     .await?;
+    // "End all sessions" is the compromised-account button, so personal API
+    // keys (which outlive any session) go with it.
+    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(&mut conn, user_id).await?;
 
     // Before `drop(conn)` — the connection is released below and re-acquiring
     // one just to log would be a second pool checkout on a path that already
@@ -1409,7 +1499,10 @@ pub async fn revoke_member_sessions(
         .target(user_id, &target_email)
         .changes(crate::audit::created(
             crate::audit::entity::MEMBER,
-            &[("revoked_sessions", serde_json::json!(ids.len()))],
+            &[
+                ("revoked_sessions", serde_json::json!(ids.len())),
+                ("revoked_keys", serde_json::json!(revoked_keys)),
+            ],
         )),
     )
     .await;
@@ -1424,7 +1517,7 @@ pub async fn revoke_member_sessions(
         "admin revoked all sessions for a member"
     );
     Ok(Json(
-        serde_json::json!({ "ok": true, "revoked": ids.len() }),
+        serde_json::json!({ "ok": true, "revoked": ids.len(), "revoked_keys": revoked_keys }),
     ))
 }
 
@@ -1660,6 +1753,8 @@ pub async fn reset_member_password(
         Some(auth.user_id),
     )
     .await?;
+    // A forced reset assumes compromise: personal API keys die with the sessions.
+    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(&mut conn, user_id).await?;
     // Turns the dialog's "within a few seconds" into a statement about this
     // replica rather than about its next poll.
     state.revocations.mark_revoked(&ids);
@@ -1724,6 +1819,7 @@ pub async fn reset_member_password(
                 ("reset_action", serde_json::json!("reset")),
                 ("expires_at", serde_json::json!(expires_at)),
                 ("revoked_sessions", serde_json::json!(ids.len())),
+                ("revoked_keys", serde_json::json!(revoked_keys)),
             ],
         )),
     )

@@ -45,7 +45,7 @@ several minutes. Use `./packaging/rpm/build-rpm.sh --srpm` to produce just the s
 
 > **Using rustup / nvm** instead of the Fedora `rust`/`cargo`/`nodejs`/`npm` packages?
 > `rpmbuild` resolves `BuildRequires` against the RPM database, not `$PATH`, so it reports
-> `cargo >= 1.82 is needed` even though `cargo` works in your shell. `build-rpm.sh`
+> `cargo >= 1.88 is needed` even though `cargo` works in your shell. `build-rpm.sh`
 > auto-detects this and adds `--nodeps` for you (your toolchain still does the build); force
 > it with `./packaging/rpm/build-rpm.sh --nodeps`, or install the distro toolchain to satisfy
 > the check natively.

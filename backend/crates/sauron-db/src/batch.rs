@@ -1043,10 +1043,13 @@ async fn set_issue_users_seen_once(
     // the same order — see the module's ordering rule.
     let mut ix: Vec<usize> = (0..rows.len()).collect();
     ix.sort_unstable_by(|&a, &b| rows[a].0.cmp(&rows[b].0));
+    // `users_seen < t.n`: never lowers the count — an estimate read earlier
+    // can commit later — and a row it would not change is neither locked nor
+    // rewritten. Same rule as `repo::set_issue_users_seen`.
     diesel::sql_query(
         "UPDATE issues SET users_seen = t.n \
          FROM unnest($1::uuid[], $2::bigint[]) AS t(id, n) \
-         WHERE issues.id = t.id",
+         WHERE issues.id = t.id AND issues.users_seen < t.n",
     )
     .bind::<Array<SqlUuid>, _>(ix.iter().map(|&i| rows[i].0).collect::<Vec<_>>())
     .bind::<Array<BigInt>, _>(ix.iter().map(|&i| rows[i].1).collect::<Vec<_>>())
@@ -1098,9 +1101,10 @@ pub struct WriteSet<'a> {
 ///    carries a fresh uuid_v7, so nothing would dedupe them. Rolling back makes
 ///    the replay start from nothing.
 ///
-/// Explicit `BEGIN`/`COMMIT` rather than `conn.transaction(|c| …)`:
-/// diesel-async 0.9's closure signature needs async closures, which would push
-/// the workspace MSRV past the 1.82 the RPM spec builds against.
+/// Explicit `BEGIN`/`COMMIT` rather than `conn.transaction(async |c| …)`. Both
+/// work at the 1.88 MSRV (async closures are stable since Rust 1.85, and
+/// `routes/environments.rs` uses `conn.transaction` that way); this block
+/// predates that and behaves the same.
 ///
 /// The issue upsert is deliberately NOT part of this — see [`upsert_issues`].
 pub async fn write_rows(conn: &mut AsyncPgConnection, set: WriteSet<'_>) -> QueryResult<()> {

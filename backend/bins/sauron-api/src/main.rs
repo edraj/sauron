@@ -9,6 +9,7 @@ mod audit;
 mod csv;
 mod error;
 mod mail;
+mod mcp;
 mod openapi;
 mod overview_cache;
 mod release_guard;
@@ -549,6 +550,14 @@ async fn main() -> anyhow::Result<()> {
         // (`GET /v1/apps/{app_id}/sessions`). None of these match
         // `/v1/apps/{app_id}/...`, so `routes::scope::reject_environment_id` is
         // not required and the env-scoping router enumeration does not see them.
+        .route(
+            "/v1/me/api-keys",
+            get(routes::account::list_api_keys).post(routes::account::create_api_key),
+        )
+        .route(
+            "/v1/me/api-keys/{key_id}",
+            delete(routes::account::delete_api_key),
+        )
         .route("/v1/me/sessions", get(routes::account::list_sessions))
         .route(
             "/v1/me/sessions/{session_id}",
@@ -564,6 +573,10 @@ async fn main() -> anyhow::Result<()> {
             get(routes::orgs::list_orgs).post(routes::orgs::create_org),
         )
         .route("/v1/orgs/{org_id}/access", get(routes::orgs::access))
+        .route(
+            "/v1/orgs/{org_id}/settings",
+            get(routes::orgs::get_org_settings).patch(routes::orgs::update_org_settings),
+        )
         .route(
             "/v1/orgs/{org_id}/members",
             get(routes::orgs::list_members).post(routes::orgs::create_member),
@@ -1177,6 +1190,20 @@ async fn main() -> anyhow::Result<()> {
             "/v1/admin/ingest-failures/{id}/retry",
             post(routes::failures::retry),
         )
+        // The read-only MCP endpoint, `/v1/mcp`, authenticated by personal API
+        // keys rather than JWTs (see `mcp`'s module docs). Merged HERE, ahead of
+        // every layer below, so the release guard, CORS, concurrency limit,
+        // timeout, security headers and tracing all wrap it. The
+        // `DefaultBodyLimit` just below does NOT bound it: that layer only
+        // configures axum's body extractors, and the MCP service is a raw
+        // tower service that reads the body itself. Its ceiling is rmcp's own
+        // `with_max_request_body_bytes`, set in `mcp::router`. It is mounted
+        // with `nest_service` inside `mcp::router`, so it is
+        // deliberately absent from the route-call scans in `route_table.rs`
+        // and `tests/audit_coverage.rs` (both read only this file). Keep the
+        // literal route-call spelling out of this comment: those scanners
+        // match on it, comments included.
+        .merge(mcp::router(state.clone()))
         // A JSON API body never legitimately reaches megabytes; the artifact
         // routes below are merged separately with their own raised limit.
         .layer(DefaultBodyLimit::max(API_JSON_BODY_LIMIT))

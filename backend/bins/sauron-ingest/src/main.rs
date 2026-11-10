@@ -574,6 +574,17 @@ async fn main() -> anyhow::Result<()> {
         },
     );
 
+    // `issues.users_seen` write-back flusher. The workers throttle that
+    // write to once per issue per interval and park an issue whose estimate
+    // moved while its gate was closed; this writes the parked ones back once
+    // the gate reopens, so a burst followed by silence still converges. One
+    // per process, because the parked set is process-global — see
+    // `sauron_pipeline::users_seen`. Its first pass also re-checks the issues
+    // active in the 10 minutes before startup, since a restart drops the
+    // parked set; that query runs inside the task, so a Postgres outage at
+    // boot does not hold up the edge.
+    let _users_seen = sauron_pipeline::users_seen::spawn_flusher(pool.clone(), redis.clone());
+
     let port = cfg.ingest_port;
     let max_body = cfg.ingest_max_body_bytes;
     let uds_path = cfg.ingest_uds_path.clone();

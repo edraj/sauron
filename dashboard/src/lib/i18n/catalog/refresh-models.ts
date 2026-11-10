@@ -195,6 +195,8 @@ export const refreshModels = {
   },
   'audit.verb.release': { en: 'Released {noun}', ar: 'حرّر {noun}' },
   'audit.verb.extend': { en: 'Extended {noun}', ar: 'مدّد {noun}' },
+  'audit.verb.revoke': { en: 'Revoked {noun}', ar: 'ألغى {noun}' },
+  'audit.verb.settingsUpdate': { en: 'Updated settings for {noun}', ar: 'حدّث إعدادات {noun}' },
   // Auth actions are about the actor, so they carry no noun.
   'audit.auth.login': { en: 'Signed in', ar: 'سجّل الدخول' },
   'audit.auth.loginFailed': { en: 'Failed sign-in', ar: 'فشل تسجيل الدخول' },
@@ -217,6 +219,7 @@ export const refreshModels = {
   'audit.noun.tierRestore': { en: 'cold-data restore', ar: 'استعادة بيانات باردة' },
   'audit.noun.tierPin': { en: 'restore pin', ar: 'تثبيت استعادة' },
   'audit.noun.pii': { en: 'data', ar: 'بيانات' },
+  'audit.noun.accessKey': { en: 'personal API key', ar: 'مفتاح API شخصي' },
   'audit.value.yes': { en: 'yes', ar: 'نعم' },
   'audit.value.no': { en: 'no', ar: 'لا' },
   'audit.value.empty': { en: '(empty)', ar: '(فارغ)' },

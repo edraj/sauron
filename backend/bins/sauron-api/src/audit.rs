@@ -33,6 +33,7 @@ use uuid::Uuid;
 /// column is TEXT: adding an action must be a code change, not a migration.
 pub mod action {
     pub const ORG_CREATE: &str = "org.create";
+    pub const ORG_SETTINGS_UPDATE: &str = "org.settings_update";
 
     pub const PROJECT_CREATE: &str = "project.create";
     pub const PROJECT_UPDATE: &str = "project.update";
@@ -124,6 +125,9 @@ pub mod action {
     pub const TIER_RESTORE_CREATE: &str = "tier_restore.create";
     pub const TIER_PIN_RELEASE: &str = "tier_pin.release";
     pub const TIER_PIN_EXTEND: &str = "tier_pin.extend";
+
+    pub const ACCESS_KEY_CREATE: &str = "access_key.create";
+    pub const ACCESS_KEY_REVOKE: &str = "access_key.revoke";
 }
 
 /// Entity families, used for the `entity_type` column and its filter.
@@ -152,6 +156,9 @@ pub mod entity {
     /// in SQL. Declared here anyway so [`ALL`] can offer it as a filter value
     /// and the two spellings cannot drift apart.
     pub const PII: &str = "pii";
+    /// A personal API key (MCP access). `changes` carries only `name`,
+    /// `prefix` and `expires_at` — never the token.
+    pub const ACCESS_KEY: &str = "access_key";
 
     /// Sign-in activity. Hidden from the default feed — `repo::list_audit_feed`
     /// filters on this exact literal and migration 52's partial index is
@@ -160,7 +167,7 @@ pub mod entity {
 
     /// Every entity family the feed can contain, including the read-only
     /// projections. The API validates `?entity_type=` against this.
-    pub const ALL: [&str; 17] = [
+    pub const ALL: [&str; 18] = [
         AUTH,
         ORG,
         PROJECT,
@@ -178,6 +185,7 @@ pub mod entity {
         TIER,
         INGEST_FAILURE,
         PII,
+        ACCESS_KEY,
     ];
 }
 
@@ -192,6 +200,9 @@ pub mod entity {
 pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
     match entity_type {
         entity::PROJECT => &["name", "slug"],
+        // Deliberately no token or hash: neither name could pass
+        // `FORBIDDEN_FIELDS` anyway.
+        entity::ACCESS_KEY => &["name", "prefix", "expires_at"],
         // `ingest_enabled` is here because muting an app is a silent, total
         // outage for it; a trail that recorded the rename but not the mute
         // would omit the more consequential of the two.
@@ -205,6 +216,7 @@ pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
             "email",
             "name",
             "revoked_sessions",
+            "revoked_keys",
             "reset_action",
             "expires_at",
             // The address an admin asked to move the account TO. Recording it
@@ -282,7 +294,7 @@ pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
             "cold_rows_skipped",
             "status_before",
         ],
-        entity::ORG => &["name"],
+        entity::ORG => &["name", "mcp_enabled"],
         // `reason` distinguishes a wrong password from a deactivated account
         // from a forced reset. No credential material has a key here, and none
         // could: `FORBIDDEN_FIELDS` rejects `password` as a substring.
@@ -620,6 +632,7 @@ mod tests {
             entity::INSPECTOR_POLICY,
             entity::TIER,
             entity::AUTH,
+            entity::ACCESS_KEY,
         ];
         for family in families {
             for field in allowlist(family) {
@@ -676,6 +689,7 @@ mod tests {
             entity::INGEST_FAILURE,
             entity::PII,
             entity::AUTH,
+            entity::ACCESS_KEY,
         ] {
             assert!(
                 entity::ALL.contains(&family),

@@ -782,9 +782,12 @@ pub async fn authorize_env_read(
 
 /// [`authorize_env_read`], plus the caller's full effective permission set at
 /// the **resolved** scope — for a handler that gates a second capability on top
-/// of the read itself. Every current caller gates `source:read`; see
-/// `sauron-api`'s `routes::scope::authorized_read_scope_with_perms`, the sole
-/// wrapper, for the list.
+/// of the read itself. Every current caller gates `source:read`. Most go
+/// through `sauron-api`'s `routes::scope::authorized_read_scope_with_perms`
+/// (see it for the list); the issue detail, issue events and session detail
+/// call this directly, through the scoped loaders `issues::load_issue_scoped`,
+/// `issues::search_issue_events` and `sessions::load_session_scoped`, which
+/// take a typed `EnvFilter` so the MCP tools reach the same authorization.
 ///
 /// Supersedes `routes::mod::authorize_app_perms` for environment-scoped reads.
 /// That helper resolved permissions through [`effective_at`], which hardcodes

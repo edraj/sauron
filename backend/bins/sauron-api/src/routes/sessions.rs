@@ -344,7 +344,18 @@ pub async fn detail(
     }))
 }
 
-/// Authorize a read of one session and load it, or 404.
+/// What [`load_session_scoped`] hands back: the pooled connection it used,
+/// the resolved scope, the caller's permissions at that scope, and the
+/// session.
+pub(crate) type ScopedSession = (
+    sauron_db::PgConn,
+    sauron_db::scope::ReadScope,
+    std::collections::HashSet<String>,
+    Session,
+);
+
+/// Authorize a read of one session and load it, or 404: `environment_id` from
+/// the raw query string, then [`load_session_scoped`].
 ///
 /// Shared by [`detail`] and its two sections, so all three resolve scope the
 /// same way and none of them answers for a session the others would refuse.
@@ -354,15 +365,26 @@ async fn load_session(
     app_id: Uuid,
     session_id: &str,
     raw_query: Option<&str>,
-) -> Result<
-    (
-        sauron_db::PgConn,
-        sauron_db::scope::ReadScope,
-        std::collections::HashSet<String>,
-        Session,
-    ),
-    ApiError,
-> {
+) -> Result<ScopedSession, ApiError> {
+    let env = super::scope::parse_env(super::scope::raw_environment_id(raw_query).as_deref())?;
+    load_session_scoped(state, user_id, app_id, session_id, env).await
+}
+
+/// Authorize an `event:read` of one session under the requested environment
+/// filter and load it, or 404.
+///
+/// The body every session route shares, typed so the MCP tools (which take
+/// the environment as an argument, not a query string) authorize exactly as
+/// the dashboard does. `env` is the REQUESTED filter, as `parse_env` produces
+/// it; a filter already resolved may be passed back in, since resolving one
+/// again yields the same filter.
+pub(crate) async fn load_session_scoped(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    session_id: &str,
+    env: sauron_db::scope::EnvFilter,
+) -> Result<ScopedSession, ApiError> {
     let mut conn = db(state).await?;
     // `_with_perms` rather than `authorized_read_scope`: the timeline carries
     // whole `ErrorEvent` rows, and two further permissions apply to them —
@@ -371,12 +393,12 @@ async fn load_session(
     // de-obfuscated lines inside `stacktrace_symbolicated`). Both are the same
     // second permission question the issues routes ask, answered at the
     // resolved environment.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+    let (scope, perms) = sauron_auth::authorize_env_read_with_perms(
         &mut conn,
         user_id,
         app_id,
         perm::EVENT_READ,
-        raw_query,
+        env,
     )
     .await?;
     let session = repo::get_session(&mut conn, scope.clone(), session_id)
@@ -390,7 +412,7 @@ async fn load_session(
 ///
 /// Takes the connection by value: symbolication checks out its own, so this one
 /// is released as soon as the three reads are done.
-async fn session_timeline(
+pub(crate) async fn session_timeline(
     state: &AppState,
     mut conn: sauron_db::PgConn,
     scope: sauron_db::scope::ReadScope,

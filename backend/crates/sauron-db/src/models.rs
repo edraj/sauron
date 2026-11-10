@@ -99,6 +99,7 @@ pub struct Organization {
     pub slug: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub mcp_enabled: bool,
 }
 
 #[derive(Debug, Insertable)]
@@ -692,6 +693,35 @@ pub struct NewPasswordResetToken {
     pub initiated_by: Option<Uuid>,
     pub requested_from: Option<String>,
     pub expires_at: DateTime<Utc>,
+}
+
+/// A personal API key (MCP server).
+///
+/// Deliberately derives no `Serialize`: `token_hash` must never leave the
+/// process, and the list endpoint maps this to its own response type.
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = api_keys)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ApiKey {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    pub token_prefix: String,
+    pub token_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Insertable)]
+#[diesel(table_name = api_keys)]
+pub struct NewApiKey<'a> {
+    pub user_id: Uuid,
+    pub name: &'a str,
+    pub token_prefix: &'a str,
+    pub token_hash: &'a str,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// A pending change to a user's login address.

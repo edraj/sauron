@@ -32,7 +32,7 @@ build (the Debian 12 package runs on Debian 13; the Ubuntu 22.04 package runs on
 
 Requires `debhelper`, `dpkg-dev` and a Rust/Node toolchain. **The distro `rustc` and `nodejs`
 packages are too old on both targets** — Debian 12 has rustc 1.63 and Node 18, Ubuntu 22.04 has
-rustc 1.75 and Node 12, against floors of Rust 1.82 and Node 22 — so use rustup and NodeSource,
+rustc 1.75 and Node 12, against floors of Rust 1.88 and Node 22 — so use rustup and NodeSource,
 as CI does:
 
 ```bash

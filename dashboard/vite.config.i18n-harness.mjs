@@ -84,6 +84,26 @@ function json(res, body) {
   res.end(JSON.stringify(body));
 }
 
+// In-memory personal API keys for the account page (create / reveal / revoke).
+let API_KEYS = [];
+let ORG_MCP_ENABLED = false;
+function apiKeyView(name, expiry) {
+  const days = { '30d': 30, '90d': 90, '1y': 365 }[expiry];
+  const token = 'sauron_pat_' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  return {
+    key: {
+      id: 'key' + Date.now(),
+      name,
+      prefix: token.slice(0, 17),
+      created_at: new Date().toISOString(),
+      expires_at: days ? new Date(Date.now() + days * 86400000).toISOString() : null,
+      last_used_at: null,
+      expired: false,
+    },
+    token,
+  };
+}
+
 function stubApi() {
   const root = fileURLToPath(new URL('./i18n-harness', import.meta.url));
   return {
@@ -105,7 +125,24 @@ function stubApi() {
           return;
         }
 
-        if (path === '/v1/orgs') return json(res, [ORG]);
+        if (path === '/v1/orgs/org1/settings') {
+          if (req.method === 'PATCH') {
+            let body = '';
+            req.on('data', (c) => (body += c));
+            req.on('end', () => {
+              const patch = JSON.parse(body || '{}');
+              if (typeof patch.mcp_enabled !== 'boolean') {
+                res.statusCode = 400;
+                return json(res, { error: { code: 'bad_request', message: 'no settings to change' } });
+              }
+              ORG_MCP_ENABLED = patch.mcp_enabled;
+              json(res, { mcp_enabled: ORG_MCP_ENABLED });
+            });
+            return;
+          }
+          return json(res, { mcp_enabled: ORG_MCP_ENABLED });
+        }
+        if (path === '/v1/orgs') return json(res, [{ ...ORG, mcp_enabled: ORG_MCP_ENABLED }]);
         if (path === '/v1/orgs/org1/access') {
           return json(res, {
             permissions: ALL_PERMS,
@@ -122,6 +159,37 @@ function stubApi() {
           return json(res, includeRevoked ? SESSIONS : SESSIONS.filter((s) => s.revoked_at === null));
         }
         if (path === '/v1/me/notification-subscriptions') return json(res, []);
+        if (path === '/v1/me/api-keys' && req.method === 'GET') return json(res, API_KEYS);
+        if (path === '/v1/me/api-keys' && req.method === 'POST') {
+          let body = '';
+          req.on('data', (c) => (body += c));
+          req.on('end', () => {
+            const { name, expiry } = JSON.parse(body || '{}');
+            if (!name || !name.trim()) {
+              res.statusCode = 400;
+              return json(res, { error: { code: 'bad_request', message: 'name must be 1 to 64 characters' } });
+            }
+            if (API_KEYS.length >= 25) {
+              res.statusCode = 409;
+              return json(res, { error: { code: 'conflict', message: 'You can have at most 25 active API keys' } });
+            }
+            const created = apiKeyView(name.trim(), expiry);
+            API_KEYS = [created.key, ...API_KEYS];
+            res.statusCode = 201;
+            json(res, created);
+          });
+          return;
+        }
+        if (path?.startsWith('/v1/me/api-keys/') && req.method === 'DELETE') {
+          const id = path.split('/').pop();
+          const before = API_KEYS.length;
+          API_KEYS = API_KEYS.filter((k) => k.id !== id);
+          if (API_KEYS.length === before) {
+            res.statusCode = 404;
+            return json(res, { error: { code: 'not_found', message: 'not found' } });
+          }
+          return json(res, { ok: true });
+        }
 
         if (path === '/v1/apps/app1/issues') {
           return json(res, { data: ISSUES, total: ISSUES.length, total_is_capped: false, next_cursor: null, clamped: null });

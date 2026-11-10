@@ -8,6 +8,7 @@ import type {
   MemberGrant,
   MemberPasswordResetResult,
   Organization,
+  OrgSettings,
   Role,
   UpdateGrantPayload,
   UpdateRolePayload,
@@ -15,6 +16,19 @@ import type {
 
 export async function listOrgs(): Promise<Organization[]> {
   const { data } = await api.get<Organization[]>('/v1/orgs');
+  return data;
+}
+
+export async function getOrgSettings(orgId: string): Promise<OrgSettings> {
+  const { data } = await api.get<OrgSettings>(`/v1/orgs/${orgId}/settings`);
+  return data;
+}
+
+export async function updateOrgSettings(
+  orgId: string,
+  patch: Partial<OrgSettings>,
+): Promise<OrgSettings> {
+  const { data } = await api.patch<OrgSettings>(`/v1/orgs/${orgId}/settings`, patch);
   return data;
 }
 

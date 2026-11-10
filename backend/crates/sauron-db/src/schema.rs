@@ -334,6 +334,21 @@ diesel::table! {
         slug -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        mcp_enabled -> Bool,
+    }
+}
+
+diesel::table! {
+    api_keys (id) {
+        id -> Uuid,
+        user_id -> Uuid,
+        name -> Text,
+        token_prefix -> Text,
+        token_hash -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        last_used_at -> Nullable<Timestamptz>,
+        revoked_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -925,6 +940,7 @@ diesel::joinable!(refresh_tokens -> users (user_id));
 // Only the user_id FK. `password_reset_tokens` has two FKs to `users` and
 // `joinable!` accepts one per table pair, so a future query for the initiating
 // admin's email needs an explicit `.on(...)` rather than a second line here.
+diesel::joinable!(api_keys -> users (user_id));
 diesel::joinable!(password_reset_tokens -> users (user_id));
 // Same one-per-table-pair limit, same shape: `email_change_requests` also has
 // two FKs to `users` (`user_id` and `initiated_by`).
@@ -1113,8 +1129,40 @@ diesel::table! {
     }
 }
 
+// Migration 84. No primary key in Postgres: identity is the unique index
+// `issue_stats_hourly_key` over (app_id, hour, issue_id, release,
+// COALESCE(environment_id, nil)). Diesel insists on a key, so this names the
+// non-null part of it; never `find()` by it (environments make it non-unique).
+diesel::table! {
+    issue_stats_hourly (app_id, hour, issue_id, release) {
+        app_id -> Uuid,
+        issue_id -> Uuid,
+        environment_id -> Nullable<Uuid>,
+        release -> Text,
+        hour -> Timestamptz,
+        events -> Int8,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    issue_stats_epoch (only_row) {
+        only_row -> Bool,
+        started_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    issue_stats_backfill (app_id) {
+        app_id -> Uuid,
+        covered_from -> Timestamptz,
+        completed_at -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     analytics_events,
+    api_keys,
     auth_sessions,
     app_environments,
     app_releases,
@@ -1172,4 +1220,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     ingest_failure_payloads,
     purge_jobs,
     purge_touched_keys,
+    issue_stats_hourly,
+    issue_stats_epoch,
+    issue_stats_backfill,
 );

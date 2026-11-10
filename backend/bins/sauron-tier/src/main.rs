@@ -601,15 +601,21 @@ async fn export_eligible(
         // steady state (fold lag ~1 min vs day-old exports) — enforced, not
         // assumed, because a stopped ingest process is exactly the state in
         // which both "fold is behind" and "partitions keep aging" hold.
-        match sauron_db::rollups::as_of(c, &sauron_db::rollups::EVENT_SOURCES).await? {
-            Some(ro_wm) if range.end <= ro_wm => {}
-            ro => {
-                tracing::info!(
-                    table = t.name, partition = %child, rollup_watermark = ?ro,
-                    "tier: partition retained until the rollup fold passes it"
-                );
-                continue;
-            }
+        let events_as_of = sauron_db::rollups::as_of(c, &sauron_db::rollups::EVENT_SOURCES).await?;
+        // Only error_events feeds issue_stats_hourly; a stuck issue_stats
+        // fold must not hold analytics_events or transactions in Postgres.
+        let issue_stats_as_of = if t.name == ISSUE_STATS_SOURCE_TABLE {
+            sauron_db::rollups::as_of(c, &[sauron_db::rollups::SRC_ISSUE_STATS]).await?
+        } else {
+            None
+        };
+        if !export_allowed(t.name, range.end, events_as_of, issue_stats_as_of) {
+            tracing::info!(
+                table = t.name, partition = %child, rollup_watermark = ?events_as_of,
+                issue_stats_watermark = ?issue_stats_as_of,
+                "tier: partition retained until the rollup fold passes it"
+            );
+            continue;
         }
         let wm = repo::get_watermark(c, t.name).await?;
         if let Some(w) = wm {
@@ -949,6 +955,31 @@ async fn run_one_restore(pool: &PgPool, cfg: &Config, worker_id: &str) -> anyhow
     Ok(true)
 }
 
+/// The one tiered table `issue_stats_hourly` is folded from.
+const ISSUE_STATS_SOURCE_TABLE: &str = "error_events";
+
+/// The rollup interlock in [`export_eligible`]: a partition may leave Postgres
+/// only once the base folds (`EVENT_SOURCES`) have passed its end, and — for
+/// `error_events` only — the `issue_stats` fold too. `issue_stats` is a
+/// separate watermark over `error_events`, so the base folds being caught up
+/// says nothing about it; for every other table it is irrelevant (and
+/// ignored), so a stuck issue_stats fold never halts their tiering. A missing
+/// watermark (`None`) where one is required means "not ready", never
+/// "pretend fresh".
+fn export_allowed(
+    table: &str,
+    range_end: DateTime<Utc>,
+    events_as_of: Option<DateTime<Utc>>,
+    issue_stats_as_of: Option<DateTime<Utc>>,
+) -> bool {
+    let base = events_as_of.is_some_and(|w| range_end <= w);
+    if table == ISSUE_STATS_SOURCE_TABLE {
+        base && issue_stats_as_of.is_some_and(|w| range_end <= w)
+    } else {
+        base
+    }
+}
+
 /// `error_events_2026_05_01` → 2026-05-01T00:00:00Z.
 fn parse_suffix_start(child: &str, table: &str) -> Option<DateTime<Utc>> {
     let suffix = child.strip_prefix(&format!("{table}_"))?;
@@ -962,4 +993,46 @@ fn parse_suffix_start(child: &str, table: &str) -> Option<DateTime<Utc>> {
         parts[2].parse().ok()?,
     );
     chrono::TimeZone::with_ymd_and_hms(&Utc, y, m, d, 0, 0, 0).single()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    /// For `error_events` the export interlock needs BOTH the base folds and
+    /// the issue_stats fold past the partition's end: tiering ahead of either
+    /// watermark would move raw rows out of Postgres before that rollup
+    /// counted them. A missing watermark row (`None`) is "not ready", never
+    /// "pretend fresh". Other tables need only the base folds.
+    #[test]
+    fn export_waits_for_issue_stats_watermark() {
+        let end: DateTime<Utc> = "2026-11-01T00:00:00Z".parse().expect("ts");
+        let ahead = Some(end + ChronoDuration::hours(1));
+        let behind = Some(end - ChronoDuration::seconds(1));
+        let ev = "error_events";
+
+        // error_events: base folds caught up, issue_stats behind or missing.
+        assert!(!export_allowed(ev, end, ahead, behind));
+        assert!(!export_allowed(ev, end, ahead, None));
+        // error_events: issue_stats caught up, base folds behind or missing.
+        assert!(!export_allowed(ev, end, behind, ahead));
+        assert!(!export_allowed(ev, end, None, ahead));
+        assert!(!export_allowed(ev, end, None, None));
+        // error_events: both at or past the end. Equality is enough, as in
+        // the original single-watermark check (`range.end <= watermark`).
+        assert!(export_allowed(ev, end, ahead, ahead));
+        assert!(export_allowed(ev, end, Some(end), Some(end)));
+
+        // Every other tiered table follows the base folds alone: a stuck or
+        // missing issue_stats watermark must not hold it back...
+        for other in ["analytics_events", "transactions"] {
+            assert!(export_allowed(other, end, ahead, None), "{other}");
+            assert!(export_allowed(other, end, ahead, behind), "{other}");
+            assert!(export_allowed(other, end, Some(end), None), "{other}");
+            // ...while the base interlock still applies unchanged.
+            assert!(!export_allowed(other, end, behind, ahead), "{other}");
+            assert!(!export_allowed(other, end, None, ahead), "{other}");
+        }
+    }
 }

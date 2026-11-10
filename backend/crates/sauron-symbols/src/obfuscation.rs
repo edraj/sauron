@@ -38,17 +38,13 @@ impl ObfuscationMap {
     /// the pairs before it are still usable, and refusing the whole map would
     /// turn a truncated upload into "no de-obfuscation at all" instead of
     /// "de-obfuscation for everything that arrived".
-    // clippy suggests `as_chunks`, which is Rust 1.88+; workspace MSRV is 1.82.
-    // The lint itself is clippy 1.98+, so older toolchains need unknown_lints.
-    #[allow(unknown_lints)]
-    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn parse(bytes: &[u8]) -> Result<Self, SymbolError> {
         let raw: Vec<String> = serde_json::from_slice(bytes)
             .map_err(|_| SymbolError::Corrupt("obfuscation map".to_string()))?;
         let mut names = HashMap::with_capacity(raw.len() / 2);
         let mut weight = 0usize;
-        for pair in raw.chunks_exact(2) {
-            let (original, obfuscated) = (&pair[0], &pair[1]);
+        // `as_chunks` leaves the trailing unpaired element in its remainder.
+        for [original, obfuscated] in raw.as_chunks::<2>().0 {
             // An identity pair carries no information and is common in real
             // maps (names the obfuscator left alone). Storing it would double
             // the index for nothing.

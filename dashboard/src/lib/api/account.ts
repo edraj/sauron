@@ -1,5 +1,5 @@
 import { api } from './client';
-import type { AccountSession } from '../models';
+import type { AccountSession, ApiKey, ApiKeyExpiry, CreatedApiKey } from '../models';
 
 /**
  * The `/v1/me/*` namespace. Bearer-authenticated, so this goes through `api`
@@ -37,4 +37,19 @@ export async function revokeMemberSessions(orgId: string, userId: string): Promi
     {},
   );
   return data.revoked;
+}
+
+/** Personal API keys (MCP). The full token is only ever in the create response. */
+export async function listApiKeys(): Promise<ApiKey[]> {
+  const { data } = await api.get<ApiKey[]>('/v1/me/api-keys');
+  return data;
+}
+
+export async function createApiKey(name: string, expiry: ApiKeyExpiry): Promise<CreatedApiKey> {
+  const { data } = await api.post<CreatedApiKey>('/v1/me/api-keys', { name, expiry });
+  return data;
+}
+
+export async function revokeApiKey(id: string): Promise<void> {
+  await api.delete(`/v1/me/api-keys/${id}`);
 }

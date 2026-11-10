@@ -48,6 +48,9 @@ woothee.workspace = true
 validator.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# The `/v1/mcp` endpoint (`src/mcp/`).
+rmcp.workspace = true
+schemars.workspace = true
 
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the real router in `main.rs`'s CSP tests without

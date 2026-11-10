@@ -529,8 +529,8 @@ async fn issue_env_narrowing_uses_the_issues_own_timestamps() {
 }
 
 /// `upsert_subscription` writes the parent and REPLACES the env child rows in a
-/// single data-modifying CTE — one statement, therefore atomic, without
-/// `conn.transaction` (MSRV 1.82 blocks it).
+/// single data-modifying CTE — one statement, therefore atomic, without a
+/// `conn.transaction` block.
 #[tokio::test]
 async fn upsert_subscription_replaces_the_env_set_in_one_statement() {
     let Some(db) = TestDb::setup().await else {
