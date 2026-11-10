@@ -9,6 +9,8 @@
 //! [`sauron_db::run_pending_migrations_waiting`] for why that retry is load
 //! bearing rather than a nicety.
 
+mod users_seen_backfill;
+
 /// One opt-in backfill: the token an operator types, and what it does.
 ///
 /// The single source for BOTH `--help` and argument validation. They were
@@ -21,7 +23,7 @@ struct Command {
     summary: &'static str,
 }
 
-const COMMANDS: [Command; 6] = [
+const COMMANDS: [Command; 8] = [
     Command {
         name: "backfill-person-days",
         summary: "Retention cohorts for apps predating migration 74. \
@@ -65,6 +67,18 @@ const COMMANDS: [Command; 6] = [
                   answer 503. Needs backfill-rollups done first. The ingest \
                   service also runs it unattended (ROLLUP_AUTO_BACKFILL).",
     },
+    Command {
+        name: "backfill-issue-stats",
+        summary: "Build the per-issue hourly counts behind MCP trending for apps created before the upgrade (hot history only)",
+    },
+    Command {
+        name: "backfill-users-seen",
+        summary: "Repair issues.users_seen (the Users column and MCP get_issue's \
+                  user figure) from each issue's Redis HyperLogLog. Run once \
+                  after upgrading: earlier releases could leave it stale for \
+                  good. Only ever raises a count; one row per statement, \
+                  safe with ingest running; idempotent. Needs REDIS_URL.",
+    },
 ];
 
 const USAGE: &str = "\
@@ -89,6 +103,9 @@ BACKFILLS:
 const ENV_HELP: &str = "\
 ENVIRONMENT:
     DATABASE_URL         Postgres connection string. Required.
+    REDIS_URL            Redis connection string, read only by
+                         backfill-users-seen (default redis://127.0.0.1:6379,
+                         the same default the daemons use).
     MIGRATE_WAIT_SECS    Seconds to tolerate a Postgres that is not up YET
                          (default 120; `0` disables waiting, which is what the
                          Compose path wants since it gates on a healthy
@@ -100,6 +117,7 @@ EXAMPLES:
     sauron-migrate backfill-person-days
     sauron-migrate backfill-rollups backfill-person-envs
     sauron-migrate backfill-releases
+    sauron-migrate backfill-users-seen
 
 After a backfill, run `ANALYZE` on the tables it filled — a backfill ships no
 statistics and the planner misestimates the new rows until it has them.
@@ -264,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Every backfill below is opt-in, and deliberately NOT part of the default
     // no-arg path — see `USAGE` for the reasoning, which is the same for all
-    // six: this is the oneshot every RPM daemon `Requires=`.
+    // eight: this is the oneshot every RPM daemon `Requires=`.
     //
     // Skipping `backfill-person-envs`, `-device-envs` or `-rollups` is a
     // PERFORMANCE decision: those reads fall back to a pre-rollup query.
@@ -274,6 +292,11 @@ async fn main() -> anyhow::Result<()> {
     // Skipping `backfill-releases` is a COMPLETENESS gap, not an error path:
     // the release switcher just starts empty and fills in from events seen
     // after the upgrade, same as a brand-new app.
+    // Skipping `backfill-issue-stats` is a COMPLETENESS gap too: MCP trending
+    // falls back (apps report not-ready) until it runs for pre-upgrade apps.
+    // Skipping `backfill-users-seen` leaves an ACCURACY gap: issues whose
+    // `users_seen` went stale under the old lossy throttle stay low until a
+    // new user reaches them.
     if tasks.contains(&"backfill-person-envs") {
         let pool = sauron_db::build_pool(&url, 4)?;
         sauron_db::person_env_backfill::backfill_all(&pool).await?;
@@ -314,6 +337,66 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
         tracing::info!("release users backfill complete");
+    }
+
+    if tasks.contains(&"backfill-issue-stats") {
+        let pool = sauron_db::build_pool(&url, 4)?;
+        use sauron_db::rollups::issue_stats::Progress;
+        let apps = sauron_db::rollups::issue_stats::backfill_all(&pool, |p| match p {
+            Progress::Pending(n) => tracing::info!("issue stats backfill: {n} apps pending"),
+            Progress::Day(app, day) => {
+                tracing::info!(%app, %day, "issue stats backfill: day complete")
+            }
+            Progress::Skipped(app, day) => {
+                tracing::warn!(%app, %day, "issue stats backfill: day below the tier floor, skipped")
+            }
+            Progress::Ready(app, covered_from) => {
+                tracing::info!("issue stats backfill: app {app} ready, covered_from={covered_from}")
+            }
+        })
+        .await?;
+        tracing::info!(apps, "issue stats backfill complete");
+    }
+
+    if tasks.contains(&"backfill-users-seen") {
+        use anyhow::Context as _;
+        // Read only here, so the plain migrate path never needs Redis. Same
+        // variable, default and blank-means-unset rule as the daemons'
+        // `Config::from_env`.
+        let redis_url = std::env::var("REDIS_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
+        // The URL is not echoed: it can carry a password.
+        let redis = sauron_redis::RedisStore::connect(&redis_url)
+            .await
+            .context(
+                "connecting to REDIS_URL (backfill-users-seen reads each issue's user sketch \
+                 from the Redis the ingest service writes to)",
+            )?;
+        let pool = sauron_db::build_pool(&url, 2)?;
+        let out =
+            users_seen_backfill::backfill_all(&pool, &redis, users_seen_backfill::PAGE, |o| {
+                tracing::info!(
+                    checked = o.checked,
+                    raised = o.raised,
+                    no_sketch = o.no_sketch,
+                    "users_seen backfill: page done"
+                )
+            })
+            .await?;
+        println!(
+            "backfill-users-seen: checked {} issues; raised {} stale counts",
+            out.checked, out.raised
+        );
+        // Always printed: a run against the wrong Redis (or db index) finds
+        // no sketches, raises nothing, and would otherwise look like success.
+        println!(
+            "backfill-users-seen: {} issues had no user sketch in Redis (normal for issues \
+             whose events carry no user; if that is most of them, check REDIS_URL and its \
+             db index)",
+            out.no_sketch
+        );
     }
 
     if tasks.contains(&"backfill-releases") {
@@ -417,5 +500,9 @@ mod tests {
             "help must document the env vars"
         );
         assert!(h.contains("MIGRATE_WAIT_SECS"));
+        assert!(
+            h.contains("REDIS_URL"),
+            "backfill-users-seen reads REDIS_URL, so --help must say so"
+        );
     }
 }

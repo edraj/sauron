@@ -43,6 +43,8 @@ const VERBS: Record<string, MessageKey> = {
   mask_preview: 'audit.verb.maskPreview',
   release: 'audit.verb.release',
   extend: 'audit.verb.extend',
+  revoke: 'audit.verb.revoke',
+  settings_update: 'audit.verb.settingsUpdate',
 };
 
 /**
@@ -76,6 +78,7 @@ const NOUNS: Record<string, MessageKey> = {
   tier_restore: 'audit.noun.tierRestore',
   tier_pin: 'audit.noun.tierPin',
   pii: 'audit.noun.pii',
+  access_key: 'audit.noun.accessKey',
 };
 
 /** Own-property lookup, so an action like `constructor.toString` cannot hit `Object.prototype`. */
@@ -110,6 +113,13 @@ const CREDENTIAL = new Set([
   'login_failed',
   'password_change',
 ]);
+/**
+ * Whole actions, for credential moves whose verb alone is too common to
+ * emphasise: `create` is usually a project or a role, but `access_key.create`
+ * mints a personal API key that can read the org through MCP, and its revoke
+ * is the row that says that access ended.
+ */
+const CREDENTIAL_ACTIONS = new Set(['access_key.create', 'access_key.revoke']);
 
 export interface DescribedAction {
   label: string;
@@ -134,7 +144,7 @@ export function describeAction(action: string): DescribedAction {
 
   const tone: ActionTone = DESTRUCTIVE.has(verb)
     ? 'destructive'
-    : CREDENTIAL.has(verb)
+    : CREDENTIAL.has(verb) || CREDENTIAL_ACTIONS.has(action)
       ? 'credential'
       : 'neutral';
 

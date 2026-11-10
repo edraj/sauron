@@ -1,10 +1,12 @@
 //! The issues API, scoped to an app: list, detail (with occurrences chart +
 //! latest event), status updates, and per-issue occurrences.
 
+use std::collections::HashSet;
+
 use axum::extract::{Path, RawQuery, State};
 use axum::Json;
 use axum_extra::extract::Query;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -12,7 +14,9 @@ use sauron_auth::{authorize_app, perm, AuthUser};
 use sauron_db::models::{ErrorEvent, Issue};
 use sauron_db::repo;
 use sauron_db::repo::SeriesPoint;
-use sauron_db::scope::Range;
+use sauron_db::scope::{EnvFilter, Range, ReadScope};
+use sauron_db::AsyncPgConnection;
+use sauron_query::{ReleaseFilter, ResolvedNode, Resource};
 
 use super::db;
 use crate::error::ApiError;
@@ -454,6 +458,135 @@ pub async fn list(
     }))
 }
 
+/// How many issues an MCP tool's `query` argument may select as candidates:
+/// the same ceiling as the list's `COUNT_CAP` and the environment ranking's
+/// `repo::ENV_RANK_CANDIDATES`.
+pub(crate) const ISSUE_CANDIDATE_CAP: i64 = 10_000;
+
+/// What [`tool_issue_search`] runs: [`list`]'s search, minus its paging.
+pub(crate) struct ToolIssueSearch<'a> {
+    /// The query language, as `list`'s `query=`. `None` (or blank) matches
+    /// every issue.
+    pub query: Option<&'a str>,
+    /// One `issues.status`, applied as an `is:` predicate; `None` for every
+    /// status. Always one of `unresolved`, `resolved`, `ignored`.
+    pub status: Option<&'a str>,
+    pub release: &'a ReleaseFilter,
+    /// Lower bound on `issues.last_seen`: the window, as `list`'s `since`.
+    pub since: DateTime<Utc>,
+    pub sort: repo::IssueSort,
+    /// Rows wanted. Up to `limit + 1` come back; the surplus one is the
+    /// has-more probe, exactly as on `list`.
+    pub limit: i64,
+}
+
+/// [`list`]'s search pipeline for the MCP tools, which already hold the
+/// scope and the permissions at it (`mcp::access::read_scope`, authorized on
+/// `issue:read` like `list`) and want rows rather than a page:
+/// `resolve_query` → `with_release` → `reject_withheld_dimensions` →
+/// `prepare` → `repo::search_issues`, descending, no cursor and no offset.
+/// A count sort under an environment scope ranks by that environment's
+/// in-window counts, exactly as on `list` (`search_issues` dispatches it).
+///
+/// What it leaves out, on purpose:
+/// - the planner's clamp on `since`. Tool windows are at most 30 days, which
+///   is the clamp's default (`SEARCH_SCAN_CLAMP_DAYS`, else `TIER_HOT_DAYS`,
+///   else 30); applying a narrower configured clamp would silently drop
+///   issues from a ranking over a window the caller was told was wider.
+/// - `count_issues` and `repair_blank_culprits`: no total is shown, and a
+///   read-only tool has no reason to write.
+pub(crate) async fn tool_issue_search(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    perms: &HashSet<String>,
+    s: &ToolIssueSearch<'_>,
+) -> Result<Vec<Issue>, ApiError> {
+    let reach = crate::symbolicate::text_search_reach(perms);
+    let mut node = super::search::resolve_query(s.query, &[], None, Resource::Issues)?;
+    if let Some(status) = s.status {
+        // Through the parser, so the predicate is the catalog's own `is:`
+        // dimension rather than a hand-built copy of it.
+        let status_node = super::search::resolve_query(
+            Some(&format!("is:{status}")),
+            &[],
+            None,
+            Resource::Issues,
+        )?;
+        node = ResolvedNode::And(vec![node, status_node]);
+    }
+    let node = sauron_query::with_release(node, Resource::Issues, s.release);
+    super::search::reject_withheld_dimensions(
+        &node,
+        reach,
+        super::search::EnvNameReach::for_perms(perms),
+    )?;
+    let prepared = sauron_db::query_plan::prepare::prepare(
+        &node,
+        Resource::Issues,
+        scope.app_id,
+        Utc::now(),
+        conn,
+    )
+    .await
+    .map_err(super::search::map_plan_error)?;
+    let search = repo::IssueSearch {
+        node: &node,
+        ctx: &prepared.ctx,
+        since: s.since,
+        sort: s.sort,
+        descending: true,
+        after: None,
+        limit: s.limit,
+        offset: 0,
+        text_reach: reach,
+    };
+    repo::search_issues(conn, scope, &search)
+        .await
+        .map_err(super::search::map_plan_error)
+}
+
+/// The ids of the issues `query` selects among those seen since `since`,
+/// most recently seen first, at most [`ISSUE_CANDIDATE_CAP`]; the `bool` is
+/// whether there were more ("capped"). `trending_issues` ranks within this
+/// set, so its `query` argument means what the dashboard's Issues search
+/// means: same parser, same withheld-dimension refusals, same planner.
+///
+/// `status` (one `issues.status`, or `None` for every status) narrows the
+/// candidates too, so issues the ranking would drop anyway do not use up
+/// the cap: under the default `unresolved`, a flood of resolved issues must
+/// not push the unresolved ones out of the 10,000.
+pub(crate) async fn issue_ids_matching(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    perms: &HashSet<String>,
+    query: &str,
+    status: Option<&str>,
+    release: &ReleaseFilter,
+    since: DateTime<Utc>,
+) -> Result<(Vec<Uuid>, bool), ApiError> {
+    let rows = tool_issue_search(
+        conn,
+        scope,
+        perms,
+        &ToolIssueSearch {
+            query: Some(query),
+            status,
+            release,
+            since,
+            sort: repo::IssueSort::LastSeen,
+            limit: ISSUE_CANDIDATE_CAP,
+        },
+    )
+    .await?;
+    let capped = rows.len() as i64 > ISSUE_CANDIDATE_CAP;
+    let ids = rows
+        .into_iter()
+        .take(ISSUE_CANDIDATE_CAP as usize)
+        .map(|i| i.id)
+        .collect();
+    Ok((ids, capped))
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct IssueDetail {
     #[serde(flatten)]
@@ -516,7 +649,11 @@ async fn issue_series(
 ///
 /// Call with the pooled connection already released — symbolication checks out
 /// its own.
-async fn finish_latest_event(
+///
+/// Also the MCP `get_issue` tool's gate (`mcp::tools::issues`), for the latest
+/// event and for one picked by id alike: a third copy of these gates is
+/// exactly what this function exists to prevent.
+pub(crate) async fn finish_latest_event(
     state: &AppState,
     app_id: Uuid,
     perms: &std::collections::HashSet<String>,
@@ -560,31 +697,56 @@ async fn finish_latest_event(
 // up before answering: a section is its own request, and must not answer `[]`
 // for an issue the composite would have answered 404 for.
 
-/// Authorize a read of one issue and load it, or 404.
+/// What [`load_issue_scoped`] hands back: the pooled connection it used, the
+/// resolved scope, the caller's permissions at that scope, and the issue.
+pub(crate) type ScopedIssue = (
+    sauron_db::PgConn,
+    sauron_db::scope::ReadScope,
+    std::collections::HashSet<String>,
+    Issue,
+);
+
+/// Authorize a read of one issue and load it, or 404: `environment_id` from
+/// the raw query string, then [`load_issue_scoped`].
 async fn load_issue(
     state: &AppState,
     user_id: Uuid,
     app_id: Uuid,
     issue_id: Uuid,
     raw_query: Option<&str>,
-) -> Result<
-    (
-        sauron_db::PgConn,
-        sauron_db::scope::ReadScope,
-        std::collections::HashSet<String>,
-        Issue,
-    ),
-    ApiError,
-> {
+) -> Result<ScopedIssue, ApiError> {
+    let env = super::scope::parse_env(super::scope::raw_environment_id(raw_query).as_deref())?;
+    load_issue_scoped(state, user_id, app_id, issue_id, env).await
+}
+
+/// Authorize an `issue:read` of one issue under the requested environment
+/// filter and load it, or 404.
+///
+/// The body every issue route shares, typed so the MCP tools (which take the
+/// environment as an argument, not a query string) authorize exactly as the
+/// dashboard does. `env` is the REQUESTED filter, as `parse_env` produces it;
+/// a filter `authorize_env_read_with_perms` already resolved may be passed
+/// back in, since resolving one again yields the same filter.
+///
+/// `repo::get_issue` derives the counts, title, culprit and level from the
+/// environment's own events under a non-`All` filter, and answers `None`
+/// (404) for an issue with no event there in the hot store.
+pub(crate) async fn load_issue_scoped(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    issue_id: Uuid,
+    env: EnvFilter,
+) -> Result<ScopedIssue, ApiError> {
     let mut conn = db(state).await?;
     // One ancestry+grant resolution authorizes the read, resolves its scope,
     // and answers the second permission question at that same scope.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
+    let (scope, perms) = sauron_auth::authorize_env_read_with_perms(
         &mut conn,
         user_id,
         app_id,
         perm::ISSUE_READ,
-        raw_query,
+        env,
     )
     .await?;
     let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
@@ -790,17 +952,75 @@ pub async fn events(
     Query(q): Query<EventsQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<super::search::SearchEnvelope<ErrorEvent>>, ApiError> {
-    let mut conn = db(&state).await?;
-    // One ancestry+grant resolution authorizes the read, resolves its scope,
-    // and answers the second permission question at that same scope.
-    let (scope, perms) = super::scope::authorized_read_scope_with_perms(
-        &mut conn,
-        auth.user_id,
-        app_id,
-        perm::ISSUE_READ,
-        raw_query.as_deref(),
-    )
-    .await?;
+    // `environment_id` and `release` from the raw query string, never from a
+    // `Query<T>` field: see `routes::scope`'s extractor-trap notes.
+    let env =
+        super::scope::parse_env(super::scope::raw_environment_id(raw_query.as_deref()).as_deref())?;
+    let release =
+        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
+    let params = EventsParams {
+        filter: q.filter,
+        q: q.q,
+        query: q.query,
+        sort: q.sort,
+        cursor: q.cursor,
+        since_days: q.since_days,
+        limit: q.limit,
+        offset: q.offset,
+    };
+    Ok(Json(
+        search_issue_events(&state, auth.user_id, app_id, issue_id, env, release, params).await?,
+    ))
+}
+
+/// [`events`]' inputs, typed: everything it reads from its query string
+/// except `environment_id` and `release`, which [`search_issue_events`] takes
+/// already parsed. The fields mean exactly what [`EventsQuery`]'s do. There is
+/// no `Default` impl: every caller states each field, and the values
+/// [`events`] uses when its query string omits one are `since_days` 3650,
+/// `limit` 30, `offset` 0, no sort, no cursor.
+pub(crate) struct EventsParams {
+    pub filter: Vec<String>,
+    pub q: Option<String>,
+    pub query: Option<String>,
+    pub sort: Option<String>,
+    pub cursor: Option<String>,
+    /// Days back from now. A whole number of days rather than a timestamp
+    /// because the window is resolved inside, against the route's ceiling
+    /// and the planner's clamp, and the response's `clamped` disclosure
+    /// names the window served in days.
+    pub since_days: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// One issue's occurrences, searched, keyset-paged, symbolicated and gated:
+/// [`events`]' body, shared with the MCP `list_issue_events` tool so both
+/// authorize, search, page and gate one way.
+///
+/// `env` is the requested environment filter (as [`load_issue_scoped`] takes
+/// it) and `release` the parsed `?release=`. The body gates stay in here:
+/// symbolication only for a caller who may read bodies, `strip_source_context`
+/// without `source:read`, then `gate_event_body`, so no caller can be handed
+/// rows that skipped them.
+pub(crate) async fn search_issue_events(
+    state: &AppState,
+    user_id: Uuid,
+    app_id: Uuid,
+    issue_id: Uuid,
+    env: EnvFilter,
+    release: ReleaseFilter,
+    p: EventsParams,
+) -> Result<super::search::SearchEnvelope<ErrorEvent>, ApiError> {
+    // Confirm the issue belongs to this app before returning its events (prevents
+    // reading another app's events by passing a foreign issue_id). The WHERE
+    // clauses below carry `app_id` too — this is the first of two layers, not
+    // a substitute for the second. The row is kept for its `times_seen`,
+    // which bounds the clamp decision below. One ancestry+grant resolution
+    // authorizes the read, resolves its scope, and answers the second
+    // permission question at that same scope.
+    let (mut conn, scope, perms, issue) =
+        load_issue_scoped(state, user_id, app_id, issue_id, env).await?;
     // Evaluated at the resolved environment — see `detail`'s comment above.
     let include_source = perms.contains(perm::SOURCE_READ);
     // Bodies need `event:read` on top of the `issue:read` that authorized this
@@ -809,14 +1029,6 @@ pub async fn events(
     // rather than a 403: the occurrences table is issue-level information and
     // `issue:read` is exactly what entitles them to it.
     let include_body = crate::symbolicate::may_read_event_body(&perms);
-    // Confirm the issue belongs to this app before returning its events (prevents
-    // reading another app's events by passing a foreign issue_id). The WHERE
-    // clauses below carry `app_id` too — this is the first of two layers, not
-    // a substitute for the second. The row is kept for its `times_seen`,
-    // which bounds the clamp decision below.
-    let issue = repo::get_issue(&mut conn, scope.clone(), issue_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
     // Same reach as the body gate above, from the same predicate: this route's
     // `?q=` used to ILIKE `contexts`/`extra`/`tags` on rows whose those very
     // columns `gate_event_body` then nulled on the way out — the response
@@ -832,13 +1044,11 @@ pub async fn events(
     let reach = crate::symbolicate::text_search_reach(&perms);
 
     let node = super::search::resolve_query(
-        q.query.as_deref(),
-        &q.filter,
-        q.q.as_deref().filter(|s| !s.is_empty()),
+        p.query.as_deref(),
+        &p.filter,
+        p.q.as_deref().filter(|s| !s.is_empty()),
         sauron_query::Resource::Occurrences,
     )?;
-    let release =
-        super::scope::parse_release(super::scope::raw_release(raw_query.as_deref()).as_deref())?;
     let node = sauron_query::with_release(node, sauron_query::Resource::Occurrences, &release);
     // **The refusal that matters most on this route.** `reject_body_filters`
     // below only ever saw the raw `filter=` strings, and `filter=` could name
@@ -873,7 +1083,7 @@ pub async fn events(
     .await
     .map_err(super::search::map_plan_error)?;
     let (sort_col, descending) = super::search::parse_sort(
-        q.sort.as_deref(),
+        p.sort.as_deref(),
         &["occurred_at", "distinct_id", "session_id", "device_key"],
         "occurred_at",
     )?;
@@ -882,7 +1092,7 @@ pub async fn events(
     // that would page unstably if the two lists ever drifted apart.
     let sort = sauron_db::repo::OccurrenceSort::from_column(&sort_col)
         .expect("parse_sort whitelist and OccurrenceSort::from_column must agree");
-    let after = match q.cursor.as_deref() {
+    let after = match p.cursor.as_deref() {
         Some(c) => Some(
             // See `analytics.rs`'s identical comment on its own `decode`
             // call: `sort.is_temporal()` is what stops a cursor whose key
@@ -901,18 +1111,18 @@ pub async fn events(
     let window = super::search::resolve_window(
         "occurred_at",
         Utc::now(),
-        q.since_days,
+        p.since_days,
         ISSUES_MAX_SINCE_DAYS,
         occurrence_scan_clamp(issue.times_seen, prepared.clamp),
     );
     let since = window.since;
-    let limit = q.limit.clamp(1, 100);
+    let limit = p.limit.clamp(1, 100);
     // Jump-only, and clamped to the same ceiling the count on this request
     // stops at: pages past `COUNT_CAP` are not numberable anyway, so an offset
     // beyond it addresses nothing while costing the planner real rows. Clamped
     // rather than rejected — a stale bookmark deep in a list that has since
     // shrunk should land on the last reachable page, not 400.
-    let offset = q.offset.clamp(0, super::search::COUNT_CAP);
+    let offset = p.offset.clamp(0, super::search::COUNT_CAP);
 
     let search = repo::OccurrenceSearch {
         node: &node,
@@ -966,7 +1176,7 @@ pub async fn events(
     if include_body {
         // One shared blob-fetcher for the whole page: the artifact lookup is
         // memoized across events instead of repeated per event.
-        crate::symbolicate::symbolicate_events(&state, app_id, &mut events).await;
+        crate::symbolicate::symbolicate_events(state, app_id, &mut events).await;
         if !include_source {
             for ev in events.iter_mut() {
                 crate::symbolicate::strip_source_context(ev);
@@ -975,13 +1185,13 @@ pub async fn events(
     }
     crate::symbolicate::gate_event_body(&perms, &mut events);
 
-    Ok(Json(super::search::SearchEnvelope {
+    Ok(super::search::SearchEnvelope {
         data: events,
         total,
         total_is_capped,
         next_cursor,
         clamped: window.clamped,
-    }))
+    })
 }
 
 /// Totals for the occurrences the sibling `events` route would list.

@@ -5,6 +5,7 @@
 //! `/v1/me`. The admin surface deliberately returns no session data at all.
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use sauron_db::repo;
 
 use super::auth::rate_limit;
 use super::db;
+use crate::audit::{self, action, entity, Entry};
 use crate::error::ApiError;
 use crate::openapi::{ErrorResponse, OkResponse};
 use crate::AppState;
@@ -282,6 +284,268 @@ pub async fn revoke_other_sessions(
 /// `ApiError::Auth`.
 const _: fn(AuthError) -> ApiError = ApiError::Auth;
 
+// ---------------------------------------------------------------------------
+// Personal API keys (MCP access)
+// ---------------------------------------------------------------------------
+
+/// Live (unrevoked) keys one user may hold.
+const MAX_LIVE_API_KEYS: i64 = 25;
+
+/// One row of the caller's key list. Hand-built from `ApiKey`, which has no
+/// `Serialize` on purpose: the hash can never be reached by a derive.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ApiKeyView {
+    pub id: Uuid,
+    pub name: String,
+    /// First 17 characters of the token, enough to recognise a key.
+    pub prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// `expires_at <= now`. Expired keys stay listed until revoked.
+    pub expired: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateApiKeyReq {
+    /// 1-64 characters after trimming.
+    pub name: String,
+    /// One of `30d`, `90d`, `1y`, `never`.
+    pub expiry: String,
+}
+
+/// Returned once, at creation. The only response that ever carries `token`.
+///
+/// `Debug` is hand-written so the plaintext token can never reach a log line
+/// through `{:?}` (a `tracing` field, a panic message, a test failure).
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct CreatedApiKey {
+    pub key: ApiKeyView,
+    pub token: String,
+}
+
+impl std::fmt::Debug for CreatedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedApiKey")
+            .field("key", &self.key)
+            .field("token", &sauron_auth::api_key::REDACTED_TOKEN)
+            .finish()
+    }
+}
+
+fn api_key_view(k: &sauron_db::models::ApiKey) -> ApiKeyView {
+    ApiKeyView {
+        id: k.id,
+        name: k.name.clone(),
+        prefix: k.token_prefix.clone(),
+        created_at: k.created_at,
+        expires_at: k.expires_at,
+        last_used_at: k.last_used_at,
+        expired: k.expires_at.is_some_and(|t| t <= Utc::now()),
+    }
+}
+
+fn parse_api_key_expiry(expiry: &str) -> Result<Option<DateTime<Utc>>, ApiError> {
+    let days = match expiry {
+        "30d" => 30,
+        "90d" => 90,
+        "1y" => 365,
+        "never" => return Ok(None),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "expiry must be one of 30d, 90d, 1y, never".into(),
+            ))
+        }
+    };
+    Ok(Some(Utc::now() + chrono::Duration::days(days)))
+}
+
+/// `access_key.create`'s changes: the key's fields as `{from: null, to: …}`.
+fn api_key_created_changes(k: &sauron_db::models::ApiKey) -> serde_json::Value {
+    audit::created(
+        entity::ACCESS_KEY,
+        &[
+            ("name", serde_json::json!(k.name)),
+            ("prefix", serde_json::json!(k.token_prefix)),
+            ("expires_at", serde_json::json!(k.expires_at)),
+        ],
+    )
+}
+
+/// `access_key.revoke`'s changes: the same fields as `{from: …, to: null}`,
+/// the removal shape every delete in the trail uses (`role.delete`,
+/// `grant.delete`, `monitor.delete`), so the Wall of Shame shows the key
+/// going away rather than a second creation. `diff` drops a pair whose sides
+/// are equal, so a never-expiring key's `expires_at` (null before and after)
+/// is left out.
+fn api_key_revoked_changes(k: &sauron_db::models::ApiKey) -> serde_json::Value {
+    audit::diff(
+        entity::ACCESS_KEY,
+        &[
+            ("name", serde_json::json!(k.name), serde_json::Value::Null),
+            (
+                "prefix",
+                serde_json::json!(k.token_prefix),
+                serde_json::Value::Null,
+            ),
+            (
+                "expires_at",
+                serde_json::json!(k.expires_at),
+                serde_json::Value::Null,
+            ),
+        ],
+    )
+}
+
+/// `GET /v1/me/api-keys`
+#[utoipa::path(
+    get,
+    path = "/v1/me/api-keys",
+    tag = "Account",
+    summary = "List your personal API keys",
+    description = "\
+Unrevoked keys for the calling user (expired ones included), newest first. \
+Only the display prefix is returned; the token itself is shown once, at \
+creation.",
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "The caller's unrevoked keys (expired ones included).", body = Vec<ApiKeyView>),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+    ),
+)]
+pub async fn list_api_keys(
+    auth: AuthUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiKeyView>>, ApiError> {
+    let mut conn = db(&state).await?;
+    let rows = sauron_db::api_keys::list_for_user(&mut conn, auth.user_id).await?;
+    Ok(Json(rows.iter().map(api_key_view).collect()))
+}
+
+/// `POST /v1/me/api-keys`
+#[utoipa::path(
+    post,
+    path = "/v1/me/api-keys",
+    tag = "Account",
+    summary = "Create a personal API key",
+    description = "\
+Mints a key for the read-only MCP endpoint. The `token` in the response is \
+shown **once** and cannot be retrieved later. At most 25 unrevoked keys per user \
+(expired keys count until revoked).",
+    request_body = CreateApiKeyReq,
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 201, description = "Key created.", body = CreatedApiKey),
+        (status = 400, description = "Bad name or expiry.", body = ErrorResponse),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+        (status = 409, description = "The caller already has 25 unrevoked keys (expired ones included).", body = ErrorResponse),
+        (status = 429, description = "Too many key actions in a short window.", body = ErrorResponse),
+    ),
+)]
+pub async fn create_api_key(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(req): Json<CreateApiKeyReq>,
+) -> Result<(StatusCode, Json<CreatedApiKey>), ApiError> {
+    rate_limit(
+        &state,
+        &format!("sauron:auth:apikeys:{}", auth.user_id),
+        SESSION_ACTIONS_PER_MIN,
+        60,
+    )
+    .await?;
+
+    let name = req.name.trim();
+    let len = name.chars().count();
+    if !(1..=64).contains(&len) {
+        return Err(ApiError::BadRequest("name must be 1-64 characters".into()));
+    }
+    let expires_at = parse_api_key_expiry(&req.expiry)?;
+
+    let mut conn = db(&state).await?;
+    if sauron_db::api_keys::count_live_for_user(&mut conn, auth.user_id).await? >= MAX_LIVE_API_KEYS
+    {
+        // `count_live_for_user` counts unrevoked keys, expired ones included
+        // (they stay listed until revoked), so the message says so.
+        return Err(ApiError::Conflict(
+            "you already have 25 unrevoked keys (expired keys count too); revoke one first".into(),
+        ));
+    }
+    let minted = sauron_auth::api_key::mint_api_key();
+    let key = sauron_db::api_keys::insert(
+        &mut conn,
+        auth.user_id,
+        name,
+        &minted.prefix,
+        &minted.hash,
+        expires_at,
+    )
+    .await?;
+
+    audit::record_for_user_orgs(
+        &mut conn,
+        auth.user_id,
+        Entry::new(Uuid::nil(), action::ACCESS_KEY_CREATE, entity::ACCESS_KEY)
+            .target(key.id, &key.name)
+            .changes(api_key_created_changes(&key)),
+    )
+    .await;
+    drop(conn);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedApiKey {
+            key: api_key_view(&key),
+            token: minted.token,
+        }),
+    ))
+}
+
+/// `DELETE /v1/me/api-keys/{key_id}`
+#[utoipa::path(
+    delete,
+    path = "/v1/me/api-keys/{key_id}",
+    tag = "Account",
+    summary = "Revoke one of your personal API keys",
+    description = "Revokes the key immediately. A missing, foreign or already-revoked key is a 404.",
+    params(("key_id" = Uuid, Path, description = "Key to revoke, from `GET /v1/me/api-keys`.")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "Key revoked.", body = OkResponse),
+        (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
+        (status = 404, description = "No such live key, or it belongs to another user.", body = ErrorResponse),
+        (status = 429, description = "Too many key actions in a short window.", body = ErrorResponse),
+    ),
+)]
+pub async fn delete_api_key(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(key_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    rate_limit(
+        &state,
+        &format!("sauron:auth:apikeys:{}", auth.user_id),
+        SESSION_ACTIONS_PER_MIN,
+        60,
+    )
+    .await?;
+
+    let mut conn = db(&state).await?;
+    let key = sauron_db::api_keys::revoke(&mut conn, auth.user_id, key_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    audit::record_for_user_orgs(
+        &mut conn,
+        auth.user_id,
+        Entry::new(Uuid::nil(), action::ACCESS_KEY_REVOKE, entity::ACCESS_KEY)
+            .target(key.id, &key.name)
+            .changes(api_key_revoked_changes(&key)),
+    )
+    .await;
+    drop(conn);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +582,63 @@ mod tests {
             assert_eq!(browser, None, "browser for {ua:?}");
             assert_eq!(os, None, "os for {ua:?}");
             assert_eq!(kind, None, "device_kind for {ua:?}");
+        }
+    }
+
+    fn api_key(expires_at: Option<DateTime<Utc>>) -> sauron_db::models::ApiKey {
+        let now = Utc::now();
+        sauron_db::models::ApiKey {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            name: "laptop".into(),
+            token_prefix: "sauron_pat_abc123".into(),
+            token_hash: "0".repeat(64),
+            created_at: now,
+            expires_at,
+            last_used_at: None,
+            revoked_at: None,
+        }
+    }
+
+    /// A revoke reads as a removal (`{from: value, to: null}`), the shape
+    /// every delete in the trail uses, not as a second creation.
+    #[test]
+    fn api_key_revoke_is_audited_as_a_removal_not_a_creation() {
+        let exp: DateTime<Utc> = "2027-01-01T00:00:00Z".parse().unwrap();
+        let k = api_key(Some(exp));
+        let created = api_key_created_changes(&k);
+        assert_eq!(
+            created["name"],
+            serde_json::json!({"from": null, "to": "laptop"})
+        );
+        let revoked = api_key_revoked_changes(&k);
+        assert_eq!(
+            revoked["name"],
+            serde_json::json!({"from": "laptop", "to": null})
+        );
+        assert_eq!(
+            revoked["prefix"],
+            serde_json::json!({"from": "sauron_pat_abc123", "to": null})
+        );
+        assert_eq!(revoked["expires_at"]["from"], serde_json::json!(exp));
+        assert!(revoked["expires_at"]["to"].is_null());
+        // A never-expiring key has nothing to say about expiry on revoke.
+        let never = api_key_revoked_changes(&api_key(None));
+        assert!(never.get("expires_at").is_none(), "{never}");
+        assert_eq!(never["name"]["to"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn created_api_key_debug_redacts_the_token() {
+        let minted = sauron_auth::api_key::mint_api_key();
+        let created = CreatedApiKey {
+            key: api_key_view(&api_key(None)),
+            token: minted.token.clone(),
+        };
+        for shown in [format!("{created:?}"), format!("{created:#?}")] {
+            assert!(!shown.contains(&minted.token), "{shown}");
+            assert!(shown.contains("sauron_pat_…[redacted]"), "{shown}");
+            assert!(shown.contains("laptop"), "the rest still prints: {shown}");
         }
     }
 

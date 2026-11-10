@@ -49,8 +49,8 @@ Source50:       libduckdb.so
 Source51:       sauron-prebuilt.tar.gz
 %endif
 
-BuildRequires:  cargo >= 1.82
-BuildRequires:  rust >= 1.82
+BuildRequires:  cargo >= 1.88
+BuildRequires:  rust >= 1.88
 # Only a C compiler + perl remain (ring's C/asm). DuckDB is linked prebuilt (no
 # C++ amalgamation), reqwest uses the ring TLS backend (no aws-lc/cmake/clang), and
 # zstd links the system library via pkgconfig(libzstd) — so gcc-c++, cmake and

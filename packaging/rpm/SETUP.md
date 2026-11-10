@@ -354,13 +354,38 @@ sudo bash /usr/share/doc/sauron-server/post-upgrade.sh
 ```
 
 Run it inside tmux/screen (the first rollup backfill can take an hour+). Note
-that since v1.8.8 `sauron-ingest` runs every backfill by itself once it starts
-(resumable; `ROLLUP_AUTO_BACKFILL=0` opts out), so steps 2 and 3 are only a way
+that since v1.8.8 `sauron-ingest` runs every rollup backfill by itself once it
+starts (resumable; `ROLLUP_AUTO_BACKFILL=0` opts out; not `backfill-issue-stats`,
+see below), so steps 2 and 3 are only a way
 to front-load that work before the daemons come up — skipping them no longer
 leaves the analytics pages on the slow legacy queries. It
 refuses to run against a sauron-migrate binary that silently ignores unknown
 arguments (releases before strict argument checking), so it cannot no-op the
 way a hand-typed command against a stale binary once did.
+
+**The MCP issue-stats backfill is operator-run, and nothing else runs it.**
+Neither `post-upgrade.sh` nor `sauron-ingest` runs `backfill-issue-stats`. On a
+host upgraded to the release that added the MCP server, run it once by hand,
+inside tmux/screen:
+
+```bash
+sudo -u sauron bash -c 'set -a; . /etc/sauron/sauron.env; set +a; exec sauron-migrate backfill-issue-stats'
+```
+
+Without it, apps created before the upgrade answer MCP `trending_issues` with a
+`Fallback ranking:` (no in-window counts, no trend). It is safe to re-run and
+covers only history still in Postgres. See the wiki page "AI Assistants (MCP)"
+for details.
+
+`backfill-users-seen` is operator-run too (nothing runs it): run it once after
+upgrading, the same way (`... exec sauron-migrate backfill-users-seen`), to
+repair issue user counts that went stale under earlier releases. It reads
+`REDIS_URL` from `sauron.env`, only ever raises a count, and is safe to re-run
+with ingest up. Run it again after any `sauron-ingest` outage longer than
+about 10 minutes (shorter restarts are re-checked automatically at startup).
+It can raise a count a data purge lowered, since the user sketch cannot forget
+purged users: an overcount, the safe direction. If its summary says most
+issues had no user sketch, check `REDIS_URL` and its db index.
 
 **Upgrading from v1.7.3 or older across the sessions partitioning (migration
 0073): read this first.** 0073 rewrites the whole `sessions` table — rename,

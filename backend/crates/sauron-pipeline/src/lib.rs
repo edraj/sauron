@@ -16,6 +16,7 @@ pub mod releases;
 pub mod retry;
 pub mod rollup_task;
 pub mod symbolize;
+pub mod users_seen;
 pub mod worker;
 
 pub use process::process_job;

@@ -42,6 +42,7 @@ use uuid::Uuid;
 use crate::sketch::{Hll, LatencyHistogram};
 
 pub mod fold;
+pub mod issue_stats;
 pub mod person_days;
 pub mod read;
 pub mod release;
@@ -50,6 +51,11 @@ pub use person_days::{add_person_days, PersonDayDelta, PersonKey};
 
 pub const SRC_ANALYTICS: &str = "analytics_events";
 pub const SRC_ERRORS: &str = "error_events";
+/// `issue_stats_hourly`'s own received_at watermark (migration 84). A second
+/// fold over `error_events`, deliberately NOT in [`EVENT_SOURCES`]: the base
+/// rollups' `as_of` must not wait on it, and the base additive backfill must
+/// never write its table (see [`issue_stats`]).
+pub const SRC_ISSUE_STATS: &str = "issue_stats";
 pub const SRC_TRANSACTIONS: &str = "transactions";
 pub const SRC_SESSIONS: &str = "sessions";
 /// The received_at-watermarked sources (sessions is a recompute stamp).
@@ -138,7 +144,8 @@ pub async fn analyze_rollup_tables(conn: &mut AsyncPgConnection) -> diesel::Quer
                  screen_stats_daily, journey_nodes_daily, journey_links_daily, \
                  perf_agg_hourly, session_stats_daily, user_activity_daily, \
                  event_top_daily, device_sessions_daily, person_releases, \
-                 user_activity_release_daily, session_stats_release_daily",
+                 user_activity_release_daily, session_stats_release_daily, \
+                 issue_stats_hourly",
     )
     .execute(conn)
     .await

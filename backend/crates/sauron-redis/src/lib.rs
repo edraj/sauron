@@ -876,6 +876,24 @@ impl RedisStore {
         Ok(n)
     }
 
+    /// One `PFCOUNT` PER KEY, pipelined into a single round trip; the counts
+    /// come back in `keys` order. A missing key counts 0.
+    ///
+    /// Not `PFCOUNT k1 k2 …`: with several keys Redis answers the cardinality
+    /// of their UNION, one number, which is a different question.
+    pub async fn pf_count_each(&self, keys: &[String]) -> anyhow::Result<Vec<i64>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for k in keys {
+            pipe.cmd("PFCOUNT").arg(k);
+        }
+        let mut c = self.conn.clone();
+        let counts: Vec<i64> = pipe.query_async(&mut c).await?;
+        Ok(counts)
+    }
+
     // --- breadcrumb buffer ------------------------------------------------
 
     /// Push breadcrumbs (JSON) onto a capped, expiring per-person list.
@@ -1323,6 +1341,18 @@ mod hll_tests {
         // Empty is a no-op, not a malformed `PFADD key` with no arguments.
         assert!(!redis.pf_add_many(&key, &[]).await.unwrap());
         assert_eq!(redis.pf_count(&key).await.unwrap(), 5);
+
+        // The pipelined form answers per key, in order — NOT the union that
+        // `PFCOUNT k1 k2` would give (which here would be 5, not [5, 0, 5]).
+        let missing = format!("sauron:test:hll:{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            redis
+                .pf_count_each(&[key.clone(), missing, key.clone()])
+                .await
+                .unwrap(),
+            vec![5, 0, 5]
+        );
+        assert!(redis.pf_count_each(&[]).await.unwrap().is_empty());
 
         let mut c = redis.conn.clone();
         let _: () = redis::cmd("DEL")

@@ -1106,7 +1106,7 @@ pub async fn schema(
 /// a failed schema request: the input stays usable and the reader types the key
 /// themselves. Every error path here therefore returns an empty list rather
 /// than propagating.
-async fn load_tag_keys(
+pub(crate) async fn load_tag_keys(
     state: &AppState,
     conn: &mut sauron_db::pool::PgConn,
     app_id: Uuid,

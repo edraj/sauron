@@ -59,8 +59,13 @@ services:
         BIN: sauron-migrate
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-sauron}:${POSTGRES_PASSWORD:-sauron}@postgres:5432/${POSTGRES_DB:-sauron}
+      # Read only by `backfill-users-seen` (`docker compose run --rm migrate
+      # backfill-users-seen`); the no-argument migrate path never touches Redis.
+      REDIS_URL: redis://redis:6379
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: "no"
 

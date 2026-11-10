@@ -16,6 +16,7 @@
   import { pageRefresher } from '../lib/stores/page-refresh.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
   import ConfirmDialog from '../lib/components/ui/ConfirmDialog.svelte';
+  import ApiKeys from '../lib/components/account/ApiKeys.svelte';
   import NotificationSubscriptions from '../lib/components/account/NotificationSubscriptions.svelte';
   import LanguagePicker from '../lib/components/account/LanguagePicker.svelte';
   import { authStore } from '../lib/stores/auth.svelte';
@@ -142,7 +143,10 @@
   // This page used an inline `() => void load(true)` handler, which forced the
   // client cache but never the server's and reported completion the instant the
   // call was made rather than when it landed.
-  const refresher = pageRefresher(() => load(true));
+  let apiKeysCard = $state<{ refresh: () => Promise<void> } | undefined>();
+  const refresher = pageRefresher(async () => {
+    await Promise.all([load(true), apiKeysCard?.refresh()]);
+  });
 
   // Not forced: flipping the toggle should paint a cached list for the new key
   // instantly. The effect below re-runs on `showRevoked` too, but both calls
@@ -404,6 +408,8 @@
         {/if}
       {/if}
     </Card>
+
+    <ApiKeys bind:this={apiKeysCard} />
 
     <NotificationSubscriptions />
   </div>

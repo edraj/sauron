@@ -85,7 +85,7 @@ use sauron_auth::rbac::{grants_from_rows, reach_for};
 use sauron_auth::{authorize_app, authorize_project, perm, AuthError, AuthUser};
 use sauron_core::ids;
 use sauron_db::models::{AppEnvironment, AppEnvironmentView, Environment, NewAppEnvironment};
-use sauron_db::repo;
+use sauron_db::{repo, AsyncPgConnection};
 use sauron_redis::keys;
 
 use super::db;
@@ -532,22 +532,49 @@ pub async fn list_app_environments(
         super::scope::raw_environment_id(raw_query.as_deref()).as_deref(),
     )?;
     let mut conn = db(&state).await?;
+    Ok(Json(
+        reachable_app_environments(&mut conn, auth.user_id, app_id, q.include_retired).await?,
+    ))
+}
+
+/// The app's LIVE enrollments that `user_id` may see, for the MCP
+/// `list_apps` tool: `list_app_environments` without `include_retired`, from
+/// the same rule. Each row still carries the ingest `public_key`; a caller
+/// that renders text must leave it out.
+///
+/// `NotFound` for an unknown app; `Forbidden` when the user holds no grant in
+/// its org, or reaches none of its environments.
+pub(crate) async fn visible_app_environments(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+) -> Result<Vec<AppEnvironmentView>, ApiError> {
+    reachable_app_environments(conn, user_id, app_id, false).await
+}
+
+/// `list_app_environments`' body.
+async fn reachable_app_environments(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+    include_retired: bool,
+) -> Result<Vec<AppEnvironmentView>, ApiError> {
     // Same shape as `list_apps`, one level down: `authorize_app` gates on a
     // fixed (org, project, app, None) target that an env-scoped grant can
     // never satisfy, so an env-scoped member would 403 from the very endpoint
     // that populates their environment picker.
-    let (project_id, org_id) = repo::app_ancestry(&mut conn, app_id)
+    let (project_id, org_id) = repo::app_ancestry(conn, app_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let rows = repo::user_grants_in_org(&mut conn, auth.user_id, org_id).await?;
+    let rows = repo::user_grants_in_org(conn, user_id, org_id).await?;
     if rows.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
     }
     let grants = grants_from_rows(rows);
     let reach = reach_for(&grants, perm::ENV_READ);
-    let all = repo::list_app_environments(&mut conn, app_id, q.include_retired).await?;
+    let all = repo::list_app_environments(conn, app_id, include_retired).await?;
     if reach.org || reach.projects.contains(&project_id) || reach.apps.contains(&app_id) {
-        return Ok(Json(all));
+        return Ok(all);
     }
 
     // `reach.envs` holds enrollment ids, which is exactly what these rows are
@@ -561,7 +588,7 @@ pub async fn list_app_environments(
     if mine.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
     }
-    Ok(Json(mine))
+    Ok(mine)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

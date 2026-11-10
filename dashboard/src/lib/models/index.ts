@@ -43,6 +43,11 @@ export interface RegisterPayload {
   org_name: string;
 }
 
+/** `GET/PATCH /v1/orgs/{id}/settings`. */
+export interface OrgSettings {
+  mcp_enabled: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Orgs, projects & apps
 // ---------------------------------------------------------------------------
@@ -51,6 +56,8 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+  /** Whether members may use personal API keys with the MCP server. */
+  mcp_enabled: boolean;
   created_at: string;
   updated_at: string;
   /**
@@ -237,6 +244,26 @@ export interface AccountSession {
   /** Only ever set on rows returned with `?include_revoked=1`. */
   revoked_at: string | null;
   revoked_reason: string | null;
+}
+
+/** Lifetime choices for a personal API key; the server validates the same set. */
+export type ApiKeyExpiry = '30d' | '90d' | '1y' | 'never';
+
+/** One row of GET /v1/me/api-keys. Never carries the token, only its display prefix. */
+export interface ApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  expired: boolean;
+}
+
+/** POST /v1/me/api-keys response. `token` exists nowhere else, ever. */
+export interface CreatedApiKey {
+  key: ApiKey;
+  token: string;
 }
 
 // ---------------------------------------------------------------------------

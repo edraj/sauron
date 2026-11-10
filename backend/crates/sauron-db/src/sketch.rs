@@ -199,15 +199,12 @@ impl LatencyHistogram {
     }
 
     /// Tolerant decode: shorter blobs read as zero-padded, longer are
-    /// truncated — a schema that grows buckets later stays readable.
-    // clippy suggests `as_chunks`, which is Rust 1.88+; workspace MSRV is 1.82.
-    // The lint itself is clippy 1.98+, so older toolchains need unknown_lints.
-    #[allow(unknown_lints)]
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    /// truncated — a schema that grows buckets later stays readable. A
+    /// trailing partial bucket (fewer than 8 bytes) is ignored.
     pub fn counts_from_bytes(b: &[u8]) -> Vec<i64> {
         let mut counts = vec![0i64; HIST_BUCKETS];
-        for (i, chunk) in b.chunks_exact(8).enumerate().take(HIST_BUCKETS) {
-            counts[i] = i64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        for (i, chunk) in b.as_chunks::<8>().0.iter().enumerate().take(HIST_BUCKETS) {
+            counts[i] = i64::from_le_bytes(*chunk);
         }
         counts
     }

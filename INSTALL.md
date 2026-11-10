@@ -62,12 +62,12 @@ sudo dnf install -y rust cargo gcc perl-interpreter libzstd-devel nodejs npm rpm
 ./packaging/rpm/build-rpm.sh
 ```
 
-Fedora's own `rust`/`cargo` are new enough (1.98 on Fedora 44, against a 1.82 floor). No C++
+Fedora's own `rust`/`cargo` are new enough (1.98 on Fedora 44, against a 1.88 floor). No C++
 toolchain is needed — DuckDB is linked against a prebuilt `libduckdb` that `build-rpm.sh`
 fetches, rather than compiled from its C++ amalgamation.
 
 > Using **rustup or nvm** instead of the distro packages? `rpmbuild` resolves `BuildRequires`
-> against the RPM *database*, not `$PATH`, so it reports `cargo >= 1.82 is needed` even though
+> against the RPM *database*, not `$PATH`, so it reports `cargo >= 1.88 is needed` even though
 > `cargo` works in your shell. `build-rpm.sh` detects this and adds `--nodeps` for you; your
 > toolchain still does the build.
 
@@ -107,14 +107,14 @@ Build on the distribution you intend to run on.
 **1. Build**
 
 Unlike Fedora, **neither target ships a usable toolchain** — Debian 12 has rustc 1.63 and Node
-18, Ubuntu 22.04 has rustc 1.75 and Node 12, against floors of Rust 1.82 and Node 22. Installing
+18, Ubuntu 22.04 has rustc 1.75 and Node 12, against floors of Rust 1.88 and Node 22. Installing
 the distro `rustc`/`nodejs` packages will not work; use rustup and NodeSource, which is what CI
 does:
 
 ```bash
 sudo apt-get install -y debhelper dpkg-dev gcc libc6-dev perl pkg-config libzstd-dev curl unzip git
 
-# Rust >= 1.82
+# Rust >= 1.88
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh
 sh rustup-init.sh -y --profile minimal --default-toolchain stable
 . "$HOME/.cargo/env"
@@ -244,5 +244,8 @@ and watch the first event land.
   Postgres and Redis, secrets, migrations, enabling the PII inspector and transactional email,
   firewalling, troubleshooting, and the upgrade procedure. Written against the RPM layout, but
   every path is identical on the `.deb`, so it applies unchanged there.
+- **[AI assistants (MCP)](wiki/AI-Assistants-MCP.md)** — connect Claude Code to Sauron with a
+  personal API key (read-only tools; upgraded hosts need a one-time `sauron-migrate backfill-issue-stats`
+  and `sauron-migrate backfill-users-seen`).
 - **[README.md](README.md)** — architecture, SDK setup, the query language, and the full
   configuration table.

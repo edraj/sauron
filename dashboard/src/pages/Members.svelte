@@ -16,6 +16,7 @@
   import EditMemberDialog from '../lib/components/members/EditMemberDialog.svelte';
   import ResetPasswordDialog from '../lib/components/members/ResetPasswordDialog.svelte';
   import ChangeEmailDialog from '../lib/components/members/ChangeEmailDialog.svelte';
+  import OrgAiAccessCard from '../lib/components/members/OrgAiAccessCard.svelte';
   import MembersTable from '../lib/components/members/MembersTable.svelte';
   import ScopeTree from '../lib/components/members/ScopeTree.svelte';
   import { sessionStore } from '../lib/stores/session.svelte';
@@ -517,6 +518,7 @@
     />
   {:else}
     <div class="stack">
+      <OrgAiAccessCard />
       <Card>
         {#snippet header()}
           <h3 class="grant-title">{t('members.grantAccess')}</h3>

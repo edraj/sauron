@@ -1473,9 +1473,8 @@ pub async fn reset_password(
     // The expensive work sits BEFORE the burn: a failed Argon2 must not eat the
     // user's only link, and a crash between the burn and the password write
     // must leave the account unchanged. The burn itself is one atomic
-    // `UPDATE … RETURNING`, which is how single-use is enforced without
-    // `conn.transaction` (async closures need Rust 1.85; workspace MSRV is
-    // 1.82 per packaging/rpm/sauron.spec).
+    // `UPDATE … RETURNING`, which is how single-use is enforced without an
+    // explicit transaction or `SELECT … FOR UPDATE`.
     let Some((user_id, _fingerprint, _mode)) =
         repo::consume_password_reset_token(&mut conn, &hash).await?
     else {
@@ -1618,10 +1617,9 @@ pub async fn change_password(
     // device, which is correct when the old credential may be known to whoever
     // generated it.
     //
-    // The order (revoke, then set password, then issue) is deliberate and not
-    // a transaction: `conn.transaction` needs async closures, which need Rust
-    // 1.85+, and this workspace's MSRV is 1.82 per packaging/rpm/sauron.spec.
-    // If the revoke fails, the caller is still on the temp password —
+    // The order (revoke, then set password, then issue) is deliberate, and it
+    // is what keeps a partial failure safe without a transaction around the
+    // three steps. If the revoke fails, the caller is still on the temp password —
     // recoverable, since they log in again with it and remain flagged. The
     // reverse order would leave the password changed but every old session
     // (including one held by whoever handed out the temp credential) still

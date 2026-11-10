@@ -153,6 +153,19 @@ async fn run_cycle(pool: &PgPool, upto: chrono::DateTime<Utc>, name_cap: usize) 
             }
         }
     }
+    // issue_stats_hourly: a second pass over error_events behind its own
+    // watermark. Its own loop (not folded into fold_errors) so a failure here
+    // never holds back the base error rollups, and vice versa.
+    for _ in 0..MAX_DRAIN_PASSES {
+        match rollups::fold::fold_issue_stats(&mut conn, upto).await {
+            Ok(Some(o)) if !o.caught_up => continue,
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "issue stats fold failed");
+                break;
+            }
+        }
+    }
     for _ in 0..MAX_DRAIN_PASSES {
         match rollups::fold::fold_transactions(&mut conn, upto, name_cap).await {
             Ok(Some(o)) if !o.caught_up => continue,
@@ -168,6 +181,58 @@ async fn run_cycle(pool: &PgPool, upto: chrono::DateTime<Utc>, name_cap: usize) 
     {
         warn!(error = %e, "session recompute failed");
     }
+}
+
+/// How one drifted day is healed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// Only `issue_stats` drifted: replace that day's `issue_stats_hourly`
+    /// (`issue_stats::replace_day_locked`) and leave every other rollup alone.
+    IssueStatsOnly,
+    /// Another source drifted: rebuild every rollup of the day from raw
+    /// (`fold_day_from_raw`), which replaces `issue_stats_hourly` too.
+    FullDay,
+}
+
+/// One day of the heal plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DayHeal {
+    day: NaiveDate,
+    rebuild: Rebuild,
+    /// The day's drift descriptions, joined, for the log line.
+    drift: String,
+}
+
+/// The sweep's drift list as one heal per day, in first-seen order. A day on
+/// which several sources drifted is rebuilt ONCE (the full rebuild covers them
+/// all), and a day on which only `issue_stats` drifted gets the targeted
+/// replace instead of a rebuild of every rollup table. The source is read with
+/// `fold::drift_source`, the inverse of the `fold::drift_desc` the sweep
+/// writes; a description it cannot parse fails safe to a full rebuild.
+fn heal_plan(drifts: &[(NaiveDate, String)]) -> Vec<DayHeal> {
+    let mut plan: Vec<DayHeal> = Vec::new();
+    for (day, desc) in drifts {
+        let rebuild = if rollups::fold::drift_source(desc) == Some(rollups::SRC_ISSUE_STATS) {
+            Rebuild::IssueStatsOnly
+        } else {
+            Rebuild::FullDay
+        };
+        match plan.iter_mut().find(|h| h.day == *day) {
+            Some(h) => {
+                if rebuild == Rebuild::FullDay {
+                    h.rebuild = Rebuild::FullDay;
+                }
+                h.drift.push_str("; ");
+                h.drift.push_str(desc);
+            }
+            None => plan.push(DayHeal {
+                day: *day,
+                rebuild,
+                drift: desc.clone(),
+            }),
+        }
+    }
+    plan
 }
 
 /// Daily: compare yesterday's rollups against raw counts, rebuild drifted
@@ -211,19 +276,42 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
                 "tier floor probe failed; deferring day rebuilds"
             ),
             Ok(floor) => {
-                for (day, what) in drifts {
+                for DayHeal {
+                    day,
+                    rebuild,
+                    drift,
+                } in heal_plan(&drifts)
+                {
                     // Belt to the sweep's own clamp: a partition can be
                     // dropped between the check and this rebuild.
                     let start = day.and_hms_opt(0, 0, 0).expect("valid").and_utc();
                     if floor.is_some_and(|f| start < f) {
-                        warn!(day = %day, drift = %what, "drift on a tiered-out day; NOT rebuilding (raw is cold-only)");
+                        warn!(day = %day, drift = %drift, "drift on a tiered-out day; NOT rebuilding (raw is cold-only)");
                         continue;
                     }
-                    warn!(day = %day, drift = %what, "rollup drift detected; rebuilding day");
-                    if let Err(e) =
-                        rollups::fold::fold_day_from_raw(&mut conn, day, None, true, name_cap).await
-                    {
-                        warn!(day = %day, error = %e, "rollup day rebuild failed");
+                    match rebuild {
+                        Rebuild::IssueStatsOnly => {
+                            warn!(day = %day, drift = %drift, "issue_stats drift detected; replacing the day's issue_stats_hourly");
+                            match rollups::issue_stats::replace_day_locked(&mut conn, day).await {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    warn!(day = %day, "issue_stats day below the error_events tier floor; NOT replaced")
+                                }
+                                Err(e) => {
+                                    warn!(day = %day, error = %e, "issue_stats day replace failed")
+                                }
+                            }
+                        }
+                        Rebuild::FullDay => {
+                            warn!(day = %day, drift = %drift, "rollup drift detected; rebuilding day");
+                            if let Err(e) = rollups::fold::fold_day_from_raw(
+                                &mut conn, day, None, true, name_cap,
+                            )
+                            .await
+                            {
+                                warn!(day = %day, error = %e, "rollup day rebuild failed");
+                            }
+                        }
                     }
                 }
             }
@@ -304,5 +392,70 @@ async fn maintenance(pool: &PgPool, cfg: RollupCfg) {
         Ok(n) if n > 0 => info!(pruned = n, "person-days past the horizon pruned"),
         Ok(_) => {}
         Err(e) => warn!(error = %e, "person-days prune failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(s: &str) -> NaiveDate {
+        s.parse().expect("date")
+    }
+
+    /// Built by the producer itself, so these tests follow its format.
+    fn drift(day: &str, source: &str) -> (NaiveDate, String) {
+        (d(day), rollups::fold::drift_desc(source, 9, 1))
+    }
+
+    #[test]
+    fn an_unparsed_description_fails_safe_to_a_full_rebuild() {
+        for desc in ["issue_stats", "issue_stats: drifted", ""] {
+            let plan = heal_plan(&[(d("2026-11-01"), desc.to_string())]);
+            assert_eq!(plan.len(), 1, "{desc:?}");
+            assert_eq!(plan[0].rebuild, Rebuild::FullDay, "{desc:?}");
+        }
+    }
+
+    #[test]
+    fn an_issue_stats_only_day_gets_the_targeted_replace() {
+        let plan = heal_plan(&[drift("2026-11-01", rollups::SRC_ISSUE_STATS)]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].day, d("2026-11-01"));
+        assert_eq!(plan[0].rebuild, Rebuild::IssueStatsOnly);
+    }
+
+    #[test]
+    fn a_day_is_healed_once_and_any_base_drift_makes_it_a_full_rebuild() {
+        let plan = heal_plan(&[
+            // issue_stats first: the later base label must still upgrade it.
+            drift("2026-11-02", rollups::SRC_ISSUE_STATS),
+            drift("2026-11-02", rollups::SRC_ERRORS),
+            drift("2026-11-02", rollups::SRC_ANALYTICS),
+            drift("2026-11-01", rollups::SRC_TRANSACTIONS),
+            drift("2026-11-01", rollups::SRC_ISSUE_STATS),
+            drift("2026-10-31", rollups::SRC_ISSUE_STATS),
+        ]);
+        let shape: Vec<(NaiveDate, Rebuild)> = plan.iter().map(|h| (h.day, h.rebuild)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (d("2026-11-02"), Rebuild::FullDay),
+                (d("2026-11-01"), Rebuild::FullDay),
+                (d("2026-10-31"), Rebuild::IssueStatsOnly),
+            ],
+            "one heal per day, in the sweep's order"
+        );
+        assert_eq!(
+            plan[0].drift,
+            "issue_stats: raw 9 vs rollup 1; error_events: raw 9 vs rollup 1; \
+             analytics_events: raw 9 vs rollup 1",
+            "every drift of the day stays in the log line"
+        );
+    }
+
+    #[test]
+    fn no_drift_no_heals() {
+        assert!(heal_plan(&[]).is_empty());
     }
 }

@@ -1092,3 +1092,167 @@ async fn granting_a_user_who_is_already_a_member_of_this_org_still_works() {
 
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// GET/PATCH /v1/orgs/{org_id}/settings — the org-level MCP switch.
+// ---------------------------------------------------------------------------
+
+#[derive(diesel::QueryableByName)]
+struct SettingsAuditRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    action: String,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    changes: Value,
+}
+
+/// `org.settings_update` rows of `org_id`, oldest first.
+async fn settings_audit_rows(server: &TestServer, org_id: Uuid) -> Vec<SettingsAuditRow> {
+    use diesel_async::RunQueryDsl;
+    let mut conn = server.conn().await;
+    let rows = diesel::sql_query(
+        "SELECT action, changes FROM audit_log WHERE org_id = $1 \
+         AND action = 'org.settings_update' ORDER BY created_at",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(org_id)
+    .load::<SettingsAuditRow>(&mut conn)
+    .await
+    .expect("query audit_log");
+    drop(conn);
+    rows
+}
+
+#[tokio::test]
+async fn org_settings_default_mcp_enabled_true() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (email, _uid, org_id) = register_owner(&server, "setdef").await;
+    let access = server.login(&email, PASSWORD).await;
+
+    let body = server
+        .get_json(&format!("/v1/orgs/{org_id}/settings"), &access)
+        .await;
+    assert_eq!(body["mcp_enabled"], json!(true), "body: {body}");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn org_settings_patch_requires_org_manage() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (owner_email, _uid, org_id) = register_owner(&server, "setperm").await;
+    let owner_access = server.login(&owner_email, PASSWORD).await;
+    let weak_role = seed_role(&server, org_id, &[perm::MEMBER_READ]).await;
+    let (_weak_id, weak_access) = seed_sole_holder(&server, org_id, weak_role, "weak").await;
+
+    let (status, body) = server
+        .patch_status_json(
+            &format!("/v1/orgs/{org_id}/settings"),
+            &weak_access,
+            json!({ "mcp_enabled": false }),
+        )
+        .await;
+    assert_eq!(status, 403, "body: {body}");
+
+    // Any member may READ it, and it did not change.
+    let read = server
+        .get_json(&format!("/v1/orgs/{org_id}/settings"), &weak_access)
+        .await;
+    assert_eq!(read["mcp_enabled"], json!(true), "body: {read}");
+
+    // Discriminator: the owner can flip it.
+    let (status, body) = server
+        .patch_status_json(
+            &format!("/v1/orgs/{org_id}/settings"),
+            &owner_access,
+            json!({ "mcp_enabled": false }),
+        )
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["mcp_enabled"], json!(false));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn org_settings_patch_is_audited_with_diff() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (email, _uid, org_id) = register_owner(&server, "setaud").await;
+    let access = server.login(&email, PASSWORD).await;
+
+    let (status, body) = server
+        .patch_status_json(
+            &format!("/v1/orgs/{org_id}/settings"),
+            &access,
+            json!({ "mcp_enabled": false }),
+        )
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+
+    let rows = settings_audit_rows(&server, org_id).await;
+    assert_eq!(rows.len(), 1, "expected one audit row");
+    assert_eq!(rows[0].action, "org.settings_update");
+    assert_eq!(rows[0].changes["mcp_enabled"]["from"], json!(true));
+    assert_eq!(rows[0].changes["mcp_enabled"]["to"], json!(false));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn org_settings_patch_same_value_writes_no_audit_row() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (email, _uid, org_id) = register_owner(&server, "setsame").await;
+    let access = server.login(&email, PASSWORD).await;
+
+    let (status, body) = server
+        .patch_status_json(
+            &format!("/v1/orgs/{org_id}/settings"),
+            &access,
+            json!({ "mcp_enabled": true }),
+        )
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["mcp_enabled"], json!(true));
+    assert!(settings_audit_rows(&server, org_id).await.is_empty());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn org_settings_get_by_non_member_is_403() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (_e, _uid, org_id) = register_owner(&server, "setmem").await;
+    let (stranger_email, _s, _stranger_org) = register_owner(&server, "setstranger").await;
+    let stranger = server.login(&stranger_email, PASSWORD).await;
+
+    let resp = server
+        .get(&format!("/v1/orgs/{org_id}/settings"), &stranger)
+        .await;
+    assert_eq!(resp.status().as_u16(), 403);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn org_settings_empty_patch_is_400() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (email, _uid, org_id) = register_owner(&server, "setempty").await;
+    let access = server.login(&email, PASSWORD).await;
+
+    let (status, body) = server
+        .patch_status_json(&format!("/v1/orgs/{org_id}/settings"), &access, json!({}))
+        .await;
+    assert_eq!(status, 400, "body: {body}");
+
+    server.shutdown().await;
+}

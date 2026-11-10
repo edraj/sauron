@@ -555,10 +555,19 @@ async fn process_error(
         // move, and the gate means an issue's denormalized copy is refreshed at
         // most once per interval. Together they take this `UPDATE issues` off
         // the per-event path, where it deadlocked against the issue upsert.
-        if redis.pf_add(&key, &did).await.unwrap_or(false) && crate::batch::users_seen_due(issue_id)
-        {
-            if let Ok(count) = redis.pf_count(&key).await {
-                let _ = repo::set_issue_users_seen(&mut conn, issue_id, count).await;
+        // A closed gate records the issue as pending rather than dropping the
+        // update; the batch drain or the flusher writes it back once the gate
+        // reopens (see `crate::users_seen`). A `PFADD` error counts as moved:
+        // on a real outage the `PFCOUNT` fails too and `retry_later` keeps it.
+        if redis.pf_add(&key, &did).await.unwrap_or(true) && crate::users_seen::claim(issue_id) {
+            let written = match redis.pf_count(&key).await {
+                Ok(count) => repo::set_issue_users_seen(&mut conn, issue_id, count)
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !written {
+                crate::users_seen::retry_later(issue_id);
             }
         }
         // Was `let _ = …`; see `process_event`'s identical comment.

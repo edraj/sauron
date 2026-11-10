@@ -4,11 +4,13 @@
 //! [`pool`], the [`repo`]sitory functions both binaries call, and the embedded
 //! migrations run at startup.
 
+pub mod api_keys;
 pub mod batch;
 pub mod device_env_backfill;
 pub mod filter;
 pub mod identity_merge;
 pub mod models;
+pub mod org_settings;
 pub mod person_days_backfill;
 pub mod person_env_backfill;
 pub mod pool;

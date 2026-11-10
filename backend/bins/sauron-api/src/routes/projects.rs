@@ -11,7 +11,7 @@ use uuid::Uuid;
 use sauron_auth::rbac::{grants_from_rows, reach_for};
 use sauron_auth::{authorize_org, authorize_project, perm, AuthError, AuthUser};
 use sauron_db::models::{App, Project};
-use sauron_db::repo;
+use sauron_db::{repo, AsyncPgConnection};
 
 use super::{db, slugify};
 use crate::error::ApiError;
@@ -42,12 +42,27 @@ pub async fn list_projects(
     Path(org_id): Path<Uuid>,
 ) -> Result<Json<Vec<Project>>, ApiError> {
     let mut conn = db(&state).await?;
+    Ok(Json(
+        visible_projects(&mut conn, auth.user_id, org_id).await?,
+    ))
+}
+
+/// The projects in `org_id` that `user_id`'s grants reach: `list_projects`'
+/// body, shared with the MCP `list_apps` tool so both answer from one rule.
+///
+/// `Forbidden` when the user holds no grant in the org at all; an empty list
+/// when they are a member who reaches nothing here.
+pub(crate) async fn visible_projects(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> Result<Vec<Project>, ApiError> {
     // `authorize_org` checks a single fixed scope and can never be satisfied by
     // a project/app-scoped grant (see `grant_applies`) — that's the exact bug
     // this endpoint used to have. Listing needs the inverse of an authorize
     // check: load the grants once, then ask `reach_for` which resources they
     // actually cover, rather than gating on a check no scoped grant can pass.
-    let rows = repo::user_grants_in_org(&mut conn, auth.user_id, org_id).await?;
+    let rows = repo::user_grants_in_org(conn, user_id, org_id).await?;
     if rows.is_empty() {
         // Not a member of this org at all — distinct from "a member who can't
         // see anything", which returns 200 with an empty/partial list below.
@@ -56,12 +71,12 @@ pub async fn list_projects(
     let grants = grants_from_rows(rows);
     let reach = reach_for(&grants, perm::PROJECT_READ);
     if reach.org {
-        return Ok(Json(repo::list_projects_for_org(&mut conn, org_id).await?));
+        return Ok(repo::list_projects_for_org(conn, org_id).await?);
     }
 
     let mut project_ids = reach.projects;
     if !reach.apps.is_empty() {
-        let ancestries = repo::app_ancestries(&mut conn, &reach.apps).await?;
+        let ancestries = repo::app_ancestries(conn, &reach.apps).await?;
         project_ids.extend(
             ancestries
                 .into_iter()
@@ -77,7 +92,7 @@ pub async fn list_projects(
     // belonging to another org (should never happen, `role_grants.scope_id`
     // has no FK, so "should" is doing work) still cannot widen this list.
     if !reach.envs.is_empty() {
-        let env_ancestries = repo::env_ancestries(&mut conn, &reach.envs).await?;
+        let env_ancestries = repo::env_ancestries(conn, &reach.envs).await?;
         project_ids.extend(
             env_ancestries
                 .into_iter()
@@ -87,9 +102,7 @@ pub async fn list_projects(
     }
     project_ids.sort();
     project_ids.dedup();
-    Ok(Json(
-        repo::list_projects_by_ids_in_org(&mut conn, org_id, &project_ids).await?,
-    ))
+    Ok(repo::list_projects_by_ids_in_org(conn, org_id, &project_ids).await?)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -297,23 +310,36 @@ pub async fn list_apps(
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<App>>, ApiError> {
     let mut conn = db(&state).await?;
+    Ok(Json(
+        visible_apps(&mut conn, auth.user_id, project_id).await?,
+    ))
+}
+
+/// The apps in `project_id` that `user_id`'s grants reach: `list_apps`' body,
+/// shared with the MCP `list_apps` tool.
+///
+/// `NotFound` for an unknown project, `Forbidden` when the user holds no grant
+/// in the project's org, and otherwise the (possibly empty) reachable list.
+pub(crate) async fn visible_apps(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    project_id: Uuid,
+) -> Result<Vec<App>, ApiError> {
     // Same shape as `list_projects` above: `authorize_project` gates on a
     // fixed (org, project, None) target that an app-scoped grant can never
     // satisfy, one level below where `list_projects` used to break. Resolve
     // the project's org first (needed to load grants), then decompose reach.
-    let org_id = repo::project_org(&mut conn, project_id)
+    let org_id = repo::project_org(conn, project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let rows = repo::user_grants_in_org(&mut conn, auth.user_id, org_id).await?;
+    let rows = repo::user_grants_in_org(conn, user_id, org_id).await?;
     if rows.is_empty() {
         return Err(ApiError::Auth(AuthError::Forbidden));
     }
     let grants = grants_from_rows(rows);
     let reach = reach_for(&grants, perm::APP_READ);
     if reach.org || reach.projects.contains(&project_id) {
-        return Ok(Json(
-            repo::list_apps_for_project(&mut conn, project_id).await?,
-        ));
+        return Ok(repo::list_apps_for_project(conn, project_id).await?);
     }
 
     let mut allowed: HashSet<Uuid> = reach.apps.into_iter().collect();
@@ -323,7 +349,7 @@ pub async fn list_apps(
     // widen this listing, mirroring the app-grant sibling-isolation the
     // `reach.projects.contains(&project_id)` fast path above already relies on.
     if !reach.envs.is_empty() {
-        let env_ancestries = repo::env_ancestries(&mut conn, &reach.envs).await?;
+        let env_ancestries = repo::env_ancestries(conn, &reach.envs).await?;
         allowed.extend(
             env_ancestries
                 .into_iter()
@@ -331,12 +357,12 @@ pub async fn list_apps(
                 .map(|(_, app_id, _, _)| app_id),
         );
     }
-    let apps = repo::list_apps_for_project(&mut conn, project_id)
+    let apps = repo::list_apps_for_project(conn, project_id)
         .await?
         .into_iter()
         .filter(|a| allowed.contains(&a.id))
         .collect();
-    Ok(Json(apps))
+    Ok(apps)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

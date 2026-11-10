@@ -24,6 +24,18 @@ export const admin = {
   'admin.nav.purge': { en: 'Purge data', ar: 'حذف البيانات' },
 
   // --- members -------------------------------------------------------------
+  'members.aiAccess.thing': { en: 'AI access settings', ar: 'إعدادات وصول الذكاء الاصطناعي' },
+  'members.aiAccess.title': { en: 'AI assistants (MCP)', ar: 'مساعدو الذكاء الاصطناعي (MCP)' },
+  'members.aiAccess.toggle': {
+    en: 'Allow members to connect AI assistants (MCP)',
+    ar: 'السماح للأعضاء بربط مساعدي الذكاء الاصطناعي (MCP)',
+  },
+  'members.aiAccess.body': {
+    en: "When on, members can use personal API keys to let Claude read this organization's data with their own permissions. Error data sent to the assistant can include end-user details such as emails and IP addresses.",
+    ar: 'عند التفعيل، يمكن للأعضاء استخدام مفاتيح API الشخصية للسماح لـ Claude بقراءة بيانات هذه المنظمة بحسب صلاحياتهم. قد تتضمن بيانات الأخطاء المرسلة إلى المساعد تفاصيل عن المستخدمين النهائيين مثل البريد الإلكتروني وعناوين IP.',
+  },
+  'members.aiAccess.toast.on': { en: 'AI assistant access turned on', ar: 'تم تفعيل وصول مساعدي الذكاء الاصطناعي' },
+  'members.aiAccess.toast.off': { en: 'AI assistant access turned off', ar: 'تم إيقاف وصول مساعدي الذكاء الاصطناعي' },
   'members.title': { en: 'Members', ar: 'الأعضاء' },
   'members.column.member': { en: 'Member', ar: 'العضو' },
   'members.column.role': { en: 'Role', ar: 'الدور' },

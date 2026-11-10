@@ -35,8 +35,6 @@
 //! itself.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -56,6 +54,7 @@ use crate::process::{
     identified_column_present, object_or_empty, truncate,
 };
 use crate::symbolize::SymbolizeCtx;
+use crate::users_seen;
 
 /// One decoded, masked stream entry ready to be written.
 pub struct Decoded {
@@ -511,56 +510,6 @@ impl Acc {
     }
 }
 
-/// How long an issue's `users_seen` may go without a Postgres write-back.
-///
-/// `users_seen` is a HyperLogLog *estimate* whose authoritative copy lives in
-/// Redis; Postgres holds a denormalized copy so the Issues page can sort by it.
-/// Writing that copy on every occurrence put an `UPDATE issues` in the hot path
-/// of every error event, and it deadlocked against the issue upsert — two
-/// statements touching the same rows, one ordered by `(app_id, fingerprint)`
-/// and one by `id`, which no amount of sorting can reconcile. Measured on an
-/// 8-worker ingest against 5 fingerprints, nearly every batch lost that race,
-/// rolled back, and replayed item-by-item: the write path ran ~14x slower than
-/// with the write-back removed entirely.
-///
-/// Throttling is what makes the statement rare instead of constant. The
-/// estimate in Redis stays exact and immediate; only the denormalized copy
-/// lags, by at most this long.
-const USERS_SEEN_WRITE_BACK: Duration = Duration::from_secs(5);
-
-/// Last Postgres write-back per issue, shared by every worker in the process.
-///
-/// Process-global rather than per-worker so N workers throttle to N-per-interval
-/// combined rather than N-per-interval each.
-fn users_seen_gate() -> &'static Mutex<HashMap<Uuid, Instant>> {
-    static GATE: OnceLock<Mutex<HashMap<Uuid, Instant>>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Whether `issue_id` is due a `users_seen` write-back, stamping it if so.
-pub(crate) fn users_seen_due(issue_id: Uuid) -> bool {
-    let mut gate = match users_seen_gate().lock() {
-        Ok(g) => g,
-        // A panic elsewhere poisoned it. Writing the estimate is best-effort,
-        // so recover rather than propagate a panic into the write path.
-        Err(p) => p.into_inner(),
-    };
-    let now = Instant::now();
-    match gate.get(&issue_id) {
-        Some(at) if now.duration_since(*at) < USERS_SEEN_WRITE_BACK => false,
-        _ => {
-            // Bounded so a long-lived process tracking many fingerprints cannot
-            // grow this without limit. Clearing wholesale (rather than evicting
-            // an LRU) costs at most one extra write-back per issue.
-            if gate.len() > 50_000 {
-                gate.clear();
-            }
-            gate.insert(issue_id, now);
-            true
-        }
-    }
-}
-
 fn is_empty_object(v: &Value) -> bool {
     v.as_object().is_some_and(|m| m.is_empty())
 }
@@ -572,6 +521,19 @@ pub async fn process_batch(
     redis: &RedisStore,
     sym: &SymbolizeCtx,
     decoded: &[Decoded],
+) -> anyhow::Result<()> {
+    process_batch_in(pool, redis, sym, decoded, users_seen::Ctx::global()).await
+}
+
+/// [`process_batch`] against an explicit `users_seen` throttle and clock.
+/// Production always passes [`users_seen::Ctx::global`]; tests pass a
+/// private one to drive stage 6b with the clock advanced.
+pub(crate) async fn process_batch_in(
+    pool: &PgPool,
+    redis: &RedisStore,
+    sym: &SymbolizeCtx,
+    decoded: &[Decoded],
+    us: users_seen::Ctx<'_>,
 ) -> anyhow::Result<()> {
     let mut acc = Acc::default();
     // Items whose whole implementation is already a single cheap call and which
@@ -706,7 +668,8 @@ pub async fn process_batch(
     .await?;
 
     // --- stage 6: affected-user cardinality. One PFADD per distinct ISSUE,
-    // PFCOUNT likewise, and the write-back is one statement.
+    // PFCOUNT likewise, and the write-back is one statement covering only the
+    // issues whose throttle gate is open.
     if !hll.is_empty() {
         // Grouped rather than iterated: `PFADD` is variadic, and its reply — did
         // any register move — is already per-key, so N members for one issue
@@ -735,30 +698,53 @@ pub async fn process_batch(
             // every person has been seen before does no `issues` write at all —
             // which is the steady state, and the difference between this
             // statement being rare and it being on every batch.
+            //
+            // An ERROR counts as moved, not as unchanged: the members may well
+            // have landed. On a real outage the `PFCOUNT` below fails too and
+            // `retry_later` keeps the issue pending, instead of this silently
+            // reading the outage as "nobody new".
             if redis
                 .pf_add_many(&key, &members[&issue_id])
                 .await
-                .unwrap_or(false)
+                .unwrap_or(true)
             {
                 issues_touched.push(issue_id);
             }
         }
         let mut counts: Vec<(Uuid, i64)> = Vec::with_capacity(issues_touched.len());
         for issue_id in issues_touched {
-            if !users_seen_due(issue_id) {
+            // A closed gate records the issue as pending and keeps it OUT of
+            // this statement; the drain below or the flusher writes it back
+            // once the gate reopens (see `crate::users_seen`).
+            if !us.claim(issue_id) {
                 continue;
             }
-            if let Ok(n) = redis
+            match redis
                 .pf_count(&keys::issue_users(&issue_id.to_string()))
                 .await
             {
-                counts.push((issue_id, n));
+                Ok(n) => counts.push((issue_id, n)),
+                Err(_) => us.retry_later(issue_id),
             }
         }
         if let Err(e) = db::set_issue_users_seen(&mut conn, &counts).await {
-            tracing::warn!(error = %e, "batched users_seen write-back failed");
+            tracing::warn!(
+                error = %e,
+                "batched users_seen write-back failed; retrying next interval"
+            );
+            for &(issue_id, _) in &counts {
+                us.retry_later(issue_id);
+            }
         }
     }
+
+    // --- stage 6b: write back a few pending issues whose gate has reopened,
+    // one single-row autocommit each. `conn` is outside any transaction here
+    // (`write_rows` committed above), which is what keeps these statements
+    // cycle-free; see `crate::users_seen`. Every batch helps, not only batches
+    // that carried errors, so the pending set drains while traffic flows.
+    us.drain(&mut conn, redis, users_seen::DRAIN_PER_BATCH)
+        .await;
 
     // --- stage 7: the per-item tail. Rare paths, left unbatched on purpose.
     // Folded, not replayed: this was one autocommit round trip per item
@@ -1237,7 +1223,7 @@ mod equivalence_tests {
     //! through `process_job` and the other through `process_batch`, and diff
     //! the resulting rows.
 
-    use super::{process_batch, Decoded};
+    use super::{process_batch, process_batch_in, Decoded};
     use crate::mask::MaskSet;
     use crate::process::workflow_pipeline_tests::PipelineTestDb;
     use chrono::round::SubsecRound;
@@ -2142,5 +2128,144 @@ mod equivalence_tests {
                 )
             })
             .collect()
+    }
+
+    /// Stage 6b, the drain at the end of every batch, on its own: a gated
+    /// burst, then ONE more batch with the clock one interval ahead, and the
+    /// count converges with no `flush_due` anywhere. That follow-up batch
+    /// carries only an analytics event, so stage 6 has nothing to write and
+    /// the drain is the only thing that can. A private throttle keeps the
+    /// process-wide pending set, and every concurrent test's drain, out of it.
+    #[tokio::test]
+    async fn the_next_batch_drains_a_gated_issue_without_the_flusher() {
+        use crate::users_seen::{Ctx, Throttle, WRITE_BACK_INTERVAL};
+        use diesel::sql_types::Uuid as SqlUuid;
+        use sauron_redis::keys;
+        use std::sync::Mutex;
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = SqlUuid)]
+            id: Uuid,
+            #[diesel(sql_type = BigInt)]
+            users_seen: i64,
+        }
+        async fn the_issue(db: &PipelineTestDb, app_id: Uuid) -> Row {
+            let mut conn = db.conn().await;
+            let mut rows: Vec<Row> =
+                diesel::sql_query("SELECT id, users_seen FROM issues WHERE app_id = $1")
+                    .bind::<SqlUuid, _>(app_id)
+                    .load(&mut conn)
+                    .await
+                    .expect("read issues");
+            assert_eq!(rows.len(), 1, "one fingerprint, one issue");
+            rows.remove(0)
+        }
+        fn burst_error(user: &str, fp: &str, at: DateTime<Utc>) -> EnvelopeItem {
+            EnvelopeItem::Error(Box::new(ErrorItem {
+                event_id: Uuid::new_v4(),
+                level: Level::Error,
+                timestamp: at,
+                exception: Some(ExceptionInfo {
+                    ty: "TypeError".to_string(),
+                    value: Some("stage 6b".to_string()),
+                    mechanism: None,
+                    stacktrace: vec![],
+                }),
+                message: Some("stage 6b".to_string()),
+                breadcrumbs: vec![],
+                tags: json!({}),
+                contexts: json!({}),
+                extra: json!({}),
+                user: Some(EventUser {
+                    id: Some(user.to_string()),
+                    ..Default::default()
+                }),
+                session_id: None,
+                screen: None,
+                fingerprint: Some(vec![fp.to_string()]),
+                workflow_id: None,
+                workflow_name: None,
+                raw_stacktrace: None,
+                debug_meta: None,
+            }))
+        }
+
+        let Some(db) = PipelineTestDb::setup().await else {
+            eprintln!("TEST_DATABASE_URL unset — skipping");
+            return;
+        };
+        let Ok(redis_url) = std::env::var("TEST_REDIS_URL") else {
+            eprintln!("TEST_REDIS_URL unset — skipping");
+            db.cleanup().await;
+            return;
+        };
+        let redis = RedisStore::connect(&redis_url)
+            .await
+            .expect("connect redis");
+        let sym = crate::symbolize::SymbolizeCtx::new(
+            Arc::new(sauron_symbols::Symbolicator::new(1 << 20)),
+            sauron_redis::SymbolBlobCache::connect(None, 1 << 20).await,
+            100,
+            1 << 20,
+        );
+        let app = seed_app(&db, "us6b").await;
+        let throttle = Mutex::new(Throttle::new(WRITE_BACK_INTERVAL, 1_000, 1_000));
+        let real_clock = Ctx::for_test(&throttle, std::time::Duration::ZERO);
+        let one_interval_on = Ctx::for_test(&throttle, WRITE_BACK_INTERVAL);
+        let fp = format!("stage-6b-{}", Uuid::new_v4().simple());
+        let t0 = Utc::now();
+        let wrap = |n: usize, item: EnvelopeItem| Decoded {
+            id: format!("0-{n}"),
+            job: job(&app, t0, item),
+            masks: Arc::new(MaskSet::from_rows(vec![])),
+            entry_tail: true,
+        };
+
+        let burst: &[&[&str]] = &[&["u1"], &["u2", "u3"], &["u4", "u5", "u6"], &["u7", "u8"]];
+        let started = std::time::Instant::now();
+        let mut n = 0;
+        for users in burst {
+            let batch: Vec<Decoded> = users
+                .iter()
+                .map(|u| {
+                    n += 1;
+                    wrap(n, burst_error(u, &fp, t0))
+                })
+                .collect();
+            process_batch_in(db.pool(), &redis, &sym, &batch, real_clock)
+                .await
+                .expect("burst batch");
+        }
+        let burst_took = started.elapsed();
+
+        let issue = the_issue(&db, app.app_id).await;
+        let key = keys::issue_users(&issue.id.to_string());
+        assert_eq!(redis.pf_count(&key).await.expect("PFCOUNT"), 8);
+        if burst_took < WRITE_BACK_INTERVAL {
+            assert_eq!(issue.users_seen, 1, "the throttle held the burst back");
+            assert!(
+                throttle.lock().unwrap().is_pending(issue.id),
+                "and parked the issue"
+            );
+        } else {
+            eprintln!("burst took {burst_took:?} (> one interval); throttle assertions skipped");
+        }
+
+        // One more batch, one interval later, carrying nothing for the issue.
+        let tail = vec![wrap(n + 1, event_item("after_burst", "sess-6b", t0))];
+        process_batch_in(db.pool(), &redis, &sym, &tail, one_interval_on)
+            .await
+            .expect("tail batch");
+
+        let after = the_issue(&db, app.app_id).await;
+        assert_eq!(
+            after.users_seen, 8,
+            "the next batch's stage 6b drain must write the parked issue back"
+        );
+        assert!(!throttle.lock().unwrap().is_pending(issue.id));
+
+        let _ = redis.del(&key).await;
+        db.cleanup().await;
     }
 }

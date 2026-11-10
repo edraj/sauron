@@ -6,7 +6,7 @@ members = ["crates/*", "bins/*"]
 version = "1.9.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-rust-version = "1.82"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # --- internal crates ---
@@ -62,6 +62,22 @@ tower-http = { version = "0.7", features = [
     "decompression-full",
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+
+# --- mcp ---
+# The official Model Context Protocol SDK, for the read-only `/v1/mcp`
+# endpoint. No default features: `server` + `macros` for the tool router, and
+# the Streamable HTTP server transport (a plain `tower` service mounted with
+# `nest_service`; rmcp has no axum dependency of its own, so this adds no
+# second axum). Its MSRV (1.88) is why `rust-version` above is 1.88.
+rmcp = { version = "3.9", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+# Tool argument schemas for rmcp's `#[tool]` macro. Major version 1 is the one
+# rmcp 3.x derives against; a second major would make every `Parameters<T>`
+# fail to satisfy rmcp's `JsonSchema` bound.
+schemars = "1"
 
 # --- openapi / swagger ---
 # `chrono` and `uuid` are not optional niceties: without them `DateTime<Utc>`

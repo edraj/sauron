@@ -22,13 +22,14 @@ use diesel::QueryableByName;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
+use super::issue_stats::{self, IRow};
 use super::release::{self, ReleaseActivityDelta, ReleaseDayKey};
 use super::{
     add_event_top, add_journey_links, add_journey_nodes, add_perf_agg, add_person_days,
     add_screen_stats, add_user_activity, begin_locked, env_key, replace_session_days,
     rollback_quietly, set_watermark, watermark, DayKey, PerfDelta, PersonDayDelta, PersonKey,
     ScreenDelta, SessionDayRow, UserActivityDelta, CHUNK, OTHER_NAME, SRC_ANALYTICS, SRC_ERRORS,
-    SRC_SESSIONS, SRC_TRANSACTIONS,
+    SRC_ISSUE_STATS, SRC_SESSIONS, SRC_TRANSACTIONS,
 };
 use crate::batch::release_key;
 use crate::sketch::{Hll, LatencyHistogram};
@@ -153,7 +154,9 @@ fn day_of(t: DateTime<Utc>) -> NaiveDate {
     t.date_naive()
 }
 
-fn hour_of(t: DateTime<Utc>) -> DateTime<Utc> {
+/// UTC hour start. `pub(crate)` for `issue_stats`, whose day replace computes
+/// the same bucket in SQL as `date_trunc('hour', occurred_at, 'UTC')`.
+pub(crate) fn hour_of(t: DateTime<Utc>) -> DateTime<Utc> {
     t.duration_trunc(Duration::hours(1)).unwrap_or(t)
 }
 
@@ -528,6 +531,15 @@ pull_source!(
     "SELECT app_id, environment_id, occurred_at, received_at, name, op, duration_ms, status, http_status \
      FROM transactions WHERE received_at = $1"
 );
+pull_source!(
+    pull_issue_stats,
+    IRow,
+    "SELECT app_id, environment_id, issue_id, release, occurred_at, received_at \
+     FROM error_events WHERE received_at > $1 AND received_at <= $2 AND occurred_at >= $3 \
+     ORDER BY received_at, id LIMIT $4",
+    "SELECT app_id, environment_id, issue_id, release, occurred_at, received_at \
+     FROM error_events WHERE received_at = $1"
+);
 
 // ---------------------------------------------------------------------------
 // State-table I/O (inside the fold transaction).
@@ -800,6 +812,36 @@ pub async fn fold_errors(
     finish(conn, out).await
 }
 
+/// The `issue_stats_hourly` fold: a second pass over `error_events` behind its
+/// OWN watermark ([`SRC_ISSUE_STATS`]), so the table can have its own epoch
+/// and backfill without touching the base error fold. Additive; the
+/// watermark advances in the same transaction as the adds (see
+/// `rollups::issue_stats` for the exactly-once argument).
+pub async fn fold_issue_stats(
+    conn: &mut AsyncPgConnection,
+    upto: DateTime<Utc>,
+) -> diesel::QueryResult<Option<FoldOutcome>> {
+    begin_locked(conn).await?;
+    let out = async {
+        let wm = watermark(conn, SRC_ISSUE_STATS).await?;
+        if wm >= upto {
+            return Ok(None);
+        }
+        let (rows, new_wm, caught_up) = pull_issue_stats(conn, wm, upto).await?;
+        let n = rows.len();
+        let d = issue_stats::fold_issue_rows(&rows);
+        issue_stats::add_issue_stats(conn, &d).await?;
+        set_watermark(conn, SRC_ISSUE_STATS, new_wm).await?;
+        Ok(Some(FoldOutcome {
+            rows_read: n,
+            new_watermark: new_wm,
+            caught_up,
+        }))
+    }
+    .await;
+    finish(conn, out).await
+}
+
 pub async fn fold_transactions(
     conn: &mut AsyncPgConnection,
     upto: DateTime<Utc>,
@@ -826,7 +868,7 @@ pub async fn fold_transactions(
     finish(conn, out).await
 }
 
-async fn finish<T>(
+pub(super) async fn finish<T>(
     conn: &mut AsyncPgConnection,
     out: diesel::QueryResult<T>,
 ) -> diesel::QueryResult<T> {
@@ -1230,6 +1272,17 @@ async fn fold_day_body(
             .bind::<Timestamptz, _>(day_start)
             .execute(conn)
             .await?;
+            // Only the unbounded REBUILD replaces issue_stats_hourly. Its
+            // bound is the issue_stats watermark, read here, inside the
+            // caller's locked transaction: rows at or below it are recounted
+            // from raw, rows above it are still the live fold's. Any call
+            // with `received_upto` set (the base backfill's epoch bound)
+            // leaves the table alone — that bound is the base epoch, not
+            // this table's watermark.
+            if received_upto.is_none() {
+                let wm = watermark(conn, SRC_ISSUE_STATS).await?;
+                issue_stats::replace_day(conn, day, None, wm).await?;
+            }
         }
         let mut sess: HashMap<SessKey, SessState> = HashMap::new();
         let mut jour: HashMap<JourKey, JourState> = HashMap::new();
@@ -1420,7 +1473,17 @@ async fn consistency_check_day(
     let start = day.and_hms_opt(0, 0, 0).expect("valid").and_utc();
     // (day parameter comes from consistency_check_trailing's loop.)
     let mut drifts = Vec::new();
-    let checks: [(&str, &str, &str); 3] = [
+    let issue_raw_sql = format!(
+        "SELECT count(*)::bigint AS n FROM error_events \
+         WHERE occurred_at >= $1 AND occurred_at < $2 AND app_id IN {}",
+        issue_stats::READY_APPS_SQL
+    );
+    let issue_rolled_sql = format!(
+        "SELECT COALESCE(sum(events), 0)::bigint AS n FROM issue_stats_hourly \
+         WHERE hour >= $1 AND hour < $2 AND app_id IN {}",
+        issue_stats::READY_APPS_SQL
+    );
+    let checks: [(&str, &str, &str); 4] = [
         (
             SRC_ANALYTICS,
             "SELECT count(*)::bigint AS n FROM analytics_events WHERE occurred_at >= $1 AND occurred_at < $2",
@@ -1435,6 +1498,14 @@ async fn consistency_check_day(
             SRC_TRANSACTIONS,
             "SELECT count(*)::bigint AS n FROM transactions WHERE occurred_at >= $1 AND occurred_at < $2",
             "SELECT COALESCE(sum(count), 0)::bigint AS n FROM perf_agg_hourly WHERE hour >= $1 AND hour < $2",
+        ),
+        // Only issue-stats-READY apps on both sides: an app that predates the
+        // epoch holds live-fold rows only until its backfill marker lands, and
+        // counting it would turn that known gap into a daily rebuild.
+        (
+            SRC_ISSUE_STATS,
+            &issue_raw_sql,
+            &issue_rolled_sql,
         ),
     ];
     for (source, raw_sql, rolled_sql) in checks {
@@ -1458,13 +1529,27 @@ async fn consistency_check_day(
         let diff = (raw.n - rolled.n).abs();
         let tolerated = diff <= 5 || (raw.n > 0 && (diff as f64 / raw.n as f64) <= 0.005);
         if !tolerated {
-            drifts.push((
-                day,
-                format!("{source}: raw {} vs rollup {}", raw.n, rolled.n),
-            ));
+            drifts.push((day, drift_desc(source, raw.n, rolled.n)));
         }
     }
     Ok(drifts)
+}
+
+/// The text [`consistency_check_trailing`] reports for one drifted
+/// (day, source): `"{source}: raw {raw} vs rollup {rolled}"`. Read it back
+/// with [`drift_source`]; the two are the one place the shape is defined.
+pub fn drift_desc(source: &str, raw: i64, rolled: i64) -> String {
+    format!("{source}: raw {raw} vs rollup {rolled}")
+}
+
+/// The source label of a [`drift_desc`] text, or `None` when `desc` does not
+/// have its shape. A caller choosing a narrower heal by source must treat
+/// `None` as "rebuild everything".
+pub fn drift_source(desc: &str) -> Option<&str> {
+    let (source, rest) = desc.split_once(": raw ")?;
+    let (raw, rolled) = rest.split_once(" vs rollup ")?;
+    let numeric = |s: &str| s.parse::<i64>().is_ok();
+    (!source.is_empty() && numeric(raw) && numeric(rolled)).then_some(source)
 }
 
 /// Keep `sessions` partitions ahead of the clock. The tier worker pre-creates
@@ -1786,6 +1871,32 @@ pub async fn backfill_all(
 mod tests {
     use super::super::NIL_ENV;
     use super::*;
+
+    /// `drift_source` reads back exactly what `drift_desc` writes, for every
+    /// source the consistency sweep checks, and refuses anything else.
+    #[test]
+    fn drift_desc_round_trips_through_drift_source() {
+        for source in [SRC_ANALYTICS, SRC_ERRORS, SRC_TRANSACTIONS, SRC_ISSUE_STATS] {
+            for (raw, rolled) in [(9, 1), (0, 12), (-1, 0)] {
+                let desc = drift_desc(source, raw, rolled);
+                assert_eq!(drift_source(&desc), Some(source), "{desc}");
+            }
+        }
+        assert_eq!(
+            drift_desc(SRC_ISSUE_STATS, 9, 1),
+            "issue_stats: raw 9 vs rollup 1"
+        );
+        for bad in [
+            "",
+            "issue_stats",
+            "issue_stats: drifted",
+            ": raw 9 vs rollup 1",
+            "issue_stats: raw x vs rollup 1",
+            "issue_stats: raw 9 vs rollup",
+        ] {
+            assert_eq!(drift_source(bad), None, "{bad:?}");
+        }
+    }
 
     fn arow(
         app: Uuid,

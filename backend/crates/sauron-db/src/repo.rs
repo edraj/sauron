@@ -86,9 +86,7 @@ pub struct NewMemberRow {
 ///
 /// A single data-modifying CTE rather than a transaction: Postgres runs both
 /// INSERTs atomically within the statement, so a grant failure rolls the user
-/// back for free. This avoids `conn.transaction`, whose diesel-async 0.9
-/// signature needs async closures (Rust 1.85) and would push the workspace
-/// MSRV past the 1.82 the RPM spec builds against. The scopes travel as two
+/// back for free, without a `conn.transaction` block. The scopes travel as two
 /// parallel arrays unnested into rows, so N grants stay one round trip; they
 /// must be the same length, as multi-argument `unnest` pads the shorter one
 /// with NULLs that then fail `role_grants`' NOT NULL.
@@ -212,10 +210,8 @@ pub async fn set_user_password(
 
 /// Mint a refresh token, starting a new session or continuing an existing one.
 ///
-/// One data-modifying CTE rather than a transaction: `conn.transaction`'s
-/// diesel-async 0.9 signature needs async closures (Rust 1.85) and this
-/// workspace's MSRV is 1.82 per `packaging/rpm/sauron.spec`. Postgres runs both
-/// statements atomically within the one statement anyway.
+/// One data-modifying CTE rather than a transaction: Postgres runs both
+/// statements atomically within the one statement, in one round trip.
 ///
 /// Returns the number of refresh-token rows inserted: `1` on success, `0` when
 /// the session exists but is revoked or belongs to somebody else.
@@ -814,8 +810,8 @@ struct ConsumedResetRow {
 ///
 /// Zero rows means somebody else burned it first. This has to be one
 /// `UPDATE … RETURNING` rather than a SELECT then an UPDATE: single-use is the
-/// whole security property, and `conn.transaction` is unavailable (async
-/// closures need Rust 1.85, workspace MSRV is 1.82).
+/// whole security property, and one statement makes the check and the burn
+/// atomic without an explicit transaction or `SELECT … FOR UPDATE`.
 pub async fn consume_password_reset_token(
     conn: &mut AsyncPgConnection,
     token_hash: &str,
@@ -963,9 +959,9 @@ struct ConsumedEmailChangeRow {
 ///
 /// Zero rows means the link was already burned, vetoed, expired, or is stale.
 /// One `UPDATE … RETURNING` rather than a SELECT then an UPDATE because
-/// single-use is the whole security property and `conn.transaction` is
-/// unavailable (async closures need Rust 1.85; workspace MSRV is 1.82 per
-/// `packaging/rpm/sauron.spec`).
+/// single-use is the whole security property, and one statement makes the
+/// check and the burn atomic without an explicit transaction or
+/// `SELECT … FOR UPDATE`.
 pub async fn consume_email_change_approval(
     conn: &mut AsyncPgConnection,
     token_hash: &str,
@@ -1888,10 +1884,10 @@ pub async fn update_app(
 /// handler authorizes through `authorize_app` against an app that no longer
 /// exists. Visible, and unreachable.
 ///
-/// One CTE rather than two statements: `conn.transaction(...)` is blocked by
-/// the MSRV, and a bare pair could delete the app and then fail, leaving
-/// exactly the orphan this exists to prevent. Every arm of a CTE also reads the
-/// SAME snapshot, so the `app_environments` sub-select still sees the
+/// One CTE rather than two statements: a bare pair could delete the app and
+/// then fail, leaving exactly the orphan this exists to prevent, and one
+/// statement is atomic without a `conn.transaction` block. Every arm of a CTE
+/// also reads the SAME snapshot, so the `app_environments` sub-select still sees the
 /// enrollments even though the app delete cascades them away in the same
 /// statement — which is why the `app_env` arm does not need to run first.
 pub async fn delete_app(conn: &mut AsyncPgConnection, id: Uuid) -> QueryResult<usize> {
@@ -3783,8 +3779,10 @@ fn issue_search_base(
         ctx,
     )?;
     // The tenant key in the WHERE clause is the mandatory second layer; the
-    // handler's `authorized_read_scope_with_perms` call is the first. Neither
-    // substitutes for the other.
+    // caller's authorization (the handler's `authorized_read_scope_with_perms`,
+    // or `sauron_auth::authorize_env_read_with_perms` through the shared
+    // `load_*_scoped` / `search_*` bodies the MCP tools also use) is the
+    // first. Neither substitutes for the other.
     let mut q = issues::table
         .filter(issues::app_id.eq(scope.app_id))
         .filter(issues::last_seen.ge(since))
@@ -4511,8 +4509,10 @@ pub struct EventSearch<'a> {
 /// **One `EventsLower` serves both the predicate and the base scope**, so the
 /// `app_id` in the WHERE clause and the `app_id` the leaves are lowered against
 /// cannot disagree — they are the same field of the same value. That WHERE-
-/// clause tenant key is the mandatory second authorization layer; the handler's
-/// `authorized_read_scope_with_perms` is the first, and neither substitutes for
+/// clause tenant key is the mandatory second authorization layer; the caller's
+/// authorization (a handler's `authorized_read_scope_with_perms`, or
+/// `sauron_auth::authorize_env_read_with_perms` through a shared route body
+/// such as `search_issue_events`) is the first, and neither substitutes for
 /// the other.
 fn event_search_base<'a>(
     scope: &'a ReadScope,
@@ -5930,6 +5930,266 @@ pub fn apply_issue_env_stats(rows: &mut [Issue], stats: &HashMap<Uuid, IssueEnvS
     }
 }
 
+#[derive(QueryableByName)]
+struct IssueUsersRow {
+    #[diesel(sql_type = SqlUuid)]
+    issue_id: Uuid,
+    #[diesel(sql_type = BigInt)]
+    users: i64,
+}
+
+/// Distinct users per issue in `range`: `count(DISTINCT distinct_id)` over
+/// raw `error_events` (an occurrence with no `distinct_id` is no user), for
+/// the issues MCP `trending_issues` shows. `issue_stats_hourly` holds events
+/// only (no users sketch, by design), so users are counted on read, for a
+/// bounded set of ids.
+///
+/// Same per-issue LATERAL shape as [`issue_env_stats`], for the same reason:
+/// each issue is one range scan of `error_events_issue_env_time_idx
+/// (issue_id, environment_id, occurred_at DESC) INCLUDE (distinct_id)`, not
+/// a sort over every matching occurrence. The tenant key sits on `issues`.
+/// `release` is the rollup key (`""` = no release), matched as
+/// `COALESCE(release, '')` so it means exactly what it means in the rollup.
+/// Every id in `ids` that belongs to the app comes back, `0` when it had no
+/// identified user.
+///
+/// **`Ok(None)` when the count outlives `timeout_ms`.** It runs in its own
+/// transaction under `SET LOCAL statement_timeout`; a cancelled statement
+/// rolls that transaction back (taking the LOCAL setting with it) and reads
+/// as "unknown", which the tool shows as `?`. Any other failure is an error.
+/// diesel's transaction manager owns the BEGIN/ROLLBACK, so a caller that
+/// drops this future mid-transaction leaves a connection the pool discards
+/// rather than one that hands its open transaction to the next request.
+pub async fn issue_users_in_window(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    release: Option<&str>,
+    ids: &[Uuid],
+    range: Range,
+    timeout_ms: u32,
+) -> QueryResult<Option<HashMap<Uuid, i64>>> {
+    if ids.is_empty() {
+        return Ok(Some(HashMap::new()));
+    }
+    // Bind layout: $1 ids, $2 app_id, $3 from; then environment (One/Subset
+    // only), then release when present; the range's upper bound last (it
+    // consumes an index only when the range is closed, see `Range::upper_sql`).
+    let mut next = 4;
+    let env_sql = scope.env.sql_fragment_for("e", next);
+    if scope.env.consumes_bind() {
+        next += 1;
+    }
+    let release_sql = match release {
+        Some(_) => {
+            let sql = format!(" AND COALESCE(e.release, '') = ${next}");
+            next += 1;
+            sql
+        }
+        None => String::new(),
+    };
+    let upper_sql = range.upper_sql_for("e", "occurred_at", next);
+    let sql_text = format!(
+        "SELECT i.id AS issue_id, agg.users \
+         FROM issues i \
+         JOIN LATERAL ( \
+             SELECT count(DISTINCT e.distinct_id)::bigint AS users \
+             FROM error_events e \
+             WHERE e.issue_id = i.id AND e.occurred_at >= $3{env_sql}{release_sql}{upper_sql} \
+         ) agg ON TRUE \
+         WHERE i.id = ANY($1) AND i.app_id = $2"
+    );
+    let mut stmt = diesel::sql_query(sql_text)
+        .into_boxed()
+        .bind::<Array<SqlUuid>, _>(ids.to_vec())
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<Timestamptz, _>(range.from);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(r) = release {
+        stmt = stmt.bind::<Text, _>(r.to_string());
+    }
+    stmt = crate::bind_range!(stmt, range);
+
+    // `SET` takes no parameters; `timeout_ms` is a `u32`, never caller text.
+    let set_timeout = format!("SET LOCAL statement_timeout = {timeout_ms}");
+    let counted = conn
+        .transaction::<_, diesel::result::Error, _>(async |conn| {
+            conn.batch_execute(&set_timeout).await?;
+            stmt.get_results::<IssueUsersRow>(conn).await
+        })
+        .await;
+    match counted {
+        Ok(rows) => Ok(Some(
+            rows.into_iter().map(|r| (r.issue_id, r.users)).collect(),
+        )),
+        Err(e) if is_query_canceled(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether Postgres cancelled the statement: SQLSTATE 57014
+/// (`query_canceled`), raised for a `statement_timeout` or a cancel request.
+/// diesel-async's error wrapper exposes the message but not the SQLSTATE, so
+/// this matches the two messages 57014 carries, the way
+/// `pool::is_statement_timeout` matches the first of them. A lock timeout is
+/// 55P03, a different error, and does not match.
+fn is_query_canceled(err: &diesel::result::Error) -> bool {
+    match err {
+        diesel::result::Error::DatabaseError(_, info) => {
+            let message = info.message();
+            message.starts_with("canceling statement due to statement timeout")
+                || message.starts_with("canceling statement due to user request")
+        }
+        _ => false,
+    }
+}
+
+/// The `issues` rows for `ids`, confined to `app_id` (an id from another app
+/// is simply absent), in no particular order. Their stored, app-wide values:
+/// for a tool that ranks from a rollup and needs each issue's description.
+pub async fn issues_by_ids(
+    conn: &mut AsyncPgConnection,
+    app_id: Uuid,
+    ids: &[Uuid],
+) -> QueryResult<Vec<Issue>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    issues::table
+        .filter(issues::app_id.eq(app_id))
+        .filter(issues::id.eq_any(ids))
+        .select(Issue::as_select())
+        .load(conn)
+        .await
+}
+
+/// How many breakdown groups [`occurrence_breakdown`] returns per dimension.
+pub const OCCURRENCE_BREAKDOWN_TOP: i64 = 10;
+
+/// One issue's occurrences in a window, counted three ways, each the top
+/// [`OCCURRENCE_BREAKDOWN_TOP`] groups, most events first. Ties go by key,
+/// with the unknown group (`""`, no environment) after the known ones.
+///
+/// `total` is every occurrence counted, so `total - sum(top)` is what the
+/// groups past the top ten hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OccurrenceBreakdown {
+    /// `COALESCE(release, '')`: `""` is "no release", the rollup's key.
+    pub by_release: Vec<(String, i64)>,
+    /// The enrollment (`app_environments.id`); `None` = no environment.
+    pub by_environment: Vec<(Option<Uuid>, i64)>,
+    /// `COALESCE(context->'os'->>'name', '')`: `""` is "not reported".
+    pub by_os: Vec<(String, i64)>,
+    pub total: i64,
+}
+
+#[derive(QueryableByName)]
+struct BreakdownRow {
+    #[diesel(sql_type = Text)]
+    dim: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    rel: Option<String>,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    env: Option<Uuid>,
+    #[diesel(sql_type = Nullable<Text>)]
+    os: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+/// Where `issue_id`'s occurrences in `range` came from: by release, by
+/// environment and by OS. MCP `list_issue_events` answers "one release, or
+/// everywhere?" with it; `events/stats` returns totals only.
+///
+/// - **One scan.** `GROUPING SETS ((release), (environment), (os), ())`
+///   counts all three dimensions and the total over a single pass of the
+///   issue's rows in the window (`error_events_issue_idx (issue_id,
+///   occurred_at DESC)`), and a window function keeps the top
+///   [`OCCURRENCE_BREAKDOWN_TOP`] of each.
+/// - **OS** is `context->'os'->>'name'`: ingest writes the SDK envelope's
+///   `context` (with its `os` object) into `error_events.context`
+///   (`sauron_pipeline::enrich::enrich_context`), and it is the path the
+///   search language's `os.name` dimension reads. `context` is part of the
+///   event body, so a caller that may not read bodies must not be shown
+///   `by_os`; this function does not know the caller, and gating it is the
+///   caller's job.
+/// - **Scope.** The scope's app, its environments, and `release` when given
+///   (`""` = no release, matched as `COALESCE(release, '')` like the rollup).
+pub async fn occurrence_breakdown(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    issue_id: Uuid,
+    range: Range,
+    release: Option<&str>,
+) -> QueryResult<OccurrenceBreakdown> {
+    // Bind layout: $1 app_id, $2 issue_id, $3 from, $4 the top-N; then the
+    // environment (One/Subset only), the release when present, and the
+    // range's upper bound last (`Range::upper_sql`'s rule).
+    let mut next = 5;
+    let env_sql = scope.env.sql_fragment_for("e", next);
+    if scope.env.consumes_bind() {
+        next += 1;
+    }
+    let release_sql = match release {
+        Some(_) => {
+            let sql = format!(" AND COALESCE(e.release, '') = ${next}");
+            next += 1;
+            sql
+        }
+        None => String::new(),
+    };
+    let upper_sql = range.upper_sql_for("e", "occurred_at", next);
+    let sql_text = format!(
+        "SELECT dim, rel, env, os, n FROM ( \
+             SELECT g.*, row_number() OVER ( \
+                 PARTITION BY dim \
+                 ORDER BY n DESC, rel = '', rel, env, os = '', os \
+             ) AS rk \
+             FROM ( \
+                 SELECT CASE \
+                            WHEN GROUPING(rel) = 0 THEN 'release' \
+                            WHEN GROUPING(env) = 0 THEN 'environment' \
+                            WHEN GROUPING(os) = 0 THEN 'os' \
+                            ELSE 'total' \
+                        END AS dim, \
+                        rel, env, os, count(*)::bigint AS n \
+                 FROM ( \
+                     SELECT COALESCE(e.release, '') AS rel, \
+                            e.environment_id AS env, \
+                            COALESCE(e.context->'os'->>'name', '') AS os \
+                     FROM error_events e \
+                     WHERE e.app_id = $1 AND e.issue_id = $2 \
+                       AND e.occurred_at >= $3{env_sql}{release_sql}{upper_sql} \
+                 ) s \
+                 GROUP BY GROUPING SETS ((rel), (env), (os), ()) \
+             ) g \
+         ) r \
+         WHERE rk <= $4 \
+         ORDER BY dim, rk"
+    );
+    let mut stmt = diesel::sql_query(sql_text)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id)
+        .bind::<SqlUuid, _>(issue_id)
+        .bind::<Timestamptz, _>(range.from)
+        .bind::<BigInt, _>(OCCURRENCE_BREAKDOWN_TOP);
+    stmt = crate::bind_env!(stmt, &scope.env);
+    if let Some(r) = release {
+        stmt = stmt.bind::<Text, _>(r.to_string());
+    }
+    stmt = crate::bind_range!(stmt, range);
+
+    let mut out = OccurrenceBreakdown::default();
+    for row in stmt.get_results::<BreakdownRow>(conn).await? {
+        match row.dim.as_str() {
+            "release" => out.by_release.push((row.rel.unwrap_or_default(), row.n)),
+            "environment" => out.by_environment.push((row.env, row.n)),
+            "os" => out.by_os.push((row.os.unwrap_or_default(), row.n)),
+            _ => out.total = row.n,
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod issue_env_stats_tests {
     use super::*;
@@ -6047,14 +6307,66 @@ pub async fn update_issue_status(
     .optional()
 }
 
+/// Raise one issue's denormalized `users_seen` to `count`; never lower it.
+///
+/// Monotonic because the value is a HyperLogLog estimate read from Redis
+/// before this runs, and two write-backs can commit in the other order than
+/// they read (two ingest replicas, or the pending-set drain racing a hot-path
+/// write): the later commit must not replace a higher count with a stale one.
+/// The `<` filter rather than `GREATEST(...)` so a write that would change
+/// nothing touches no row at all. Single-row and, at every caller, autocommit,
+/// which is what keeps it out of lock cycles with the issue upsert (see
+/// `sauron_pipeline::users_seen`).
 pub async fn set_issue_users_seen(
     conn: &mut AsyncPgConnection,
     issue_id: Uuid,
     count: i64,
 ) -> QueryResult<usize> {
-    diesel::update(issues::table.find(issue_id))
-        .set(issues::users_seen.eq(count))
-        .execute(conn)
+    diesel::update(
+        issues::table
+            .filter(issues::id.eq(issue_id))
+            .filter(issues::users_seen.lt(count)),
+    )
+    .set(issues::users_seen.eq(count))
+    .execute(conn)
+    .await
+}
+
+/// One keyset page of issue ids, ascending: the ids after `after` (all of
+/// them when `None`), at most `limit`. Every app, no scope: this exists for
+/// the operator-run `sauron-migrate backfill-users-seen`, which visits every
+/// issue once and must not be offset-paged over a table ingest is inserting
+/// into.
+pub async fn issue_ids_after(
+    conn: &mut AsyncPgConnection,
+    after: Option<Uuid>,
+    limit: i64,
+) -> QueryResult<Vec<Uuid>> {
+    let mut q = issues::table
+        .select(issues::id)
+        .order(issues::id.asc())
+        .limit(limit)
+        .into_boxed();
+    if let Some(after) = after {
+        q = q.filter(issues::id.gt(after));
+    }
+    q.load(conn).await
+}
+
+/// Ids of the issues an event landed on at or after `since` (by
+/// `last_event_at`, the ingest-side clock), newest first, at most `limit`.
+/// Every app, no scope: `sauron-ingest`'s startup re-check of `users_seen`.
+pub async fn issue_ids_with_events_since(
+    conn: &mut AsyncPgConnection,
+    since: DateTime<Utc>,
+    limit: i64,
+) -> QueryResult<Vec<Uuid>> {
+    issues::table
+        .select(issues::id)
+        .filter(issues::last_event_at.ge(since))
+        .order(issues::last_event_at.desc())
+        .limit(limit)
+        .load(conn)
         .await
 }
 
@@ -6271,6 +6583,38 @@ pub async fn latest_error_event(
     let row: Option<ErrorEvent> = crate::scope_env!(query, error_events, &scope.env)
         .select(ErrorEvent::as_select())
         .order(error_events::occurred_at.desc())
+        .first(conn)
+        .await
+        .optional()?;
+    let Some(ev) = row else { return Ok(None) };
+    let mut one = [ev];
+    crate::stack_pool::hydrate(conn, &mut one).await?;
+    let [ev] = one;
+    Ok(Some(ev))
+}
+
+/// One occurrence of `issue_id` by its id: [`latest_error_event`] for a
+/// chosen occurrence instead of the newest (MCP `get_issue`'s `event_id`).
+///
+/// Confined exactly as [`latest_error_event`] is: the scope's app, the
+/// issue, and the scope's environments. An id that belongs to another issue,
+/// another app or an environment outside the scope is `None`, the same answer
+/// as an id that does not exist. Hot rows only, and the pooled stack trace is
+/// hydrated like every other read. The lookup is the `(id, occurred_at)`
+/// primary key's leading column in each partition.
+pub async fn error_event_by_id(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    issue_id: Uuid,
+    event_id: Uuid,
+) -> QueryResult<Option<ErrorEvent>> {
+    let query = error_events::table
+        .filter(error_events::app_id.eq(scope.app_id))
+        .filter(error_events::issue_id.eq(issue_id))
+        .filter(error_events::id.eq(event_id))
+        .into_boxed();
+    let row: Option<ErrorEvent> = crate::scope_env!(query, error_events, &scope.env)
+        .select(ErrorEvent::as_select())
         .first(conn)
         .await
         .optional()?;
@@ -13106,9 +13450,9 @@ struct ExpiredRows {
 /// rows. "Housekeeping" would have quietly become a storage leak and a wrong
 /// number on every chart.
 ///
-/// One data-modifying CTE rather than two statements: `conn.transaction(...)`
-/// is blocked by the MSRV (see `delete_app` for the same constraint), and the
-/// two halves must not be separable. The row delete is the CTE and the pin
+/// One data-modifying CTE rather than two statements: the two halves must not
+/// be separable, and one statement is atomic without a `conn.transaction`
+/// block (as in `delete_app`). The row delete is the CTE and the pin
 /// delete is the main statement, so they share one snapshot and either both
 /// happen or neither does. That matters because the READ path keys on the pin
 /// ROW EXISTING, not on its expiry: for as long as the pin row is there the
@@ -15940,8 +16284,8 @@ mod password_reset_reason_tests {
 /// Create or update a subscription and replace its environment set, in ONE
 /// data-modifying CTE.
 ///
-/// One statement means atomicity without `conn.transaction`, which the MSRV
-/// blocks. A two-statement version could leave the parent updated and the child
+/// One statement means atomicity without a `conn.transaction` block. A
+/// two-statement version could leave the parent updated and the child
 /// rows stale — and a stale-empty child set is read everywhere downstream as
 /// "all environments", which WIDENS the subscription rather than narrowing it.
 #[allow(clippy::too_many_arguments)]
@@ -17446,7 +17790,8 @@ pub struct FlushOutcome {
 }
 
 /// Persist one unit's findings AND advance the cursor in ONE data-modifying
-/// CTE. There is no `conn.transaction` in this repository (MSRV 1.82).
+/// CTE: one statement, so both commit together without a `conn.transaction`
+/// block.
 ///
 /// Four properties are load-bearing:
 ///
@@ -20250,10 +20595,8 @@ const FAILURE_ROW_SELECT: &str = "
 /// Record one ingest failure, folding it into its fingerprint group and
 /// retaining the payload if the group is still under `payload_cap`.
 ///
-/// **One statement, not a transaction.** `conn.transaction` is avoided
-/// workspace-wide (diesel-async 0.9 wants async closures, which would push the
-/// MSRV past the 1.82 the RPM spec builds against), so the upsert and the
-/// conditional child insert are a single data-modifying CTE.
+/// **One statement, not a transaction.** The upsert and the conditional child
+/// insert are a single data-modifying CTE: atomic, and one round trip.
 ///
 /// The cap is tested with `count(*)` over the children rather than a stored
 /// counter. That is not merely simpler: sub-statements of one statement share a

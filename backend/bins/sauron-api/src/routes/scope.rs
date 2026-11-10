@@ -163,16 +163,19 @@ pub async fn authorized_read_scope(
 /// **resolved** scope — for handlers that gate a second capability on top of the
 /// read itself.
 ///
-/// Every current caller gates the same one: `source:read` over the
-/// de-obfuscated source lines in an `ErrorEvent`'s `stacktrace_symbolicated`.
-/// As of this comment there are six: `issues::detail`, `issues::events`,
-/// `sessions::detail`, `devices::detail`, `screens::detail`,
-/// `analytics::person` — `grep -n authorized_read_scope_with_perms
-/// src/routes/*.rs` finds each of them. That grep returns NINE lines, not eight:
-/// the six call sites, this file's doc and definition lines, and `mod.rs:74`,
-/// which is prose in a comment rather than a call site. The last four were added when the gate turned out to be
-/// enforced only on the issues pair while those four returned whole event rows,
-/// context lines included, off `event:read` alone.
+/// Every caller gates the same one: `source:read` over the de-obfuscated
+/// source lines in an `ErrorEvent`'s `stacktrace_symbolicated`. The routes
+/// that return whole event rows call this (`grep -n
+/// authorized_read_scope_with_perms src/routes/*.rs` lists them; some are
+/// prose in comments). The issue detail and event list no longer call it
+/// directly: `issues::detail` goes through `issues::load_issue_scoped` and
+/// `issues::events` through `issues::search_issue_events`, and the session
+/// detail through `sessions::load_session_scoped`. Those three take a typed
+/// `EnvFilter` and call `sauron_auth::authorize_env_read_with_perms`
+/// themselves, so the MCP tools (which have no query string) reach the same
+/// authorization. The gate was once enforced only on the issues pair while
+/// the other routes returned whole event rows, context lines included, off
+/// `event:read` alone.
 ///
 /// Use this instead of pairing [`authorized_read_scope`] with a separate
 /// permission lookup. The separate lookup it replaces (`super::authorize_app_perms`,

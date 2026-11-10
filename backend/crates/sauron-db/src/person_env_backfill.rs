@@ -44,10 +44,11 @@ pub async fn backfill_app(
     app_id: Uuid,
     cutoff: DateTime<Utc>,
 ) -> QueryResult<usize> {
-    // Explicit BEGIN/COMMIT rather than `conn.transaction(|c| …)`: diesel-async
-    // 0.9's closure signature needs async closures, which would push the
-    // workspace MSRV past the 1.82 the RPM spec builds against. Same reasoning
-    // as `batch::write_rows_once`.
+    // Explicit BEGIN/COMMIT rather than `conn.transaction(async |c| …)`. Both
+    // work at the 1.88 MSRV (async closures are stable since Rust 1.85, and
+    // `routes/environments.rs` uses `conn.transaction` that way); this block
+    // predates that and behaves the same. Same pattern as
+    // `batch::write_rows_once`.
     conn.batch_execute("BEGIN").await?;
     match backfill_app_inner(conn, app_id, cutoff).await {
         Ok(n) => {

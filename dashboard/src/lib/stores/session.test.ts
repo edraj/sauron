@@ -189,7 +189,7 @@ describe('resolveCurrentEnvironment (via setApp)', () => {
     window.localStorage.setItem(ENV_KEY, 'env-b');
 
     mockListOrgs.mockResolvedValue([
-      { id: 'org-1', name: 'Org 1', slug: 'org-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', project_count: 1, can_create_project: true },
+      { id: 'org-1', name: 'Org 1', slug: 'org-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', project_count: 1, can_create_project: true, mcp_enabled: false },
     ]);
     mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
     mockListProjects.mockResolvedValue([
@@ -964,7 +964,7 @@ describe('load() in-flight idempotency (fresh-login double bootstrap)', () => {
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',
         project_count: 1,
-        can_create_project: true,
+        can_create_project: true, mcp_enabled: false,
       },
     ]);
     mockGetAccess.mockResolvedValue({ permissions: [], grants: [] });
@@ -1242,7 +1242,7 @@ describe('accessError', () => {
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',
         project_count: 0,
-        can_create_project: true,
+        can_create_project: true, mcp_enabled: false,
       },
     ]);
     mockListProjects.mockResolvedValue([]);
@@ -1358,6 +1358,7 @@ describe('reachableProjectCount', () => {
       updated_at: '2026-01-01T00:00:00Z',
       project_count,
       can_create_project,
+      mcp_enabled: false,
     };
   }
 
@@ -1425,7 +1426,7 @@ describe('seedFromUrl (shared links)', () => {
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     project_count: 1,
-    can_create_project: true,
+    can_create_project: true, mcp_enabled: false,
   });
   const project = (id: string, orgId: string) => ({
     id,

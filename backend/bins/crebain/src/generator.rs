@@ -586,7 +586,7 @@ fn event_items(user: &VirtualUser, seq: u64, workflow_ratio: f64) -> (EnvelopeIt
             "payment_method": PAYMENT_METHODS[(pick + 3) % PAYMENT_METHODS.len()],
             "app_version": APP_VERSIONS[(pick + 7) % APP_VERSIONS.len()],
             "ab_variant": AB_VARIANTS[pick % AB_VARIANTS.len()],
-            "feature_flag_checkout_v2": pick % 2 == 0,
+            "feature_flag_checkout_v2": pick.is_multiple_of(2),
             "cart_value_cents": (pick % 100) * 149,
             "item_count": (pick % 20) + 1,
             "order_id": format!("order-{}-{}", user.index, seq),
@@ -614,7 +614,7 @@ fn event_items(user: &VirtualUser, seq: u64, workflow_ratio: f64) -> (EnvelopeIt
             "ab_variant": AB_VARIANTS[(pick + 2) % AB_VARIANTS.len()],
             "payment_method": PAYMENT_METHODS[(pick + 1) % PAYMENT_METHODS.len()],
             "app_version": APP_VERSIONS[(pick + 2) % APP_VERSIONS.len()],
-            "feature_flag_dark_mode": pick % 3 == 0,
+            "feature_flag_dark_mode": pick.is_multiple_of(3),
             "active_flags": [
                 AB_VARIANTS[pick % AB_VARIANTS.len()],
                 DEVICE_TYPES[pick % DEVICE_TYPES.len()],
@@ -632,7 +632,7 @@ fn event_items(user: &VirtualUser, seq: u64, workflow_ratio: f64) -> (EnvelopeIt
             "payment_method": PAYMENT_METHODS[(pick + 2) % PAYMENT_METHODS.len()],
             "app_version": APP_VERSIONS[(pick + 3) % APP_VERSIONS.len()],
             "ab_variant": AB_VARIANTS[(pick + 1) % AB_VARIANTS.len()],
-            "feature_flag_checkout_v2": pick % 2 == 0,
+            "feature_flag_checkout_v2": pick.is_multiple_of(2),
             "cart_value_cents": (pick % 100) * 173,
             "item_count": (pick % 20) + 1,
             "retry_count": pick % 4,
@@ -652,7 +652,7 @@ fn event_items(user: &VirtualUser, seq: u64, workflow_ratio: f64) -> (EnvelopeIt
         workflow_name: workflow.as_ref().map(|(_, name)| name.clone()),
         timestamp: Utc::now(),
         finished_at: None,
-        tags: json!({ "tier": if pick % 3 == 0 { "premium" } else { "free" } }),
+        tags: json!({ "tier": if pick.is_multiple_of(3) { "premium" } else { "free" } }),
         extra: json!({ "retry_count": pick % 4 }),
     });
     (event, txn)
@@ -737,7 +737,7 @@ fn issue_items(user: &VirtualUser, seq: u64, shape: Shape) -> (EnvelopeItem, Env
             } else {
                 Level::Error
             }
-        } else if seq % 7 == 0 {
+        } else if seq.is_multiple_of(7) {
             Level::Fatal
         } else {
             Level::Error
@@ -796,7 +796,7 @@ fn issue_items(user: &VirtualUser, seq: u64, shape: Shape) -> (EnvelopeItem, Env
             "payment_method": PAYMENT_METHODS[(pick + 2) % PAYMENT_METHODS.len()],
             "app_version": APP_VERSIONS[(pick + 4) % APP_VERSIONS.len()],
             "ab_variant": AB_VARIANTS[(pick + 1) % AB_VARIANTS.len()],
-            "feature_flag_dark_mode": pick % 2 == 0,
+            "feature_flag_dark_mode": pick.is_multiple_of(2),
             "device_type": DEVICE_TYPES[(pick + 1) % DEVICE_TYPES.len()],
             "tags": [
                 PLAN_TIERS[pick % PLAN_TIERS.len()],
@@ -818,7 +818,7 @@ fn issue_items(user: &VirtualUser, seq: u64, shape: Shape) -> (EnvelopeItem, Env
             "region": REGIONS[(pick + 5) % REGIONS.len()],
             "payment_method": PAYMENT_METHODS[(pick + 4) % PAYMENT_METHODS.len()],
             "app_version": APP_VERSIONS[(pick + 1) % APP_VERSIONS.len()],
-            "feature_flag_checkout_v2": pick % 3 == 0,
+            "feature_flag_checkout_v2": pick.is_multiple_of(3),
         }),
         fingerprint: None,
         user: None,

@@ -20,6 +20,8 @@ const MAIN_RS: &str = include_str!("../src/main.rs");
 /// path. Verified against the source of the handler itself by
 /// `audited_handlers_actually_call_record`.
 const AUDITED: &[&str] = &[
+    "routes::account::create_api_key",
+    "routes::account::delete_api_key",
     "routes::admin::create_restore",
     "routes::admin::extend_pin",
     "routes::admin::release_pin",
@@ -61,6 +63,7 @@ const AUDITED: &[&str] = &[
     "routes::notifications::test_channel",
     "routes::notifications::update_channel",
     "routes::notifications::update_rule",
+    "routes::orgs::update_org_settings",
     "routes::orgs::create_grant",
     "routes::orgs::create_member",
     "routes::orgs::create_org",
@@ -307,6 +310,7 @@ fn every_exemption_carries_a_real_reason() {
 /// was added to AUDITED by a later feature and went unchecked until this guard
 /// was added.
 const SOURCES: &[(&str, &str)] = &[
+    ("routes::account", include_str!("../src/routes/account.rs")),
     ("routes::admin", include_str!("../src/routes/admin.rs")),
     ("routes::apps", include_str!("../src/routes/apps.rs")),
     (
