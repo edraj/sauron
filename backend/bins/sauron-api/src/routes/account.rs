@@ -591,7 +591,10 @@ mod tests {
             id: Uuid::nil(),
             user_id: Uuid::nil(),
             name: "laptop".into(),
-            token_prefix: "sauron_pat_abc123".into(),
+            // Low-entropy placeholder on purpose: a random-looking value next
+            // to a `token…` field trips gitleaks' generic-api-key rule and
+            // fails the security gate (see .gitleaks.toml).
+            token_prefix: "sauron_pat_000000".into(),
             token_hash: "0".repeat(64),
             created_at: now,
             expires_at,
@@ -618,7 +621,7 @@ mod tests {
         );
         assert_eq!(
             revoked["prefix"],
-            serde_json::json!({"from": "sauron_pat_abc123", "to": null})
+            serde_json::json!({"from": "sauron_pat_000000", "to": null})
         );
         assert_eq!(revoked["expires_at"]["from"], serde_json::json!(exp));
         assert!(revoked["expires_at"]["to"].is_null());
