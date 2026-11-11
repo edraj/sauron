@@ -572,6 +572,13 @@ pub fn has_free_text(node: &ResolvedNode) -> bool {
 /// out to be a server fault.
 pub fn map_plan_error(e: PlanError) -> ApiError {
     match e {
+        // The pool's `statement_timeout` cancelled a pipeline statement: the
+        // request budget ran out, which every other read reports as 503
+        // `query_timeout`. The pipeline flattens the diesel error to its
+        // message, so the shared message predicate decides.
+        PlanError::Database(inner) if sauron_db::is_statement_timeout_message(&inner) => {
+            ApiError::query_timeout()
+        }
         PlanError::Database(inner) => ApiError::Internal(inner),
         e @ PlanError::NotYetSupported { .. }
         | e @ PlanError::UnsupportedOnResource { .. }
@@ -1692,6 +1699,21 @@ mod tests {
     /// environment check a no-op and cannot make them pass for a new reason.
     fn reject(node: &ResolvedNode, reach: TextSearchReach) -> Result<(), ApiError> {
         reject_withheld_dimensions(node, reach, EnvNameReach::Readable)
+    }
+
+    /// A statement the pool's `statement_timeout` cancelled inside the search
+    /// pipeline is the request budget running out, the same class as every
+    /// other timed-out read (`From<diesel::result::Error> for ApiError`): a
+    /// 503 `query_timeout` that tells the caller to narrow the window, not a
+    /// bare 500.
+    #[test]
+    fn a_statement_timeout_in_the_pipeline_is_a_query_timeout() {
+        assert!(matches!(
+            map_plan_error(PlanError::Database(
+                "canceling statement due to statement timeout".into()
+            )),
+            ApiError::Unavailable("query_timeout", _)
+        ));
     }
 
     #[test]

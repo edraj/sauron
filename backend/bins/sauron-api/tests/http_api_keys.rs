@@ -515,6 +515,79 @@ async fn key_cap_is_25() {
     server.shutdown().await;
 }
 
+/// The cap holds against concurrent creates: with one slot left, parallel
+/// requests must yield exactly one key. A count-then-insert lets every one of
+/// them see 24 and pass.
+#[tokio::test]
+async fn key_cap_holds_under_concurrent_creates() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (_e, user_id, _o, jwt) = jwt_for(&server, "akrace").await;
+    let mut conn = server.conn().await;
+    for i in 0..24 {
+        let m = sauron_auth::api_key::mint_api_key();
+        sauron_db::api_keys::insert(
+            &mut conn,
+            user_id,
+            &format!("k{i}"),
+            &m.prefix,
+            &m.hash,
+            None,
+        )
+        .await
+        .expect("seed key");
+    }
+    drop(conn);
+
+    // Open ten keep-alive connections first, so the ten creates below reach
+    // the server together instead of staggered by TCP handshakes; the race
+    // window is one database round trip wide.
+    let mut warm = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        let req = server
+            .client
+            .get(format!("{}/v1/me/api-keys", server.base))
+            .bearer_auth(&jwt);
+        warm.spawn(async move { req.send().await.expect("warm-up GET") });
+    }
+    while let Some(r) = warm.join_next().await {
+        assert_eq!(r.expect("join").status().as_u16(), 200);
+    }
+
+    // Ten at once, inside the endpoint's 20/min budget.
+    let mut attempts = tokio::task::JoinSet::new();
+    for i in 0..10 {
+        let req = server
+            .client
+            .post(format!("{}/v1/me/api-keys", server.base))
+            .bearer_auth(&jwt)
+            .json(&json!({"name": format!("race{i}"), "expiry": "90d"}));
+        attempts.spawn(async move { req.send().await.expect("POST /v1/me/api-keys") });
+    }
+    let mut statuses: Vec<u16> = Vec::new();
+    while let Some(r) = attempts.join_next().await {
+        statuses.push(r.expect("join").status().as_u16());
+    }
+    let created = statuses.iter().filter(|s| **s == 201).count();
+    assert_eq!(
+        created, 1,
+        "exactly one create fits the last slot: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().all(|s| *s == 201 || *s == 409),
+        "the rest are the cap's 409: {statuses:?}"
+    );
+
+    let mut conn = server.conn().await;
+    let live = sauron_db::api_keys::count_live_for_user(&mut conn, user_id)
+        .await
+        .expect("count");
+    drop(conn);
+    assert_eq!(live, 25);
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn create_and_revoke_are_audited() {
     let Some(mut server) = TestServer::start().await else {
@@ -753,5 +826,184 @@ async fn own_password_change_keeps_keys() {
     let status = resp.status().as_u16();
     assert!(status < 300, "change password failed: {status}");
     assert!(key_is_live(&server, &token).await);
+    server.shutdown().await;
+}
+
+/// `POST /v1/orgs/{org}/members/revoke-api-keys`: every live key of every
+/// named member, recorded per member (reason, who, audit), and only theirs.
+#[tokio::test]
+async fn admin_bulk_revoke_revokes_every_named_members_keys() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (owner_email, owner_id, org_id) = register_owner(&server, "akbulk").await;
+    let (owner_jwt, _) = server.login(&owner_email, PASSWORD, UA).await;
+    let (jwt_a, a) = seed_member(&server, org_id, "akbulka", &["event:read"]).await;
+    let (jwt_b, b) = seed_member(&server, org_id, "akbulkb", &["event:read"]).await;
+    let (jwt_c, c) = seed_member(&server, org_id, "akbulkc", &["event:read"]).await;
+    let a1 = member_key(&server, &jwt_a).await;
+    let a2 = member_key(&server, &jwt_a).await;
+    let b1 = member_key(&server, &jwt_b).await;
+    let c1 = member_key(&server, &jwt_c).await;
+
+    // The Members page sees who holds working keys.
+    let members = server
+        .get_json(&format!("/v1/orgs/{org_id}/members"), &owner_jwt)
+        .await;
+    let keys_of = |members: &Value, id: Uuid| -> Value {
+        members
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["user_id"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} listed"))["api_keys"]
+            .clone()
+    };
+    assert_eq!(keys_of(&members, a)["active"], 2, "{members}");
+    assert_eq!(keys_of(&members, owner_id)["active"], 0);
+
+    // A named twice counts once.
+    let resp = server
+        .post_json(
+            &format!("/v1/orgs/{org_id}/members/revoke-api-keys"),
+            Some(&owner_jwt),
+            json!({"user_ids": [a, b, a]}),
+        )
+        .await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revoked"], 3, "{body}");
+    let per: std::collections::HashMap<String, i64> = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["user_id"].as_str().unwrap().to_string(),
+                m["revoked"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(per[&a.to_string()], 2, "{body}");
+    assert_eq!(per[&b.to_string()], 1, "{body}");
+
+    for t in [&a1, &a2, &b1] {
+        assert!(
+            !key_is_live(&server, t).await,
+            "a named member's key is dead"
+        );
+    }
+    assert!(
+        key_is_live(&server, &c1).await,
+        "an unnamed member's key lives"
+    );
+
+    // The member sees when and why on their own Account page.
+    let mine = server
+        .get_json("/v1/me/api-keys?include_revoked=1", &jwt_a)
+        .await;
+    let mine = mine.as_array().unwrap();
+    assert_eq!(mine.len(), 2, "{mine:?}");
+    for k in mine {
+        assert_eq!(k["revoked_reason"], "admin_revoked", "{k}");
+        assert!(k["revoked_at"].is_string(), "{k}");
+    }
+    assert_eq!(
+        server.get_json("/v1/me/api-keys", &jwt_a).await,
+        json!([]),
+        "without the flag only live keys are listed"
+    );
+
+    let members = server
+        .get_json(&format!("/v1/orgs/{org_id}/members"), &owner_jwt)
+        .await;
+    assert_eq!(keys_of(&members, a)["active"], 0);
+    assert_eq!(keys_of(&members, c)["active"], 1);
+    assert!(keys_of(&members, a)["revoked_by_password_reset_at"].is_null());
+
+    // One audit row per named member, with the count and the reason.
+    use diesel_async::RunQueryDsl;
+    let mut conn = server.conn().await;
+    let rows = diesel::sql_query(
+        "SELECT action, changes FROM audit_log WHERE org_id = $1 \
+         AND action = 'access_key.revoke_all' ORDER BY (changes->'revoked_keys'->>'to')::int",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(org_id)
+    .load::<AuditRow>(&mut conn)
+    .await
+    .expect("query audit_log");
+    drop(conn);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].changes["revoked_keys"]["to"], 1,
+        "{}",
+        rows[0].changes
+    );
+    assert_eq!(
+        rows[1].changes["revoked_keys"]["to"], 2,
+        "{}",
+        rows[1].changes
+    );
+    for r in &rows {
+        assert_eq!(r.changes["reason"]["to"], "admin_revoked", "{}", r.changes);
+    }
+    server.shutdown().await;
+}
+
+/// The refusals, each before anything is revoked.
+#[tokio::test]
+async fn admin_bulk_revoke_refuses_without_revoking_anything() {
+    let Some(mut server) = TestServer::start().await else {
+        return;
+    };
+    let (owner_email, owner_id, org_id) = register_owner(&server, "akbulkr").await;
+    let (owner_jwt, _) = server.login(&owner_email, PASSWORD, UA).await;
+    let (jwt_a, a) = seed_member(&server, org_id, "akbulkra", &["event:read"]).await;
+    let a1 = member_key(&server, &jwt_a).await;
+    let path = format!("/v1/orgs/{org_id}/members/revoke-api-keys");
+    let post = |token: String, user_ids: Value| {
+        let server = &server;
+        let path = path.clone();
+        async move {
+            let resp = server
+                .post_json(&path, Some(&token), json!({"user_ids": user_ids}))
+                .await;
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+
+    let (s, body) = post(owner_jwt.clone(), json!([])).await;
+    assert_eq!(s, 400, "no member named: {body}");
+
+    let too_many: Vec<Uuid> = (0..101).map(|_| Uuid::new_v4()).collect();
+    let (s, body) = post(owner_jwt.clone(), json!(too_many)).await;
+    assert_eq!(s, 400, "more than 100: {body}");
+
+    let (s, body) = post(owner_jwt.clone(), json!([a, owner_id])).await;
+    assert_eq!(s, 409, "yourself: {body}");
+
+    // A stranger's id among real members: 404, and the real member's key
+    // survives (every check runs before any revoke). The stranger is not
+    // named: that would be an email lookup by id.
+    let stranger = register_owner(&server, "akbulkx").await;
+    let (s, body) = post(owner_jwt.clone(), json!([a, stranger.1])).await;
+    assert_eq!(s, 404, "not a member here: {body}");
+    assert!(!body.to_string().contains(&stranger.0), "{body}");
+    assert!(key_is_live(&server, &a1).await);
+
+    // A member without member:credential may not.
+    let (jwt_r, _) = seed_member(
+        &server,
+        org_id,
+        "akbulkrd",
+        &["member:read", "member:manage"],
+    )
+    .await;
+    let (s, body) = post(jwt_r, json!([a])).await;
+    assert_eq!(s, 403, "needs member:credential: {body}");
+    assert!(key_is_live(&server, &a1).await);
     server.shutdown().await;
 }

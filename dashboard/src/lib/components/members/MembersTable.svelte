@@ -4,7 +4,9 @@
   import Badge from '../ui/Badge.svelte';
   import RowActionsMenu from '../ui/RowActionsMenu.svelte';
   import { sessionStore } from '../../stores/session.svelte';
-  import { initials } from '../../utils/format';
+  import { formatDateTime, initials } from '../../utils/format';
+  import { canRevokeMemberKeys, recentResetRevocation } from '../../models/api-keys';
+  import { formatNumber } from '../../i18n';
   import { canCancelPasswordReset, canResetMemberPassword } from '../../models/password-reset';
   import { canRequestEmailChange, canWithdrawEmailChange } from '../../models/email-change';
     import { lockTip } from '../../actions/lock-tip';
@@ -61,6 +63,15 @@
     onemailchange: (member: Member, action: 'request' | 'withdraw') => void;
     /** Asks to remove one scope; the page confirms before anything is deleted. */
     onremovegrant: (grantId: string, context: { member: string; scope: string }) => void;
+    /** Members ticked for a bulk action (today: revoking API keys), by user id. */
+    selectedIds: string[];
+    /** One member's box changed. */
+    onselect: (userId: string, checked: boolean) => void;
+    /** The header box: tick or clear every member that can be selected. */
+    onselectall: (checked: boolean) => void;
+    /** Asks to revoke one member's API keys; the page confirms first. Gated on
+        `credentialLock`, as the server requires both permissions. */
+    onrevokekeys: (member: Member) => void;
   }
 
   let {
@@ -81,7 +92,18 @@
     onresetpassword,
     onemailchange,
     onremovegrant,
+    selectedIds,
+    onselect,
+    onselectall,
+    onrevokekeys,
   }: Props = $props();
+
+  // Everyone but the signed-in admin: the server refuses a self-target.
+  const selectable = $derived(grouped.filter((m) => canRevokeMemberKeys(m, currentUserId)));
+  const selectedCount = $derived(
+    selectable.filter((m) => selectedIds.includes(m.user_id)).length,
+  );
+  const allSelected = $derived(selectable.length > 0 && selectedCount === selectable.length);
 
   const envsById = $derived.by(() => {
     const map: Record<string, AppEnvironment> = {};
@@ -128,6 +150,16 @@
 <DataTable>
   {#snippet head()}
         <tr>
+          <th class="col-sel">
+            <input
+              type="checkbox"
+              aria-label={t('members.select.all')}
+              checked={allSelected}
+              indeterminate={selectedCount > 0 && !allSelected}
+              disabled={selectable.length === 0}
+              onchange={(e) => onselectall(e.currentTarget.checked)}
+            />
+          </th>
           <th>{t('members.column.member')}</th>
           <th>{t('members.column.role')}</th>
           <th>{t('members.column.scope')}</th>
@@ -136,7 +168,18 @@
   {/snippet}
   {#snippet children()}
         {#each grouped as member (member.user_id)}
+          {@const resetRevokedAt = recentResetRevocation(member.api_keys)}
           <tr class:inactive={!member.is_active}>
+            <td class="col-sel">
+              {#if canRevokeMemberKeys(member, currentUserId)}
+                <input
+                  type="checkbox"
+                  aria-label={t('members.select.one', { member: member.name || member.email })}
+                  checked={selectedIds.includes(member.user_id)}
+                  onchange={(e) => onselect(member.user_id, e.currentTarget.checked)}
+                />
+              {/if}
+            </td>
             <td>
               <div class="member-cell">
                 <span class="m-avatar">{initials(member.name || member.email)}</span>
@@ -149,6 +192,27 @@
                            to show without being opened: the admin who forced it may
                            not be the one fielding "I can't log in". -->
                       <Badge tone="warning" size="sm">{t('members.resetPending')}</Badge>
+                    {/if}
+                    {#if member.api_keys.active > 0}
+                      <span title={t('members.apiKeys.activeTitle')}>
+                        <Badge tone="neutral" size="sm"
+                          >{member.api_keys.active === 1
+                            ? t('members.apiKeys.one')
+                            : t('members.apiKeys.many', { n: formatNumber(member.api_keys.active) })}</Badge
+                        >
+                      </span>
+                    {/if}
+                    {#if resetRevokedAt}
+                      <!-- The member's MCP client stopped working and they may
+                           not connect it to the reset; the admin fielding
+                           "Claude can't reach Sauron" sees why here. -->
+                      <span
+                        title={t('members.apiKeys.revokedByResetTitle', {
+                          when: formatDateTime(resetRevokedAt),
+                        })}
+                      >
+                        <Badge tone="warning" size="sm">{t('members.apiKeys.revokedByReset')}</Badge>
+                      </span>
                     {/if}
                     {#if member.pending_email_change}
                       <!-- Shown with the address, because the admin typed it and
@@ -303,6 +367,22 @@
                           >{/if}{t('members.menu.signOutAll')}
                       </button>
                     {/if}
+                    {#if canRevokeMemberKeys(member, currentUserId)}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        class="ram-item"
+                        use:lockTip={credentialLock}
+                        onclick={() => {
+                          close();
+                          onrevokekeys(member);
+                        }}
+                      >
+                        {#if credentialLock}<span class="ram-lock" aria-hidden="true"
+                            ><Icon name="lock" size={12} /></span
+                          >{/if}{t('members.menu.revokeApiKeys')}
+                      </button>
+                    {/if}
                     <button
                       type="button"
                       role="menuitem"
@@ -327,8 +407,15 @@
 </DataTable>
 
 <style>
-  tr.inactive td:not(.col-act) {
+  tr.inactive td:not(.col-act):not(.col-sel) {
     opacity: 0.58;
+  }
+  .col-sel {
+    width: 1%;
+    padding-inline-end: 0;
+  }
+  .col-sel input {
+    cursor: pointer;
   }
   .col-act {
     text-align: end;

@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
-use diesel::sql_types::{Nullable, Text, Timestamptz, Uuid as SqlUuid};
+use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
@@ -101,6 +101,40 @@ pub async fn list_for_app(
         .bind::<SqlUuid, _>(scope.app_id);
     let stmt = crate::bind_env!(stmt, &scope.env);
     stmt.load(conn).await
+}
+
+#[derive(QueryableByName)]
+struct RecentRelease {
+    #[diesel(sql_type = Text)]
+    release: String,
+}
+
+/// The `limit` most recently seen distinct releases the scope may see, each
+/// ranked by its latest sighting in any of the scope's environments, newest
+/// first (ties by release). [`list_for_app`] folded the same way, but with the
+/// cut made in SQL: a caller wanting a handful of names (MCP `list_apps`)
+/// does not load an app's whole catalogue, which a release per CI build can
+/// make thousands of rows per environment.
+pub async fn recent_for_app(
+    conn: &mut AsyncPgConnection,
+    scope: &ReadScope,
+    limit: i64,
+) -> QueryResult<Vec<String>> {
+    // `$1` app, the environment at `$2` when it binds one, the limit last.
+    let env_sql = scope.env.sql_fragment(2);
+    let limit_idx = if scope.env.consumes_bind() { 3 } else { 2 };
+    let sql = format!(
+        "SELECT release FROM app_releases WHERE app_id = $1{env_sql} \
+         GROUP BY release \
+         ORDER BY max(last_seen_at) DESC, release \
+         LIMIT ${limit_idx}"
+    );
+    let stmt = diesel::sql_query(sql)
+        .into_boxed()
+        .bind::<SqlUuid, _>(scope.app_id);
+    let stmt = crate::bind_env!(stmt, &scope.env);
+    let rows: Vec<RecentRelease> = stmt.bind::<BigInt, _>(limit).load(conn).await?;
+    Ok(rows.into_iter().map(|r| r.release).collect())
 }
 
 /// What one `backfill_all` run did, in the two numbers an operator needs to

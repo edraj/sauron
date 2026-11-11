@@ -9,8 +9,13 @@
 //! response never says whether a key exists. The owner-state refusals (403)
 //! are only reachable with a live key, so they disclose nothing to someone who
 //! does not already hold one.
+//!
+//! Two budgets, both `429`: per client address before the key is looked up
+//! (so made-up keys cannot become unthrottled Postgres lookups), then per key.
 
-use axum::extract::{Request, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -21,15 +26,21 @@ use sauron_auth::AuthError;
 use sauron_db::api_keys::{self, KeyOwner};
 
 use crate::error::ApiError;
-use crate::routes::auth::within_budget;
+use crate::routes::auth::{client_addr, within_budget};
 use crate::AppState;
 
 /// The challenge on every 401, so an MCP client recognises an auth failure
 /// (and not a server fault) and tells the developer to fix the key.
 const BEARER_CHALLENGE: &str = r#"Bearer realm="sauron""#;
 
-/// Fixed-window length of the per-key limiter, seconds.
+/// Fixed-window length of the per-key and per-address limiters, seconds.
 const RATE_WINDOW_SECS: u64 = 60;
+
+/// The per-client-address budget for key lookups, as a multiple of the
+/// per-key one (`MCP_CALLS_PER_MIN`). It only has to stop one address from
+/// turning made-up keys into unthrottled Postgres lookups, so it is wide: ten
+/// developers behind one office NAT, each at the per-key ceiling, still fit.
+const ADDRESS_BUDGET_FACTOR: u32 = 10;
 
 /// Who is calling, inserted into the request extensions by
 /// [`require_api_key`]. rmcp forwards the request's `http::request::Parts`
@@ -62,7 +73,16 @@ pub(crate) async fn require_api_key(
     mut req: Request,
     next: Next,
 ) -> Response {
-    match authenticate(&state, req.headers()).await {
+    // The server runs with `into_make_service_with_connect_info`, so the peer
+    // is always there; the unspecified address is only a fallback that keeps
+    // a limiter key defined if it ever is not.
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr)
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let client = client_addr(req.headers(), &peer, &state);
+    match authenticate(&state, req.headers(), &client).await {
         Ok(caller) => {
             req.extensions_mut().insert(caller);
             next.run(req).await
@@ -75,12 +95,35 @@ pub(crate) async fn require_api_key(
 /// malformed, unknown, revoked or expired key.
 const UNAUTHENTICATED: ApiError = ApiError::Auth(AuthError::InvalidToken);
 
-async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<McpCaller, ApiError> {
+async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+    client: &str,
+) -> Result<McpCaller, ApiError> {
     // Shape first: a dashboard JWT (or anything else that is not a key) never
     // reaches the database, and gets the same answer as a wrong key.
     let token = bearer_token(headers)
         .filter(|t| sauron_auth::looks_like_api_key(t))
         .ok_or(UNAUTHENTICATED)?;
+
+    // Then the caller's address, BEFORE the lookup: an unknown key has no key
+    // id for the per-key limiter below, so this is the only thing between a
+    // flood of made-up keys and one Postgres round trip each. The same shape
+    // as `/v1/auth/refresh`, the other unauthenticated token lookup.
+    if !within_budget(
+        state,
+        &format!("sauron:mcp:addr:{client}"),
+        state
+            .cfg
+            .mcp_calls_per_min
+            .saturating_mul(ADDRESS_BUDGET_FACTOR),
+        RATE_WINDOW_SECS,
+    )
+    .await
+    {
+        return Err(ApiError::RateLimited);
+    }
+
     let hash = sauron_auth::hash_token(token);
 
     let mut conn = crate::routes::db(state).await?;

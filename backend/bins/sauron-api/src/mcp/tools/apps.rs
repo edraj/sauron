@@ -197,18 +197,11 @@ async fn latest_releases(
         Err(AuthError::Forbidden) => return Ok(withheld(perm::EVENT_READ)),
         Err(e) => return Err(e.into()),
     };
-    // One row per (release, environment), newest `last_seen_at` first.
-    let mut recent: Vec<String> = Vec::with_capacity(RECENT_RELEASES);
-    for row in releases::list_for_app(conn, &scope).await? {
-        let release = row.release.trim();
-        if release.is_empty() || recent.iter().any(|r| r == release) {
-            continue;
-        }
-        recent.push(release.to_string());
-        if recent.len() == RECENT_RELEASES {
-            break;
-        }
-    }
+    // Cut in SQL: an app with a release per CI build has thousands of
+    // catalogue rows, and this prints three names for every app listed.
+    // Releases reach `app_releases` trimmed and non-blank (the ingest edge
+    // and the pipeline normalise them first).
+    let recent = releases::recent_for_app(conn, &scope, RECENT_RELEASES as i64).await?;
     if recent.is_empty() {
         return Ok("none seen yet".into());
     }

@@ -1494,6 +1494,47 @@ pub async fn reset_password(
     // Without this the kill is invisible on THIS replica until its next
     // AUTH_REVOCATION_POLL_SECS tick — the one place the delay is visible.
     state.revocations.mark_revoked(&ids);
+    // This is the account-recovery path, so it assumes compromise the way the
+    // admin-forced reset does: a personal API key minted by whoever held the
+    // account outlives every session above and would keep reading through
+    // MCP. Revoked before the password write, for the same partial-failure
+    // reason as the sessions.
+    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(
+        &mut conn,
+        user_id,
+        sauron_db::api_keys::REVOKE_PASSWORD_RESET,
+        None,
+    )
+    .await?;
+    if revoked_keys > 0 {
+        tracing::warn!(%user_id, revoked_keys, "password reset revoked personal api keys");
+        // In every org the account belongs to, so each admin's Wall of Shame
+        // shows that this member's MCP keys stopped working and why. Recorded
+        // here, right after the revoke: it stands even if the password write
+        // below loses its race. The actor is the account itself, the only
+        // identity there is on this unauthenticated path.
+        crate::audit::record_for_user_orgs(
+            &mut conn,
+            user_id,
+            crate::audit::Entry::new(
+                Uuid::nil(),
+                crate::audit::action::ACCESS_KEY_REVOKE_ALL,
+                crate::audit::entity::ACCESS_KEY,
+            )
+            .target(user_id, &user.email)
+            .changes(crate::audit::created(
+                crate::audit::entity::ACCESS_KEY,
+                &[
+                    ("revoked_keys", serde_json::json!(revoked_keys)),
+                    (
+                        "reason",
+                        serde_json::json!(sauron_db::api_keys::REVOKE_PASSWORD_RESET),
+                    ),
+                ],
+            )),
+        )
+        .await;
+    }
 
     // Zero rows means someone else set the password between the fingerprint
     // read and here, two Argon2 ops of wall clock later. Failing at this point

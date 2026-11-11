@@ -8,7 +8,9 @@
   <body>
     <div id="app"></div>
     <script>
-      window.__SAURON_CONFIG__ = { apiBaseUrl: 'http://localhost:3041', ingestBaseUrl: 'http://localhost:3041' };
+      // Its own origin, not a fixed port: the stubs live in this dev server,
+      // which the preview launcher may move off 3041 when that is taken.
+      window.__SAURON_CONFIG__ = { apiBaseUrl: location.origin, ingestBaseUrl: location.origin };
     </script>
     <script>
       // `?lang=ar` seeds the locale BEFORE the store's constructor runs.

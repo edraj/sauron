@@ -20,6 +20,8 @@
   import { lockedBy } from '../src/lib/models/page-access';
   import { lockTip } from '../src/lib/actions/lock-tip';
   import OrgAiAccessCard from '../src/lib/components/members/OrgAiAccessCard.svelte';
+  import ApiKeys from '../src/lib/components/account/ApiKeys.svelte';
+  import Members from '../src/pages/Members.svelte';
   import Icon from '../src/lib/components/ui/Icon.svelte';
   import { sessionStore } from '../src/lib/stores/session.svelte';
   import type { Permission, ScopeType } from '../src/lib/models';
@@ -34,6 +36,9 @@
 
   // Holds org:manage at ORG level: the AI-access card renders unlocked.
   const ORG_ADMIN: Permission[] = [...VIEWER, 'org:manage', 'member:manage'];
+  // ORG_ADMIN plus member:credential: the Members page's "Revoke API keys"
+  // (bulk bar and row action) renders unlocked.
+  const CREDENTIAL_ADMIN: Permission[] = [...ORG_ADMIN, 'member:credential'];
 
   // Everything an alerting operator for ONE project would plausibly hold.
   const PROJECT_ALERTS: Permission[] = [
@@ -53,6 +58,18 @@
   // verifies rendering, and a real bootstrap would need the whole API.
   $effect(() => {
     sessionStore.loaded = true;
+    // A real org row, not just its id: page actions read `currentOrg` and
+    // quietly do nothing without one (the Members page's revoke, for one).
+    sessionStore.orgs = [
+      {
+        id: 'org1',
+        name: 'Harness org',
+        slug: 'harness',
+        mcp_enabled: true,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      },
+    ];
     sessionStore.currentOrgId = 'org1';
     sessionStore.currentProjectId = 'proj1';
     sessionStore.currentAppId = 'app1';
@@ -79,6 +96,9 @@
     <div class="row">
       <button id="set-viewer" onclick={() => use(VIEWER, 'org', 'org1')}>Viewer grants</button>
       <button id="set-org-admin" onclick={() => use(ORG_ADMIN, 'org', 'org1')}>Org admin grants</button>
+      <button id="set-credential-admin" onclick={() => use(CREDENTIAL_ADMIN, 'org', 'org1')}>
+        Credential admin grants
+      </button>
       <button id="set-narrow" onclick={() => use(NARROW, 'org', 'org1')}>Narrow custom role</button>
       <button id="set-project" onclick={() => use(PROJECT_ALERTS, 'project', 'proj1')}>
         Alerting role on one project
@@ -95,6 +115,12 @@
 
     <h2>Org AI-access card (Members page, org:manage)</h2>
     <div class="card-wrap"><OrgAiAccessCard /></div>
+
+    <h2>API keys card (Account page): revoked keys with their reason</h2>
+    <div class="card-wrap wide"><ApiKeys /></div>
+
+    <h2>Members page: key badges, selection, bulk "Revoke API keys"</h2>
+    <div id="members-page"><Members /></div>
 
     <h2>Buttons</h2>
     <div class="row">
@@ -158,6 +184,7 @@
   h2 { font-size: 14px; margin: 26px 0 10px; color: var(--text-muted); }
   .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
   .card-wrap { max-width: 640px; }
+  .card-wrap.wide { max-width: 960px; }
   .rail { display: flex; flex-direction: column; gap: 2px; width: 220px; }
   .item {
     display: flex; align-items: center; gap: 9px; padding: 7px 10px;

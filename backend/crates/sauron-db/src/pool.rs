@@ -86,10 +86,17 @@ pub fn url_with_statement_timeout(database_url: &str, timeout_ms: u64) -> String
 pub fn is_statement_timeout(err: &diesel::result::Error) -> bool {
     match err {
         diesel::result::Error::DatabaseError(_, info) => {
-            info.message().contains("statement timeout")
+            is_statement_timeout_message(info.message())
         }
         _ => false,
     }
+}
+
+/// [`is_statement_timeout`] for an error that has already been flattened to
+/// its message, as `query_plan::PlanError::Database` carries it. The one place
+/// the message is matched.
+pub fn is_statement_timeout_message(message: &str) -> bool {
+    message.contains("statement timeout")
 }
 
 pub async fn conn(pool: &PgPool) -> anyhow::Result<PgConn> {

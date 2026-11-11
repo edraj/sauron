@@ -756,6 +756,111 @@ async fn a_consumed_link_sets_the_password_and_kills_every_session() {
     srv.shutdown().await;
 }
 
+/// The emailed reset is the account-recovery path: whoever held the account
+/// may have minted a long-lived personal API key, which outlives every session
+/// the reset kills. It goes with them, as on the admin-forced reset.
+#[tokio::test]
+async fn a_consumed_link_revokes_personal_api_keys() {
+    let Some(mut srv) = TestServer::start().await else {
+        eprintln!("skipping: TEST_DATABASE_URL / TEST_REDIS_URL unset");
+        return;
+    };
+    let email = srv.addr("keys");
+    let (id, org, access, _refresh) = owner_of_new_org(&srv, &email, "correcthorse1").await;
+
+    let created = srv
+        .post_json(
+            "/v1/me/api-keys",
+            Some(&access),
+            json!({"name": "left behind", "expiry": "never"}),
+        )
+        .await;
+    assert_eq!(created.status().as_u16(), 201);
+
+    srv.post_raw("/v1/auth/forgot-password", None, json!({"email": email}))
+        .await;
+    let token = newest_reset_token_from_mail(&srv, &email).await;
+    let (status, body) = srv
+        .post_raw(
+            "/v1/auth/reset-password",
+            None,
+            json!({"token": token, "new_password": "thebrandnewone1"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (fresh, _) = login(&srv, &email, "thebrandnewone1").await;
+    let keys: Value = srv
+        .get("/v1/me/api-keys", &fresh)
+        .await
+        .json()
+        .await
+        .expect("key list json");
+    assert_eq!(keys, json!([]), "the reset must revoke every unrevoked key");
+
+    // The owner's Account page says why.
+    let revoked: Value = srv
+        .get("/v1/me/api-keys?include_revoked=1", &fresh)
+        .await
+        .json()
+        .await
+        .expect("key list json");
+    assert_eq!(revoked.as_array().map(Vec::len), Some(1), "{revoked}");
+    assert_eq!(revoked[0]["revoked_reason"], "password_reset", "{revoked}");
+
+    // The Members page dates it, for every admin of the org.
+    let members: Value = srv
+        .get(&format!("/v1/orgs/{org}/members"), &fresh)
+        .await
+        .json()
+        .await
+        .expect("members json");
+    let me = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["user_id"] == json!(id))
+        .expect("the owner is listed");
+    assert_eq!(me["api_keys"]["active"], 0, "{me}");
+    assert_eq!(
+        me["api_keys"]["revoked_by_password_reset_at"], revoked[0]["revoked_at"],
+        "{me}"
+    );
+
+    // And the Wall of Shame records it, attributed to the account itself.
+    let mut conn = srv.conn().await;
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        actor_id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        changes: Value,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT actor_id, changes FROM audit_log WHERE org_id = $1 \
+         AND action = 'access_key.revoke_all'",
+    )
+    .bind::<SqlUuid, _>(org)
+    .load(&mut conn)
+    .await
+    .expect("query audit_log");
+    drop(conn);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor_id, id);
+    assert_eq!(
+        rows[0].changes["revoked_keys"]["to"], 1,
+        "{}",
+        rows[0].changes
+    );
+    assert_eq!(
+        rows[0].changes["reason"]["to"], "password_reset",
+        "{}",
+        rows[0].changes
+    );
+
+    srv.shutdown().await;
+}
+
 #[tokio::test]
 async fn two_simultaneous_resets_with_one_token_yield_exactly_one_success() {
     let Some(mut srv) = TestServer::start().await else {

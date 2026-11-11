@@ -412,19 +412,37 @@ pub(crate) fn visible_or_none<T>(r: Result<Vec<T>, ApiError>) -> Result<Vec<T>, 
     }
 }
 
-/// The names of the app's live environments the caller can see: the same
-/// list the dashboard's environment picker shows them. Empty when they can
-/// see none.
+/// The app's live environments the caller can see, as `(enrollment id,
+/// name)` in the dashboard picker's order: the same list its environment
+/// picker shows them (`env:read` decides). Empty when they can see none. The
+/// one place a tool asks which environment names a caller may learn.
+pub(crate) async fn visible_envs(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    app_id: Uuid,
+) -> Result<Vec<(Uuid, String)>, ToolError> {
+    match visible_app_environments(conn, user_id, app_id).await {
+        Ok(envs) => Ok(envs
+            .into_iter()
+            .map(|e| (e.enrollment.id, e.name))
+            .collect()),
+        Err(ApiError::Auth(AuthError::Forbidden)) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`visible_envs`]' names, for a not-found that offers what the caller can
+/// read.
 async fn visible_env_names(
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
     app_id: Uuid,
 ) -> Result<Vec<String>, ToolError> {
-    match visible_app_environments(conn, user_id, app_id).await {
-        Ok(envs) => Ok(envs.into_iter().map(|e| e.name).collect()),
-        Err(ApiError::Auth(AuthError::Forbidden)) => Ok(Vec::new()),
-        Err(e) => Err(e.into()),
-    }
+    Ok(visible_envs(conn, user_id, app_id)
+        .await?
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect())
 }
 
 /// The one not-found for an environment name: unknown, or not visible to the

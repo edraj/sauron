@@ -38,7 +38,8 @@
   } from '../lib/api/orgs';
   import { listApps } from '../lib/api/apps';
   import { listEnvironments } from '../lib/api/environments';
-  import { revokeMemberSessions } from '../lib/api/account';
+  import { revokeMemberSessions, revokeMembersApiKeys } from '../lib/api/account';
+  import { canRevokeMemberKeys } from '../lib/models/api-keys';
   import { errorMessage } from '../lib/api/client';
   import { toastStore } from '../lib/stores/toast.svelte';
   import Freshness from '../lib/components/ui/Freshness.svelte';
@@ -172,6 +173,70 @@
   // whichever is missing — `member:credential` first, since it is the narrower
   // one deliberately carved out of `member:manage`.
   const credentialLock = $derived(revokeLock ?? manageLock);
+
+  // --- Revoking members' API keys ------------------------------------------
+  // Ticked members, by user id. Cleared on an org switch: ids from one org's
+  // table must never ride into a request against another.
+  let selectedIds = $state<string[]>([]);
+  $effect(() => {
+    void sessionStore.currentOrgId;
+    selectedIds = [];
+  });
+  // Only members still listed and still selectable count, so a reload that
+  // drops someone can never send their id.
+  const selectedMembers = $derived(
+    grouped.filter(
+      (m) => selectedIds.includes(m.user_id) && canRevokeMemberKeys(m, authStore.user?.id ?? ''),
+    ),
+  );
+  // Replaced wholesale, identity never compared: $state.raw.
+  let keysTarget = $state.raw<Member[] | null>(null);
+  let revokingKeys = $state(false);
+
+  function selectMember(userId: string, checked: boolean) {
+    selectedIds = checked
+      ? [...new Set([...selectedIds, userId])]
+      : selectedIds.filter((id) => id !== userId);
+  }
+
+  function selectAllMembers(checked: boolean) {
+    const me = authStore.user?.id ?? '';
+    selectedIds = checked
+      ? grouped.filter((m) => canRevokeMemberKeys(m, me)).map((m) => m.user_id)
+      : [];
+  }
+
+  async function confirmRevokeKeys() {
+    const targets = keysTarget;
+    const org = sessionStore.currentOrg;
+    if (!targets || targets.length === 0 || !org) return;
+    revokingKeys = true;
+    try {
+      const out = await revokeMembersApiKeys(
+        org.id,
+        targets.map((m) => m.user_id),
+      );
+      toastStore.success(
+        out.revoked === 0
+          ? t('members.toast.keysRevokedNone')
+          : out.revoked === 1
+            ? t('members.toast.keysRevokedOne')
+            : t('members.toast.keysRevokedMany', { n: formatNumber(out.revoked) }),
+      );
+      keysTarget = null;
+      const done = new Set(targets.map((m) => m.user_id));
+      selectedIds = selectedIds.filter((id) => !done.has(id));
+      // The key counts on each row come from the roster.
+      await reload();
+    } catch (err) {
+      // The server checks every member before revoking anything, and its
+      // 403/404/409s name the member they are about (outranks you, belongs to
+      // another organization): surface them verbatim, with nothing revoked.
+      toastStore.error(errorMessage(err));
+    } finally {
+      revokingKeys = false;
+    }
+  }
   const canReadMembers = $derived(sessionStore.can('member:read', { level: 'org' }));
 
   const projectOfApp = $derived.by(() => {
@@ -568,6 +633,26 @@
         </form>
       </Card>
 
+    {#if selectedMembers.length > 0}
+      <!-- The bulk bar exists only while something is ticked, so the table
+           reads the same as before for anyone not using it. -->
+      <div class="bulk-bar" role="region" aria-label={t('members.bulk.selected', { n: formatNumber(selectedMembers.length) })}>
+        <span class="bulk-count">{t('members.bulk.selected', { n: formatNumber(selectedMembers.length) })}</span>
+        <Button
+          variant="danger"
+          size="sm"
+          lockedReason={credentialLock}
+          loading={revokingKeys}
+          onclick={() => (keysTarget = selectedMembers)}
+        >
+          {t('members.bulk.revokeApiKeys')}
+        </Button>
+        <Button variant="ghost" size="sm" onclick={() => (selectedIds = [])}>
+          {t('members.bulk.clear')}
+        </Button>
+      </div>
+    {/if}
+
     <MembersTable
       {grouped}
       {appsById}
@@ -586,6 +671,10 @@
       onresetpassword={(m, a) => (resetTarget = { member: m, action: a })}
       onemailchange={(m, a) => (emailTarget = { member: m, action: a })}
       onremovegrant={askRemoveGrant}
+      {selectedIds}
+      onselect={selectMember}
+      onselectall={selectAllMembers}
+      onrevokekeys={(m) => (keysTarget = [m])}
     />
     </div>
   {/if}
@@ -667,6 +756,21 @@
     />
   {/if}
 
+  {#if keysTarget}
+    <ConfirmDialog
+      open
+      title={t('members.confirmRevokeKeysTitle')}
+      message={keysTarget.length === 1
+        ? t('members.confirmRevokeKeysBodyOne', { member: keysTarget[0].name || keysTarget[0].email })
+        : t('members.confirmRevokeKeysBodyMany', { n: formatNumber(keysTarget.length) })}
+      confirmLabel={t('members.bulk.revokeApiKeys')}
+      danger
+      loading={revokingKeys}
+      onconfirm={() => void confirmRevokeKeys()}
+      oncancel={() => (keysTarget = null)}
+    />
+  {/if}
+
   {#if pendingRevoke}
     <ConfirmDialog
       open
@@ -727,5 +831,20 @@
   .grant-title {
     font-size: var(--text-md);
     font-weight: var(--weight-strong);
+  }
+  .bulk-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-2);
+  }
+  .bulk-count {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    margin-inline-end: auto;
   }
 </style>

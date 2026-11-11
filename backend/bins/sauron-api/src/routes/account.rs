@@ -304,6 +304,23 @@ pub struct ApiKeyView {
     pub last_used_at: Option<DateTime<Utc>>,
     /// `expires_at <= now`. Expired keys stay listed until revoked.
     pub expired: bool,
+    /// When it was revoked; only ever set on rows `?include_revoked=1` adds.
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// Why: `user_revoked` (you), `admin_revoked` (an admin revoked it),
+    /// `reset_forced` (an admin forced a password reset) or `password_reset`
+    /// (you reset a forgotten password through the emailed link). Null on a
+    /// live key, and on keys revoked before the reason was recorded.
+    pub revoked_reason: Option<String>,
+}
+
+/// `GET /v1/me/api-keys` query.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ListApiKeysQuery {
+    /// `1` or `true` adds the most recently revoked keys (at most 50), after
+    /// the live ones, with when and why each was revoked. A `String`, like
+    /// `/v1/me/sessions`' flag, so `?include_revoked=1` is not a 400.
+    #[serde(default)]
+    pub include_revoked: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -342,6 +359,8 @@ fn api_key_view(k: &sauron_db::models::ApiKey) -> ApiKeyView {
         expires_at: k.expires_at,
         last_used_at: k.last_used_at,
         expired: k.expires_at.is_some_and(|t| t <= Utc::now()),
+        revoked_at: k.revoked_at,
+        revoked_reason: k.revoked_reason.clone(),
     }
 }
 
@@ -406,19 +425,23 @@ fn api_key_revoked_changes(k: &sauron_db::models::ApiKey) -> serde_json::Value {
     description = "\
 Unrevoked keys for the calling user (expired ones included), newest first. \
 Only the display prefix is returned; the token itself is shown once, at \
-creation.",
+creation. With `include_revoked=1`, the 50 most recently revoked keys follow, \
+each with `revoked_at` and `revoked_reason`.",
+    params(ListApiKeysQuery),
     security(("bearerAuth" = [])),
     responses(
-        (status = 200, description = "The caller's unrevoked keys (expired ones included).", body = Vec<ApiKeyView>),
+        (status = 200, description = "The caller's unrevoked keys (expired ones included), then revoked ones when asked for.", body = Vec<ApiKeyView>),
         (status = 401, description = "Missing, expired or revoked access token.", body = ErrorResponse),
     ),
 )]
 pub async fn list_api_keys(
     auth: AuthUser,
     State(state): State<AppState>,
+    Query(q): Query<ListApiKeysQuery>,
 ) -> Result<Json<Vec<ApiKeyView>>, ApiError> {
+    let include_revoked = truthy(q.include_revoked.as_ref());
     let mut conn = db(&state).await?;
-    let rows = sauron_db::api_keys::list_for_user(&mut conn, auth.user_id).await?;
+    let rows = sauron_db::api_keys::list_for_user(&mut conn, auth.user_id, include_revoked).await?;
     Ok(Json(rows.iter().map(api_key_view).collect()))
 }
 
@@ -463,24 +486,26 @@ pub async fn create_api_key(
     let expires_at = parse_api_key_expiry(&req.expiry)?;
 
     let mut conn = db(&state).await?;
-    if sauron_db::api_keys::count_live_for_user(&mut conn, auth.user_id).await? >= MAX_LIVE_API_KEYS
-    {
-        // `count_live_for_user` counts unrevoked keys, expired ones included
-        // (they stay listed until revoked), so the message says so.
-        return Err(ApiError::Conflict(
-            "you already have 25 unrevoked keys (expired keys count too); revoke one first".into(),
-        ));
-    }
     let minted = sauron_auth::api_key::mint_api_key();
-    let key = sauron_db::api_keys::insert(
+    // The cap check and the insert are one locked transaction, so parallel
+    // creates cannot all pass a count taken before any of them inserted.
+    let Some(key) = sauron_db::api_keys::insert_within_cap(
         &mut conn,
         auth.user_id,
         name,
         &minted.prefix,
         &minted.hash,
         expires_at,
+        MAX_LIVE_API_KEYS,
     )
-    .await?;
+    .await?
+    else {
+        // The cap counts unrevoked keys, expired ones included (they stay
+        // listed until revoked), so the message says so.
+        return Err(ApiError::Conflict(
+            "you already have 25 unrevoked keys (expired keys count too); revoke one first".into(),
+        ));
+    };
 
     audit::record_for_user_orgs(
         &mut conn,
@@ -600,6 +625,8 @@ mod tests {
             expires_at,
             last_used_at: None,
             revoked_at: None,
+            revoked_reason: None,
+            revoked_by: None,
         }
     }
 

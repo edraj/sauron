@@ -349,6 +349,9 @@ diesel::table! {
         expires_at -> Nullable<Timestamptz>,
         last_used_at -> Nullable<Timestamptz>,
         revoked_at -> Nullable<Timestamptz>,
+        // Appended (migration 85): `ApiKey` decodes positionally.
+        revoked_reason -> Nullable<Text>,
+        revoked_by -> Nullable<Uuid>,
     }
 }
 

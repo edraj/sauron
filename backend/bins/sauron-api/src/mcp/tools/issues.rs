@@ -46,7 +46,7 @@ use sauron_query::ReleaseFilter;
 use crate::error::ApiError;
 use crate::mcp::access::{
     deep_link, read_scope, release_arg, release_key_opt, resolve_app, within_deadline,
-    within_deadline_saying, AppTarget, ToolError, TIMED_OUT, TIMED_OUT_RETRY,
+    within_deadline_saying, AppTarget, ToolError, TIMED_OUT_RETRY,
 };
 use crate::mcp::format::{
     below_tier_floor, clip, day, device_line, device_model, env_label, env_names, hot_store_note,
@@ -474,18 +474,14 @@ impl View<'_> {
 }
 
 /// A query's parser message, or the permission it needs, is the caller's to
-/// fix: say so with the query echoed. A statement the planner's pipeline
-/// lost to the timeout arrives as an internal error string; it is a timeout.
+/// fix: say so with the query echoed. Everything else converts as usual; a
+/// pipeline statement timeout already arrives as `query_timeout`
+/// (`routes::search::map_plan_error`) and becomes `access::TIMED_OUT`.
 fn search_error(query: Option<&str>, e: ApiError) -> ToolError {
     match (query, e) {
         (Some(q), ApiError::BadRequest(m) | ApiError::Forbidden(m)) => ToolError::BadArgument(
             format!("query {:?} cannot be used: {m}", clip(q, ECHO_MAX_CHARS)),
         ),
-        (_, ApiError::Internal(m))
-            if m.contains("canceling statement due to statement timeout") =>
-        {
-            ToolError::TimedOut(TIMED_OUT.into())
-        }
         (_, e) => e.into(),
     }
 }
@@ -1681,6 +1677,25 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().expect("timestamp")
+    }
+
+    /// A search-pipeline statement timeout reaches the tool through the
+    /// shared `map_plan_error`, as the request-budget `query_timeout`, and
+    /// reads as the tool's own timeout text. With or without a `query`: a
+    /// timeout is never the query's fault.
+    #[test]
+    fn a_pipeline_statement_timeout_is_the_tool_timeout() {
+        use crate::mcp::access::TIMED_OUT;
+        use sauron_db::query_plan::PlanError;
+        for query in [Some("level:fatal"), None] {
+            let e = crate::routes::search::map_plan_error(PlanError::Database(
+                "canceling statement due to statement timeout".into(),
+            ));
+            match search_error(query, e) {
+                ToolError::TimedOut(m) => assert_eq!(m, TIMED_OUT, "{query:?}"),
+                other => panic!("{query:?}: expected TimedOut, got {other:?}"),
+            }
+        }
     }
 
     #[test]

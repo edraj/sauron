@@ -101,8 +101,8 @@ export const account = {
     ar: 'تتيح المفاتيح لـ Claude Code وعملاء MCP الآخرين قراءة بيانات Sauron الخاصة بك بصلاحياتك. للقراءة فقط. يمكن لمسؤولي مؤسستك إيقاف هذه الميزة.',
   },
   'account.apiKeys.revocationNote': {
-    en: 'Changing your password does not revoke keys; an admin ending your sessions does.',
-    ar: 'تغيير كلمة المرور لا يلغي المفاتيح؛ أما إنهاء المسؤول لجلساتك فيلغيها.',
+    en: 'Changing your password does not revoke keys; resetting a forgotten password, or an admin ending your sessions, does.',
+    ar: 'تغيير كلمة المرور لا يلغي المفاتيح؛ أما إعادة تعيين كلمة مرور منسية، أو إنهاء المسؤول لجلساتك، فيلغيها.',
   },
   'account.apiKeys.create': { en: 'Create key', ar: 'إنشاء مفتاح' },
   'account.apiKeys.empty.title': { en: 'No API keys', ar: 'لا توجد مفاتيح API' },
@@ -139,6 +139,20 @@ export const account = {
   },
   'account.apiKeys.reveal.tokenLabel': { en: 'Key only', ar: 'المفتاح فقط' },
   'account.apiKeys.toast.revoked': { en: 'API key revoked', ar: 'تم إلغاء مفتاح API' },
+  'account.apiKeys.showRevoked': { en: 'Show revoked keys', ar: 'عرض المفاتيح الملغاة' },
+  'account.apiKeys.hideRevoked': { en: 'Hide revoked keys', ar: 'إخفاء المفاتيح الملغاة' },
+  'account.apiKeys.revoked': { en: 'Revoked', ar: 'ملغى' },
+  'account.apiKeys.reason.userRevoked': { en: 'Revoked by you', ar: 'ألغيته أنت' },
+  'account.apiKeys.reason.adminRevoked': { en: 'Revoked by an admin', ar: 'ألغاه أحد المسؤولين' },
+  'account.apiKeys.reason.resetForced': {
+    en: 'An admin forced a password reset',
+    ar: 'فرض أحد المسؤولين إعادة تعيين كلمة المرور',
+  },
+  'account.apiKeys.reason.passwordReset': {
+    en: 'You reset a forgotten password',
+    ar: 'أعدت تعيين كلمة مرور منسية',
+  },
+  'account.apiKeys.reason.unknown': { en: 'Revoked', ar: 'ملغى' },
   'account.apiKeys.confirm.title': { en: 'Revoke API key', ar: 'إلغاء مفتاح API' },
   'account.apiKeys.confirm.body': {
     en: 'Anything using "{name}" will stop working immediately. This cannot be undone.',

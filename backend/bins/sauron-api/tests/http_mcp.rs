@@ -654,6 +654,34 @@ async fn rate_limit_returns_429() {
     server.shutdown().await;
 }
 
+/// Key-shaped bearer tokens are looked up in Postgres, so they are budgeted
+/// per client address BEFORE the lookup, as `/v1/auth/refresh` budgets its
+/// token lookups. Unknown keys never reach the per-key limiter (there is no
+/// key id to bucket on), so without this a flood of made-up keys would cost
+/// one database round trip each, unthrottled. The per-address budget is ten
+/// times the per-key one: MCP_CALLS_PER_MIN=1 allows ten lookups a minute.
+#[tokio::test]
+async fn unknown_keys_are_budgeted_per_client_address() {
+    let Some(mut server) = TestServer::start_with_mcp_budget(1).await else {
+        return;
+    };
+    for i in 1..=10 {
+        let made_up = format!("sauron_pat_{}", Uuid::new_v4().simple());
+        let (status, body) = server.mcp(Some(&made_up), "tools/list", json!({})).await;
+        assert_eq!(status, 401, "lookup {i} of 10 is inside the budget: {body}");
+    }
+    let made_up = format!("sauron_pat_{}", Uuid::new_v4().simple());
+    let (status, body) = server.mcp(Some(&made_up), "tools/list", json!({})).await;
+    assert_eq!(status, 429, "the 11th lookup is over budget: {body}");
+    assert_eq!(body["error"]["code"], "rate_limited", "body: {body}");
+
+    // A token that is not key-shaped never reaches Postgres, so it spends no
+    // budget and keeps its plain 401.
+    let (status, body) = server.mcp(Some("not-a-key"), "tools/list", json!({})).await;
+    assert_eq!(status, 401, "body: {body}");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn last_used_at_is_set_after_a_call() {
     let Some(mut server) = TestServer::start().await else {
@@ -669,7 +697,7 @@ async fn last_used_at_is_set_after_a_call() {
     };
     let mut conn = server.conn().await;
     let before = last_used(
-        sauron_db::api_keys::list_for_user(&mut conn, user_id)
+        sauron_db::api_keys::list_for_user(&mut conn, user_id, false)
             .await
             .expect("list keys"),
     );
@@ -680,7 +708,7 @@ async fn last_used_at_is_set_after_a_call() {
 
     let mut conn = server.conn().await;
     let after = last_used(
-        sauron_db::api_keys::list_for_user(&mut conn, user_id)
+        sauron_db::api_keys::list_for_user(&mut conn, user_id, false)
             .await
             .expect("list keys"),
     );

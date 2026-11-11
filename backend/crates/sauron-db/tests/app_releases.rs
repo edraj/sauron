@@ -679,3 +679,70 @@ async fn the_repair_also_normalises_sessions_transactions_and_workflows() {
     drop(conn);
     db.cleanup().await;
 }
+
+/// `list_apps`' "latest releases": the newest `n` distinct releases across the
+/// scope's environments, most recently seen first, read with a LIMIT rather
+/// than by loading the app's whole catalogue. A release seen in two
+/// environments counts once, by its latest sighting; the scope's environment
+/// filter applies.
+#[tokio::test]
+async fn recent_releases_are_distinct_newest_first_and_scoped() {
+    use chrono::{Duration, Utc};
+    use sauron_db::releases;
+    use sauron_db::scope::{EnvFilter, ReadScope};
+
+    let Some(db) = TestDb::setup().await else {
+        eprintln!("TEST_DATABASE_URL unset — skipping");
+        return;
+    };
+    let mut conn = db.conn().await;
+    let ids = db.seed_two_envs().await;
+    let t0 = Utc::now() - Duration::hours(10);
+    // 1.0 everywhere, early; 2.0 in env_a later; 3.0 in env_b later still;
+    // then 1.0 again in env_b, latest of all.
+    for (env, rel, hours) in [
+        (Some(ids.env_a), "1.0", 0),
+        (Some(ids.env_b), "1.0", 1),
+        (Some(ids.env_a), "2.0", 2),
+        (Some(ids.env_b), "3.0", 3),
+        (None, "4.0", 4),
+        (Some(ids.env_b), "1.0", 5),
+    ] {
+        releases::upsert_seen(&mut conn, ids.app_id, env, rel, t0 + Duration::hours(hours))
+            .await
+            .expect("upsert");
+    }
+
+    let all = ReadScope::new(ids.app_id, EnvFilter::All);
+    assert_eq!(
+        releases::recent_for_app(&mut conn, &all, 3)
+            .await
+            .expect("recent"),
+        vec!["1.0", "4.0", "3.0"],
+        "distinct releases by their latest sighting anywhere"
+    );
+    assert_eq!(
+        releases::recent_for_app(&mut conn, &all, 10)
+            .await
+            .expect("recent"),
+        vec!["1.0", "4.0", "3.0", "2.0"]
+    );
+    let env_a = ReadScope::new(ids.app_id, EnvFilter::One(ids.env_a));
+    assert_eq!(
+        releases::recent_for_app(&mut conn, &env_a, 3)
+            .await
+            .expect("recent"),
+        vec!["2.0", "1.0"],
+        "only env_a's sightings, and its own latest times"
+    );
+    let subset = ReadScope::new(ids.app_id, EnvFilter::Subset(vec![ids.env_a]));
+    assert_eq!(
+        releases::recent_for_app(&mut conn, &subset, 1)
+            .await
+            .expect("recent"),
+        vec!["2.0"]
+    );
+
+    drop(conn);
+    db.cleanup().await;
+}
