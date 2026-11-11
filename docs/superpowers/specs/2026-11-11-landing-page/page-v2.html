@@ -1,0 +1,135 @@
+<style>
+  .pg{max-width:900px;margin:0 auto;background:#0c0a09;color:#f5f0eb;font-family:Inter,system-ui,sans-serif;border-radius:12px;overflow:hidden;border:1px solid #2a1d15}
+  .glow{position:absolute;border-radius:50%;background:radial-gradient(circle,#ffd451 0%,#ff8f22 28%,#f14e0b 52%,transparent 70%);filter:blur(30px);pointer-events:none}
+  .win{background:#111215;border:1px solid #2b2420;border-radius:10px;overflow:hidden;box-shadow:0 30px 80px -20px rgba(0,0,0,.85),0 0 0 1px rgba(255,143,34,.08)}
+  .win-bar{display:flex;align-items:center;gap:5px;padding:6px 10px;background:#15110e;border-bottom:1px solid #241b15;font-size:9.5px;color:#a8a29e}
+  .dot{width:6px;height:6px;border-radius:50%;background:#3a2f28}
+  .win img{display:block;width:100%}
+  .ph{aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;font-size:10px;color:#78716c;background:repeating-linear-gradient(45deg,#111215,#111215 8px,#15161a 8px,#15161a 16px)}
+  .kicker{font-size:10px;letter-spacing:.14em;color:#ff8f22}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:#1a120c;border:1px solid #ff8f22;color:#ffd9b0;font-size:10px;padding:4px 9px;border-radius:99px;box-shadow:0 0 24px rgba(255,143,34,.35);white-space:nowrap}
+  .sec{position:relative;padding:34px 28px;border-top:1px solid #1f1611}
+  .row{display:flex;gap:24px;align-items:center}
+  .row .txt{flex:0 0 36%}
+  .row .vis{flex:1;position:relative;height:330px}
+  .txt h3{margin:6px 0 6px;font-size:18px;color:#f5f0eb}
+  .txt p{margin:0;font-size:11.5px;color:#a8a29e;line-height:1.5}
+  .btn{font-size:11px;padding:7px 12px;border-radius:7px;display:inline-block}
+  .note{font-size:10px;color:#78716c;margin-top:8px;font-style:italic}
+</style>
+
+<h2>The page with C-style everywhere</h2>
+<p class="subtitle">Section 2 (the competitor comparison) is gone. Every screenshot moment is now two layered windows plus one callout that ties them together. Striped boxes are shots I'd still need to capture. The ACME org applies when I re-shoot.</p>
+
+<div class="pg">
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 24px;font-size:12px">
+    <b>👁 SAURON</b><span style="color:#d6d3d1">Features · SDKs · Install · <span style="color:#ff8f22">★ GitHub</span></span>
+  </div>
+
+  <!-- HERO -->
+  <div class="sec" style="border-top:0;height:560px;padding-top:24px">
+    <div class="glow" style="width:420px;height:380px;right:-60px;top:40px;opacity:.38"></div>
+    <div style="position:relative;max-width:360px">
+      <div style="font-size:30px;font-weight:800;line-height:1.08">See every error <span style="background:linear-gradient(90deg,#ffd451,#f14e0b);-webkit-background-clip:text;color:transparent">through your users' eyes.</span></div>
+      <p style="font-size:12px;color:#a8a29e;margin-top:10px;line-height:1.5">Error tracking and product analytics in one self-hosted stack. Every crash lands on the timeline of the person who hit it.</p>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <span class="btn" style="background:linear-gradient(90deg,#ff8f22,#f14e0b);color:#0c0a09;font-weight:700">Self-host it</span>
+        <span class="btn" style="border:1px solid #3a2a20">★ Star on GitHub</span>
+      </div>
+      <div style="font-size:10px;color:#78716c;margin-top:10px">Open source · AGPL-3.0 · Rust + Postgres + Redis</div>
+    </div>
+    <div class="win" style="position:absolute;right:150px;top:150px;width:46%;opacity:.75">
+      <div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">ACME · Overview</span></div>
+      <img src="/files/shot-overview.png" alt="">
+    </div>
+    <div class="win" style="position:absolute;right:24px;top:215px;width:46%">
+      <div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Session · u_1001</span></div>
+      <img src="/files/shot-session.png" alt="">
+    </div>
+    <div class="chip" style="position:absolute;right:60px;top:186px">● add_to_cart → StateError · same user</div>
+  </div>
+
+  <!-- ERRORS <-> EVENTS -->
+  <div class="sec">
+    <div class="row">
+      <div class="txt">
+        <div class="kicker">ERRORS ↔ USER EVENTS</div>
+        <h3>From a crash to the person who hit it.</h3>
+        <p>Open an issue and see who hit it and what each person did first. Open a person and see their errors inline with their events.</p>
+      </div>
+      <div class="vis">
+        <div class="win" style="position:absolute;left:0;top:0;width:68%;opacity:.7"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Issue</span></div><img src="/files/shot-issue.png" alt=""></div>
+        <div class="win" style="position:absolute;right:0;top:60px;width:68%"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Person · timeline</span></div><div class="ph">Person profile timeline (re-shoot)</div></div>
+        <div class="chip" style="position:absolute;left:30%;top:36px">● 37 users affected → u_1001</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ANALYTICS (mirrored) -->
+  <div class="sec">
+    <div class="glow" style="width:280px;height:280px;left:-80px;top:20px;opacity:.22"></div>
+    <div class="row" style="flex-direction:row-reverse">
+      <div class="txt">
+        <div class="kicker">PRODUCT ANALYTICS</div>
+        <h3>Funnels and retention that know about your crashes.</h3>
+        <p>Find where users drop off, then see whether an error caused it.</p>
+      </div>
+      <div class="vis">
+        <div class="win" style="position:absolute;right:0;top:0;width:68%;opacity:.7"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Retention</span></div><div class="ph">Retention cohorts (re-shoot)</div></div>
+        <div class="win" style="position:absolute;left:0;top:60px;width:68%"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Funnel</span></div><div class="ph">Checkout funnel (re-shoot)</div></div>
+        <div class="chip" style="position:absolute;right:8%;top:36px">● step 3 drop-off: 42% hit StateError</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ALERTS / UPTIME -->
+  <div class="sec">
+    <div class="row">
+      <div class="txt">
+        <div class="kicker">ALERTS &amp; UPTIME</div>
+        <h3>Know before your users tell you.</h3>
+        <p>Alert rules on issues and performance, sent to Slack, email, webhooks and more. Uptime monitors on the same dashboard.</p>
+      </div>
+      <div class="vis">
+        <div class="win" style="position:absolute;left:0;top:0;width:68%;opacity:.7"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Monitors</span></div><div class="ph">Uptime monitors (re-shoot)</div></div>
+        <div class="win" style="position:absolute;right:0;top:60px;width:68%"><div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:6px">Alert rule</span></div><div class="ph">Alert rule editor (re-shoot)</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COMPACT FEATURE LIST -->
+  <div class="sec">
+    <div class="kicker">AND THE REST</div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px;font-size:10.5px;color:#d6d3d1">
+      <div>◆ Releases &amp; crash-free rate</div><div>◆ Source maps / symbolication</div><div>◆ Search &amp; saved views</div><div>◆ Fine-grained RBAC</div>
+      <div>◆ Performance &amp; transactions</div><div>◆ Parquet cold-storage tiering</div><div>◆ MCP server for AI agents</div><div>◆ Arabic UI / RTL</div>
+    </div>
+    <div class="note">Text-only list: these don't get screenshots.</div>
+  </div>
+
+  <!-- SDKs -->
+  <div class="sec">
+    <div class="kicker">ONE SDK, BOTH SIGNALS</div>
+    <div style="display:flex;gap:6px;margin-top:10px;font-size:10.5px"><span style="border-bottom:2px solid #ff8f22;padding:3px 6px">Browser</span><span style="padding:3px 6px;color:#a8a29e">Flutter</span><span style="padding:3px 6px;color:#a8a29e">Node</span><span style="padding:3px 6px;color:#a8a29e">Python</span><span style="padding:3px 6px;color:#a8a29e">C#</span></div>
+    <div style="margin-top:8px;background:#120e0b;border:1px solid #2a1d15;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;font-size:10.5px">init({ dsn }) · identify(user) · track('checkout') · <span style="color:#78716c">// errors captured automatically</span></div>
+    <div class="note">Real snippets come from each SDK's README at build time.</div>
+  </div>
+
+  <!-- INSTALL -->
+  <div class="sec">
+    <div class="kicker">SELF-HOST IT</div>
+    <div style="display:flex;gap:6px;margin-top:10px;font-size:10.5px"><span style="border-bottom:2px solid #ff8f22;padding:3px 6px">Docker Compose</span><span style="padding:3px 6px;color:#a8a29e">RPM</span><span style="padding:3px 6px;color:#a8a29e">.deb</span></div>
+    <div style="margin-top:8px;background:#120e0b;border:1px solid #2a1d15;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;font-size:10.5px;line-height:1.7">$ cp .env.example .env <span style="color:#78716c"># set JWT_SECRET, NOTIFY_SECRET_KEY</span><br>$ docker compose up --build<br><span style="color:#78716c">→ dashboard on :10002</span></div>
+  </div>
+
+  <!-- UNDER THE HOOD + CTA -->
+  <div class="sec">
+    <div class="kicker">UNDER THE HOOD</div>
+    <div style="font-size:11px;color:#d6d3d1;margin-top:8px">SDK → ingest (Rust/axum) → Redis stream → workers → Postgres ← API ← dashboard. Two dependencies to run: Postgres and Redis.</div>
+  </div>
+  <div class="sec" style="text-align:center;padding:40px 28px">
+    <div class="glow" style="width:300px;height:200px;left:50%;top:10px;transform:translateX(-50%);opacity:.25"></div>
+    <div style="position:relative;font-size:22px;font-weight:800">Open source. Yours to run.</div>
+    <div style="position:relative;margin-top:12px"><span class="btn" style="background:linear-gradient(90deg,#ff8f22,#f14e0b);color:#0c0a09;font-weight:700">★ Star on GitHub</span></div>
+  </div>
+</div>
