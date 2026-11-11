@@ -411,6 +411,21 @@ pub struct MemberGrant {
     /// unreachable from the UI — which is the same as not existing, since the
     /// admin who needs it is looking at a members table, not at `curl`.
     pub pending_email_change: Option<PendingEmailChange>,
+    /// The member's personal API keys (MCP access), so an admin can see who
+    /// holds working keys before revoking them, and that a password reset
+    /// through the emailed link revoked them. Keys are per account, not per
+    /// org: the same numbers show in every org the member belongs to.
+    pub api_keys: MemberApiKeys,
+}
+
+/// See [`MemberGrant::api_keys`].
+#[derive(Serialize, Clone, Default, utoipa::ToSchema)]
+pub struct MemberApiKeys {
+    /// Keys that work right now: unrevoked and unexpired.
+    pub active: i64,
+    /// The latest time a reset of a forgotten password (the emailed link)
+    /// revoked this member's keys; null if that never happened.
+    pub revoked_by_password_reset_at: Option<DateTime<Utc>>,
 }
 
 #[utoipa::path(
@@ -447,11 +462,23 @@ pub async fn list_members(
                 )
             })
             .collect();
+    // One grouped read over the org's members, riding `api_keys_user_idx`.
+    let mut user_ids: Vec<Uuid> = rows.iter().map(|r| r.0.user_id).collect();
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    let keys = sauron_db::api_keys::summaries_for_users(&mut conn, &user_ids).await?;
     let members = rows
         .into_iter()
         .map(
             |(g, email, name, role_name, is_active, credentials_invalidated_at)| MemberGrant {
                 pending_email_change: pending.get(&g.user_id).cloned(),
+                api_keys: keys
+                    .get(&g.user_id)
+                    .map(|k| MemberApiKeys {
+                        active: k.active,
+                        revoked_by_password_reset_at: k.revoked_by_password_reset_at,
+                    })
+                    .unwrap_or_default(),
                 id: g.id,
                 user_id: g.user_id,
                 email,
@@ -1478,7 +1505,13 @@ pub async fn revoke_member_sessions(
     .await?;
     // "End all sessions" is the compromised-account button, so personal API
     // keys (which outlive any session) go with it.
-    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(&mut conn, user_id).await?;
+    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(
+        &mut conn,
+        user_id,
+        sauron_db::api_keys::REVOKE_ADMIN,
+        Some(auth.user_id),
+    )
+    .await?;
 
     // Before `drop(conn)` — the connection is released below and re-acquiring
     // one just to log would be a second pool checkout on a path that already
@@ -1519,6 +1552,186 @@ pub async fn revoke_member_sessions(
     Ok(Json(
         serde_json::json!({ "ok": true, "revoked": ids.len(), "revoked_keys": revoked_keys }),
     ))
+}
+
+/// Most members one `revoke-api-keys` request may name.
+const MAX_KEY_REVOKE_MEMBERS: usize = 100;
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct RevokeMemberApiKeysReq {
+    /// The members whose personal API keys to revoke: 1 to 100 user ids, each
+    /// a member of this organization. Duplicates are ignored.
+    pub user_ids: Vec<Uuid>,
+}
+
+/// One member's share of a [`revoke_member_api_keys`] call.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct MemberKeysRevoked {
+    pub user_id: Uuid,
+    /// Keys that were live (expired ones included) and are now revoked.
+    pub revoked: usize,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct RevokeMemberApiKeysResp {
+    pub ok: bool,
+    /// Keys revoked across every member named.
+    pub revoked: usize,
+    pub members: Vec<MemberKeysRevoked>,
+}
+
+/// A per-member refusal from [`guard_member_admin_action`], prefixed with the
+/// member's address so an admin who selected many can tell which one it was.
+///
+/// Only for the refusals the guard raises AFTER it has confirmed the target is
+/// a member here (the cross-org conflict, the escalation check): naming the
+/// account behind a not-found would turn this into an email lookup by user
+/// id. Everything else passes through unchanged.
+async fn named_member_refusal(
+    conn: &mut AsyncPgConnection,
+    user_id: Uuid,
+    e: ApiError,
+) -> ApiError {
+    let named = |email: &str| match e {
+        ApiError::Conflict(m) => ApiError::Conflict(format!("{email}: {m}")),
+        ApiError::Auth(AuthError::Forbidden) => ApiError::Forbidden(format!(
+            "{email} holds permissions you do not, so you cannot revoke their API keys"
+        )),
+        other => other,
+    };
+    let email = repo::user_email(conn, user_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| user_id.to_string());
+    named(&email)
+}
+
+/// Revoke every personal API key (MCP access) of one or more members.
+///
+/// Gated like "End all sessions": `member:credential`, then `member:manage`
+/// and the shared guard stack per member (a member of this org, not someone
+/// who outranks you, not also in another org). Keys are per account, so this
+/// stops MCP access to every organization the member belongs to, which is
+/// what the cross-org guard is there for.
+///
+/// All or nothing on the checks: every member is checked before any key is
+/// revoked, so one refusal leaves every account as it was. Your own keys are
+/// refused here (409); they are revoked from your Account page. Each member
+/// gets an `access_key.revoke_all` audit entry, a count of zero included: the
+/// admin's act is the record, not its effect.
+#[utoipa::path(
+    post, path = "/v1/orgs/{org_id}/members/revoke-api-keys", tag = "Organizations",
+    summary = "Revoke members' personal API keys",
+    description = "\
+Revokes every live personal API key of each named member at once, so their MCP \
+clients stop working on the next call. Requires `member:credential` and \
+`member:manage`. Checks every member before revoking anything; a refusal names \
+the member it is about.",
+    params(("org_id" = Uuid, Path, description = "The organization.")), security(("bearerAuth" = [])),
+    request_body = RevokeMemberApiKeysReq,
+    responses((status = 200, description = "Keys revoked; `revoked` counts them, `members` per member.", body = RevokeMemberApiKeysResp),
+              (status = 400, description = "No member named, or more than 100.", body = ErrorResponse),
+              (status = 401, description = "Missing or invalid access token.", body = ErrorResponse),
+              (status = 403, description = "Requires member-credential permission, or a member outranks you.", body = ErrorResponse),
+              (status = 404, description = "A user id is not a member of this organization.", body = ErrorResponse),
+              (status = 409, description = "You named yourself, or a member also belongs to another organization.", body = ErrorResponse)),
+)]
+pub async fn revoke_member_api_keys(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Path(org_id): Path<Uuid>,
+    Json(req): Json<RevokeMemberApiKeysReq>,
+) -> Result<Json<RevokeMemberApiKeysResp>, ApiError> {
+    let mut user_ids = req.user_ids;
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    if user_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "user_ids must name at least one member".into(),
+        ));
+    }
+    if user_ids.len() > MAX_KEY_REVOKE_MEMBERS {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_KEY_REVOKE_MEMBERS} members per request"
+        )));
+    }
+
+    let mut conn = db(&state).await?;
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_CREDENTIAL).await?;
+    // The caller-level half of the guard, once and up front, so its refusal
+    // is about the caller and never names a member.
+    authorize_org(&mut conn, auth.user_id, org_id, perm::MEMBER_MANAGE).await?;
+    if user_ids.contains(&auth.user_id) {
+        return Err(ApiError::Conflict(
+            "your own API keys are revoked from your Account page; leave yourself out".into(),
+        ));
+    }
+
+    let mut targets: Vec<(Uuid, String)> = Vec::with_capacity(user_ids.len());
+    for &user_id in &user_ids {
+        if let Err(e) =
+            guard_member_admin_action(&mut conn, auth.user_id, org_id, user_id, false).await
+        {
+            return Err(named_member_refusal(&mut conn, user_id, e).await);
+        }
+        let email = repo::user_email(&mut conn, user_id)
+            .await?
+            .unwrap_or_default();
+        targets.push((user_id, email));
+    }
+
+    let mut members = Vec::with_capacity(targets.len());
+    let mut total = 0usize;
+    for (user_id, email) in &targets {
+        let revoked = sauron_db::api_keys::revoke_all_for_user(
+            &mut conn,
+            *user_id,
+            sauron_db::api_keys::REVOKE_ADMIN,
+            Some(auth.user_id),
+        )
+        .await?;
+        total += revoked;
+        members.push(MemberKeysRevoked {
+            user_id: *user_id,
+            revoked,
+        });
+        crate::audit::record(
+            &mut conn,
+            auth.user_id,
+            crate::audit::Entry::new(
+                org_id,
+                crate::audit::action::ACCESS_KEY_REVOKE_ALL,
+                crate::audit::entity::ACCESS_KEY,
+            )
+            .target(*user_id, email)
+            .changes(crate::audit::created(
+                crate::audit::entity::ACCESS_KEY,
+                &[
+                    ("revoked_keys", serde_json::json!(revoked)),
+                    (
+                        "reason",
+                        serde_json::json!(sauron_db::api_keys::REVOKE_ADMIN),
+                    ),
+                ],
+            )),
+        )
+        .await;
+    }
+    drop(conn);
+
+    tracing::warn!(
+        actor = %auth.user_id,
+        %org_id,
+        members = members.len(),
+        revoked = total,
+        "admin revoked members' personal api keys"
+    );
+    Ok(Json(RevokeMemberApiKeysResp {
+        ok: true,
+        revoked: total,
+        members,
+    }))
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -1754,7 +1967,13 @@ pub async fn reset_member_password(
     )
     .await?;
     // A forced reset assumes compromise: personal API keys die with the sessions.
-    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(&mut conn, user_id).await?;
+    let revoked_keys = sauron_db::api_keys::revoke_all_for_user(
+        &mut conn,
+        user_id,
+        sauron_db::api_keys::REVOKE_RESET_FORCED,
+        Some(auth.user_id),
+    )
+    .await?;
     // Turns the dialog's "within a few seconds" into a statement about this
     // replica rather than about its next poll.
     state.revocations.mark_revoked(&ids);

@@ -598,6 +598,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/orgs/{org_id}/members/{user_id}/revoke-sessions",
             post(routes::orgs::revoke_member_sessions),
         )
+        .route(
+            "/v1/orgs/{org_id}/members/revoke-api-keys",
+            post(routes::orgs::revoke_member_api_keys),
+        )
         .route("/v1/orgs/{org_id}/grants", post(routes::orgs::create_grant))
         .route(
             "/v1/grants/{grant_id}",

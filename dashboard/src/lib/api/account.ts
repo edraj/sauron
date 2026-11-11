@@ -1,5 +1,11 @@
 import { api } from './client';
-import type { AccountSession, ApiKey, ApiKeyExpiry, CreatedApiKey } from '../models';
+import type {
+  AccountSession,
+  ApiKey,
+  ApiKeyExpiry,
+  CreatedApiKey,
+  RevokeMemberApiKeysResult,
+} from '../models';
 
 /**
  * The `/v1/me/*` namespace. Bearer-authenticated, so this goes through `api`
@@ -39,9 +45,31 @@ export async function revokeMemberSessions(orgId: string, userId: string): Promi
   return data.revoked;
 }
 
-/** Personal API keys (MCP). The full token is only ever in the create response. */
-export async function listApiKeys(): Promise<ApiKey[]> {
-  const { data } = await api.get<ApiKey[]>('/v1/me/api-keys');
+/**
+ * Admin revoke of every personal API key (MCP) of one or more members.
+ * Requires `member:credential` AND `member:manage`, like the force-logout.
+ * The server checks every member before revoking anything, and names the
+ * member a refusal is about.
+ */
+export async function revokeMembersApiKeys(
+  orgId: string,
+  userIds: string[],
+): Promise<RevokeMemberApiKeysResult> {
+  const { data } = await api.post<RevokeMemberApiKeysResult>(
+    `/v1/orgs/${orgId}/members/revoke-api-keys`,
+    { user_ids: userIds },
+  );
+  return data;
+}
+
+/**
+ * Personal API keys (MCP). The full token is only ever in the create response.
+ * `includeRevoked` adds the most recently revoked keys, with when and why.
+ */
+export async function listApiKeys(includeRevoked = false): Promise<ApiKey[]> {
+  const { data } = await api.get<ApiKey[]>('/v1/me/api-keys', {
+    params: includeRevoked ? { include_revoked: 1 } : undefined,
+  });
   return data;
 }
 

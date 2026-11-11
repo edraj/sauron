@@ -6029,17 +6029,41 @@ pub async fn issue_users_in_window(
 /// Whether Postgres cancelled the statement: SQLSTATE 57014
 /// (`query_canceled`), raised for a `statement_timeout` or a cancel request.
 /// diesel-async's error wrapper exposes the message but not the SQLSTATE, so
-/// this matches the two messages 57014 carries, the way
-/// `pool::is_statement_timeout` matches the first of them. A lock timeout is
-/// 55P03, a different error, and does not match.
+/// this is [`crate::pool::is_statement_timeout`] (the one place the timeout
+/// message is matched) plus 57014's other message, a cancel request. A lock
+/// timeout is 55P03, a different error, and matches neither.
 fn is_query_canceled(err: &diesel::result::Error) -> bool {
-    match err {
-        diesel::result::Error::DatabaseError(_, info) => {
-            let message = info.message();
-            message.starts_with("canceling statement due to statement timeout")
-                || message.starts_with("canceling statement due to user request")
-        }
-        _ => false,
+    crate::pool::is_statement_timeout(err)
+        || matches!(
+            err,
+            diesel::result::Error::DatabaseError(_, info)
+                if info.message().starts_with("canceling statement due to user request")
+        )
+}
+
+#[cfg(test)]
+mod query_canceled_tests {
+    use super::is_query_canceled;
+
+    fn db_err(message: &str) -> diesel::result::Error {
+        diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::Unknown,
+            Box::new(message.to_string()),
+        )
+    }
+
+    #[test]
+    fn both_57014_messages_match_and_a_lock_timeout_does_not() {
+        assert!(is_query_canceled(&db_err(
+            "canceling statement due to statement timeout"
+        )));
+        assert!(is_query_canceled(&db_err(
+            "canceling statement due to user request"
+        )));
+        assert!(!is_query_canceled(&db_err(
+            "canceling statement due to lock timeout"
+        )));
+        assert!(!is_query_canceled(&diesel::result::Error::NotFound));
     }
 }
 

@@ -45,6 +45,7 @@ const VERBS: Record<string, MessageKey> = {
   extend: 'audit.verb.extend',
   revoke: 'audit.verb.revoke',
   settings_update: 'audit.verb.settingsUpdate',
+  revoke_all: 'audit.verb.revokeAll',
 };
 
 /**
@@ -119,7 +120,11 @@ const CREDENTIAL = new Set([
  * mints a personal API key that can read the org through MCP, and its revoke
  * is the row that says that access ended.
  */
-const CREDENTIAL_ACTIONS = new Set(['access_key.create', 'access_key.revoke']);
+const CREDENTIAL_ACTIONS = new Set([
+  'access_key.create',
+  'access_key.revoke',
+  'access_key.revoke_all',
+]);
 
 export interface DescribedAction {
   label: string;

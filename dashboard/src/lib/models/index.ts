@@ -249,6 +249,9 @@ export interface AccountSession {
 /** Lifetime choices for a personal API key; the server validates the same set. */
 export type ApiKeyExpiry = '30d' | '90d' | '1y' | 'never';
 
+/** Why a personal API key was revoked (`api_keys.revoked_reason`). */
+export type ApiKeyRevokedReason = 'user_revoked' | 'admin_revoked' | 'reset_forced' | 'password_reset';
+
 /** One row of GET /v1/me/api-keys. Never carries the token, only its display prefix. */
 export interface ApiKey {
   id: string;
@@ -258,6 +261,18 @@ export interface ApiKey {
   expires_at: string | null;
   last_used_at: string | null;
   expired: boolean;
+  /** Set only on the revoked rows `?include_revoked=1` adds. Optional: an
+      older server omits both. */
+  revoked_at?: string | null;
+  /** Null on keys revoked before the server recorded reasons. */
+  revoked_reason?: ApiKeyRevokedReason | string | null;
+}
+
+/** POST /v1/orgs/{org}/members/revoke-api-keys response. */
+export interface RevokeMemberApiKeysResult {
+  ok: boolean;
+  revoked: number;
+  members: { user_id: string; revoked: number }[];
 }
 
 /** POST /v1/me/api-keys response. `token` exists nowhere else, ever. */
@@ -353,7 +368,27 @@ export interface MemberGrant {
       entirely — `groupMembers` normalizes it to `null`, so nothing downstream
       has to think about the difference. */
   pending_email_change?: PendingEmailChange | null;
+  /** The member's personal API keys (MCP). OPTIONAL for the same reason as
+      `pending_email_change`: `groupMembers` normalizes a missing one to
+      {@link NO_MEMBER_API_KEYS}. */
+  api_keys?: MemberApiKeys;
 }
+
+/** `GET /v1/orgs/{org}/members`' summary of one member's personal API keys.
+    Keys are per account, so it is the same in every org the member is in. */
+export interface MemberApiKeys {
+  /** Keys that work right now: unrevoked and unexpired. */
+  active: number;
+  /** The latest time a reset of a forgotten password (the emailed link)
+      revoked this member's keys, or null if that never happened. */
+  revoked_by_password_reset_at: string | null;
+}
+
+/** What a member with no key history (or an older server) reads as. */
+export const NO_MEMBER_API_KEYS: MemberApiKeys = Object.freeze({
+  active: 0,
+  revoked_by_password_reset_at: null,
+}) as MemberApiKeys;
 
 /**
  * A change to this member's sign-in address, awaiting the new address's
@@ -387,6 +422,7 @@ export interface Member {
   /** Non-null while a change to this member's email awaits confirmation from
       the new address. Same source and same reasoning as the field above. */
   pending_email_change: PendingEmailChange | null;
+  api_keys: MemberApiKeys;
   grants: MemberGrant[];
 }
 
@@ -465,6 +501,7 @@ export function groupMembers(grants: MemberGrant[]): Member[] {
         is_active: g.is_active,
         credentials_invalidated_at: g.credentials_invalidated_at,
         pending_email_change: g.pending_email_change ?? null,
+        api_keys: g.api_keys ?? NO_MEMBER_API_KEYS,
         grants: [g],
       });
     }

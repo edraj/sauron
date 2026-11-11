@@ -164,6 +164,18 @@ api_keys
   would start working again once the reset is finished. Changing your own
   password does **not** revoke keys, matching how personal access tokens
   usually behave. The builder notes this in the UI copy.
+  *Amended 2026-11-10 (full review):* the self-service **forgot-password**
+  reset (the emailed link) revokes keys too. It is the account-recovery path
+  and already kills every session for that reason; leaving keys alive there
+  let a key minted by whoever held the account outlive the recovery.
+  *Amended 2026-11-11 (user request):* keys record why and by whom they were
+  revoked (migration 85, the `auth_sessions` reason vocabulary); the owner's
+  Account page lists revoked keys with the reason; the Members page shows each
+  member's working-key count and flags a forgotten-password revocation for 30
+  days; and admins revoke every key of one or more members at once with
+  `POST /v1/orgs/{org_id}/members/revoke-api-keys` (same permissions and guard
+  stack as "End all sessions", all-or-nothing checks, audited as
+  `access_key.revoke_all`, which the emailed reset also records).
 - **Deactivated members:** their keys are refused while they're deactivated,
   because access is re-checked on every call, but the keys aren't revoked.
   They work again after reactivation, the same way grants are kept. My call.

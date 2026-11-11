@@ -4,6 +4,7 @@
   import { errorMessage, errorStatus } from '../../api/client';
   import { createApiKey, listApiKeys, revokeApiKey } from '../../api/account';
   import { mcpAddCommand } from '../../mcp-command';
+  import { revokedReasonKey } from '../../models/api-keys';
   import { CachedView } from '../../stores/cached-view.svelte';
   import { viewCache, viewKey } from '../../stores/view-cache';
   import { sessionStore } from '../../stores/session.svelte';
@@ -30,8 +31,17 @@
   const view = new CachedView<ApiKey[]>();
   const keys = $derived(view.data ?? []);
 
+  // Revoked keys, with when and why (you, an admin, a password reset), on
+  // request, like the Sessions card's recent sign-outs. Part of the view key,
+  // so flipping it paints the cached list for the other setting at once.
+  let showRevoked = $state(false);
+
   async function load(force = false) {
-    await view.load(viewKey(KEYS_VIEW, sessionStore.scopeKey), () => listApiKeys(), force);
+    await view.load(
+      viewKey(KEYS_VIEW, sessionStore.scopeKey, showRevoked),
+      () => listApiKeys(showRevoked),
+      force,
+    );
   }
 
   /** For the page's Refresh button (`bind:this` in Account.svelte). */
@@ -139,6 +149,9 @@
 
 <Card title={t('account.apiKeys.title')}>
   {#snippet actions()}
+    <Button variant="ghost" size="sm" onclick={() => (showRevoked = !showRevoked)}>
+      {showRevoked ? t('account.apiKeys.hideRevoked') : t('account.apiKeys.showRevoked')}
+    </Button>
     <Button variant="primary" size="sm" onclick={openDialog}>{t('account.apiKeys.create')}</Button>
   {/snippet}
 
@@ -175,7 +188,7 @@
       {/snippet}
       {#snippet children()}
         {#each keys as k (k.id)}
-          <tr>
+          <tr class:revoked={Boolean(k.revoked_at)}>
             <td>{k.name}</td>
             <td><code>{k.prefix}…</code></td>
             <td><TimeValue value={k.created_at} /></td>
@@ -186,8 +199,19 @@
                 <span class="cell-muted">{t('account.apiKeys.never')}</span>
               {/if}
             </td>
-            <td>
-              {#if k.expired}
+            <!-- `wrap` (DataTable's opt-out of its no-wrap cells): the reason
+                 line may break rather than widen the table. -->
+            <td class:wrap={Boolean(k.revoked_at)}>
+              {#if k.revoked_at}
+                <span class="revoked-at">
+                  <Badge tone="neutral" size="sm">{t('account.apiKeys.revoked')}</Badge>
+                  <TimeValue value={k.revoked_at} />
+                </span>
+                <!-- Why it stopped working: you, an admin, or a password
+                     reset. Under the status rather than in the actions
+                     column, whose no-wrap would widen the whole table. -->
+                <span class="revoked-why">{t(revokedReasonKey(k.revoked_reason))}</span>
+              {:else if k.expired}
                 <Badge tone="error" size="sm">{t('account.apiKeys.expired')}</Badge>
               {:else if k.expires_at}
                 <TimeValue value={k.expires_at} />
@@ -196,9 +220,12 @@
               {/if}
             </td>
             <td class="col-act">
-              <Button variant="ghost" size="sm" onclick={() => (pending = k)}>
-                {t('account.apiKeys.revoke')}
-              </Button>
+              <!-- A revoked key has nothing left to act on. -->
+              {#if !k.revoked_at}
+                <Button variant="ghost" size="sm" onclick={() => (pending = k)}>
+                  {t('account.apiKeys.revoke')}
+                </Button>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -303,5 +330,20 @@
     text-align: end;
     width: 1%;
     white-space: nowrap;
+  }
+  tr.revoked td:not(.col-act) {
+    opacity: 0.58;
+  }
+  .revoked-at {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 6px;
+  }
+  .revoked-why {
+    display: block;
+    margin-top: 3px;
+    font-size: var(--text-xs);
+    color: var(--text-muted);
   }
 </style>

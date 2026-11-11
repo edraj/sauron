@@ -197,6 +197,7 @@ export const refreshModels = {
   'audit.verb.extend': { en: 'Extended {noun}', ar: 'مدّد {noun}' },
   'audit.verb.revoke': { en: 'Revoked {noun}', ar: 'ألغى {noun}' },
   'audit.verb.settingsUpdate': { en: 'Updated settings for {noun}', ar: 'حدّث إعدادات {noun}' },
+  'audit.verb.revokeAll': { en: 'Revoked every {noun}', ar: 'ألغى كل {noun}' },
   // Auth actions are about the actor, so they carry no noun.
   'audit.auth.login': { en: 'Signed in', ar: 'سجّل الدخول' },
   'audit.auth.loginFailed': { en: 'Failed sign-in', ar: 'فشل تسجيل الدخول' },

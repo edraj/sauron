@@ -712,6 +712,12 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Why it was revoked (`api_keys::REVOKE_*`); NULL while live, and for
+    /// keys revoked before migration 85.
+    pub revoked_reason: Option<String>,
+    /// Who revoked it: the owner, or the admin. NULL for a reset through the
+    /// emailed link, and for keys revoked before migration 85.
+    pub revoked_by: Option<Uuid>,
 }
 
 #[derive(Debug, Insertable)]

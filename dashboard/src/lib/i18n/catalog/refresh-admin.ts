@@ -198,6 +198,38 @@ export const refreshC = {
     en: '{email} will be signed out of every device and won’t be able to sign in until reactivated. Their access grants are kept.',
     ar: 'سيُسجَّل خروج {email} من كل الأجهزة ولن يتمكّن من تسجيل الدخول حتى يُعاد تفعيله. تُحفظ صلاحياته.',
   },
+  'members.apiKeys.one': { en: '1 API key', ar: 'مفتاح API واحد' },
+  'members.apiKeys.many': { en: '{n} API keys', ar: '{n} من مفاتيح API' },
+  'members.apiKeys.activeTitle': {
+    en: 'Personal API keys (MCP access) that work right now',
+    ar: 'مفاتيح API شخصية (وصول MCP) تعمل الآن',
+  },
+  'members.apiKeys.revokedByReset': {
+    en: 'API keys revoked by password reset',
+    ar: 'أُلغيت مفاتيح API بإعادة تعيين كلمة المرور',
+  },
+  'members.apiKeys.revokedByResetTitle': {
+    en: 'Revoked {when}, when this member reset a forgotten password through the emailed link',
+    ar: 'أُلغيت في {when} عندما أعاد هذا العضو تعيين كلمة مرور منسية عبر الرابط المرسَل',
+  },
+  'members.menu.revokeApiKeys': { en: 'Revoke API keys', ar: 'إلغاء مفاتيح API' },
+  'members.bulk.selected': { en: '{n} selected', ar: 'تم تحديد {n}' },
+  'members.bulk.revokeApiKeys': { en: 'Revoke API keys', ar: 'إلغاء مفاتيح API' },
+  'members.bulk.clear': { en: 'Clear selection', ar: 'مسح التحديد' },
+  'members.select.all': { en: 'Select every member', ar: 'تحديد كل الأعضاء' },
+  'members.select.one': { en: 'Select {member}', ar: 'تحديد {member}' },
+  'members.confirmRevokeKeysTitle': { en: 'Revoke API keys?', ar: 'إلغاء مفاتيح API؟' },
+  'members.confirmRevokeKeysBodyOne': {
+    en: 'Every personal API key of {member} stops working immediately, in every organization they belong to. Their MCP clients, such as Claude Code, will need a new key.',
+    ar: 'تتوقف كل مفاتيح API الشخصية لـ {member} عن العمل فورًا، في كل مؤسسة ينتمي إليها. ستحتاج عملاء MCP لديه، مثل Claude Code، إلى مفتاح جديد.',
+  },
+  'members.confirmRevokeKeysBodyMany': {
+    en: 'Every personal API key of these {n} members stops working immediately, in every organization they belong to. Their MCP clients, such as Claude Code, will need new keys.',
+    ar: 'تتوقف كل مفاتيح API الشخصية لهؤلاء الأعضاء ({n}) عن العمل فورًا، في كل مؤسسة ينتمون إليها. ستحتاج عملاء MCP لديهم، مثل Claude Code، إلى مفاتيح جديدة.',
+  },
+  'members.toast.keysRevokedNone': { en: 'There were no live API keys to revoke.', ar: 'لم تكن هناك مفاتيح API نشطة لإلغائها.' },
+  'members.toast.keysRevokedOne': { en: 'Revoked 1 API key.', ar: 'تم إلغاء مفتاح API واحد.' },
+  'members.toast.keysRevokedMany': { en: 'Revoked {n} API keys.', ar: 'تم إلغاء {n} من مفاتيح API.' },
   'members.confirmSignOutBody': {
     en: '{name} will be signed out on every device and will have to log in again. Their account stays active.',
     ar: 'سيُسجَّل خروج {name} من كل الأجهزة وسيتعيّن عليه تسجيل الدخول مجددًا. يبقى حسابه نشطًا.',

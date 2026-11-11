@@ -16,6 +16,7 @@ function member(over: Partial<Member> = {}): Member {
     is_active: true,
     credentials_invalidated_at: null,
     pending_email_change: null,
+    api_keys: { active: 0, revoked_by_password_reset_at: null },
     grants: [],
     ...over,
   };

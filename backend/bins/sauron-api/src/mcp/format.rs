@@ -18,7 +18,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::access::ToolError;
-use crate::error::ApiError;
 
 /// The most stack frames a tool prints.
 pub(crate) const MAX_FRAMES: usize = 50;
@@ -147,21 +146,18 @@ pub(crate) fn second(t: DateTime<Utc>) -> String {
 }
 
 /// The names of the app's live environments the caller can see, by
-/// enrollment id: `env:read` decides, exactly as for the dashboard's
-/// environment picker. An environment they cannot see shows as its bare id.
+/// enrollment id ([`super::access::visible_envs`]: `env:read` decides,
+/// exactly as for the dashboard's environment picker). An environment they
+/// cannot see shows as its bare id.
 pub(crate) async fn env_names(
     conn: &mut AsyncPgConnection,
     user_id: Uuid,
     app_id: Uuid,
 ) -> Result<HashMap<Uuid, String>, ToolError> {
-    match crate::routes::environments::visible_app_environments(conn, user_id, app_id).await {
-        Ok(envs) => Ok(envs
-            .into_iter()
-            .map(|e| (e.enrollment.id, e.name))
-            .collect()),
-        Err(ApiError::Auth(sauron_auth::AuthError::Forbidden)) => Ok(HashMap::new()),
-        Err(e) => Err(e.into()),
-    }
+    Ok(super::access::visible_envs(conn, user_id, app_id)
+        .await?
+        .into_iter()
+        .collect())
 }
 
 /// An event's environment: its name when the caller can see it,

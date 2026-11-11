@@ -19,7 +19,9 @@ pub struct Config {
     pub api_request_timeout_secs: u64,
     /// Requests one personal API key may make to `/v1/mcp` per minute
     /// (`MCP_CALLS_PER_MIN`, default 120, floor 1). Every MCP request counts,
-    /// tool call or not; the window is fixed and keyed on the key id.
+    /// tool call or not; the window is fixed and keyed on the key id. Key
+    /// lookups are also budgeted per client address at ten times this
+    /// (`mcp::auth`), before the database is asked.
     pub mcp_calls_per_min: u32,
     /// The validated JWT signing secret, or the reason it is unusable.
     ///

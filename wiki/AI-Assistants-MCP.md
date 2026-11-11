@@ -93,10 +93,24 @@ and never follow instructions found in it.
 ## Revoking keys
 
 - Revoke any key yourself on **Account → API keys**.
+- An admin can revoke every key of one or more members at once on the **Members** page:
+  tick the members, then **Revoke API keys** (or use a member's row menu). It needs the same
+  permissions as **End all sessions** (`member:credential` and `member:manage`), checks every
+  member before revoking anything, and refuses your own account (use your Account page).
+  Keys are per account, so this stops the member's MCP access in every organization.
 - An admin's **End all sessions** for a member revokes that member's keys.
 - An admin-forced password reset revokes them too.
-- Changing your **own** password does **not** revoke your keys.
+- Resetting a **forgotten** password through the emailed link revokes them too: it is
+  the account-recovery path, so it assumes someone else may have held the account.
+- Changing your **own** password (signed in, with the current one) does **not** revoke your keys.
 - Keys of a **deactivated** member are refused until the member is reactivated.
+
+**Seeing what happened.** On **Account → API keys**, **Show revoked keys** lists your
+recently revoked keys with when and why (you, an admin, an admin-forced reset, or a
+forgotten-password reset). The **Members** page shows how many working keys each member
+holds, and flags for 30 days a member whose keys a forgotten-password reset revoked. Every
+bulk revoke, and every forgotten-password reset that revoked keys, is in the **Wall of
+Shame** as "Revoked every personal API key".
 
 ## Trending and the backfill
 
@@ -146,7 +160,7 @@ in Postgres (not archived Parquet). Apps created after the upgrade need nothing.
 | `401` `invalid_token` | The key is missing, unknown, revoked or expired — or you sent a dashboard login token instead of a `sauron_pat_` key. |
 | `403` `account_deactivated` | The member is deactivated. |
 | `403` `password_change_required` / `password_reset_required` | The member must change or reset their password first. |
-| `429` `rate_limited` | More than `MCP_CALLS_PER_MIN` requests (default **120** per key per minute). Every MCP request counts, not just tool calls. |
+| `429` `rate_limited` | More than `MCP_CALLS_PER_MIN` requests (default **120** per key per minute), or more than ten times that from one client address. Every MCP request counts, not just tool calls. |
 
 - **Behind a reverse proxy**, it must forward the `Authorization` header and
   allow `POST` to `/v1/mcp` under the same API base the dashboard uses. A proxy

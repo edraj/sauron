@@ -79,7 +79,13 @@ const AUDITED: &[&str] = &[
     // admin would file an act they did not perform under their name.
     "routes::auth::confirm_email_change",
     "routes::auth::cancel_email_change",
+    // The emailed password reset: it records `access_key.revoke_all` when it
+    // revoked personal API keys, attributed to the account itself for the same
+    // reason. A reset that revoked nothing records nothing (the ADMIN half of
+    // a forced reset is `orgs::reset_member_password`'s).
+    "routes::auth::reset_password",
     "routes::orgs::revoke_member_sessions",
+    "routes::orgs::revoke_member_api_keys",
     "routes::orgs::set_member_active",
     "routes::orgs::update_grant_handler",
     "routes::orgs::update_role_handler",
@@ -123,11 +129,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "routes::auth::forgot_password",
         "unauthenticated — there is no actor to attribute, and recording the email \
       would turn the trail into an account-enumeration oracle",
-    ),
-    (
-        "routes::auth::reset_password",
-        "unauthenticated (bearer is the reset token); the ADMIN half of a reset is \
-      recorded by orgs::reset_member_password",
     ),
     (
         "routes::auth::preview_email_change",

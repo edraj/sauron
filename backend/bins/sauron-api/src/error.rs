@@ -99,14 +99,24 @@ impl From<diesel::result::Error> for ApiError {
             // pool's `statement_timeout`). Same class as the TimeoutLayer's
             // 503 — the window is too wide for this deployment right now —
             // and unlike a 500 it tells the dashboard what to suggest.
-            other if sauron_db::is_statement_timeout(&other) => ApiError::Unavailable(
-                "query_timeout",
-                "the query exceeded the request budget; narrow the time window or wait for the \
-                 rollup backfill to finish"
-                    .to_string(),
-            ),
+            other if sauron_db::is_statement_timeout(&other) => ApiError::query_timeout(),
             other => ApiError::Internal(other.to_string()),
         }
+    }
+}
+
+impl ApiError {
+    /// Postgres cancelled the statement at the request budget (the pool's
+    /// `statement_timeout`). One constructor for every path that detects it
+    /// (a diesel error here, a flattened search-pipeline error in
+    /// `routes::search::map_plan_error`), so they answer alike.
+    pub(crate) fn query_timeout() -> Self {
+        ApiError::Unavailable(
+            "query_timeout",
+            "the query exceeded the request budget; narrow the time window or wait for the \
+             rollup backfill to finish"
+                .to_string(),
+        )
     }
 }
 

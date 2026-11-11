@@ -128,6 +128,11 @@ pub mod action {
 
     pub const ACCESS_KEY_CREATE: &str = "access_key.create";
     pub const ACCESS_KEY_REVOKE: &str = "access_key.revoke";
+    /// Every live key of one account at once: an admin's "Revoke API keys" on
+    /// the Members page, or the owner's reset through the emailed link.
+    /// `changes` carries `revoked_keys` and `reason`, the
+    /// `api_keys.revoked_reason` value.
+    pub const ACCESS_KEY_REVOKE_ALL: &str = "access_key.revoke_all";
 }
 
 /// Entity families, used for the `entity_type` column and its filter.
@@ -202,7 +207,7 @@ pub fn allowlist(entity_type: &str) -> &'static [&'static str] {
         entity::PROJECT => &["name", "slug"],
         // Deliberately no token or hash: neither name could pass
         // `FORBIDDEN_FIELDS` anyway.
-        entity::ACCESS_KEY => &["name", "prefix", "expires_at"],
+        entity::ACCESS_KEY => &["name", "prefix", "expires_at", "revoked_keys", "reason"],
         // `ingest_enabled` is here because muting an app is a silent, total
         // outage for it; a trail that recorded the rename but not the mute
         // would omit the more consequential of the two.
