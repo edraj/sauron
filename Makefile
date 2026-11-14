@@ -24,8 +24,8 @@ fmt: ## Format the Rust workspace
 
 # --- local development without full compose ---
 
-dev-infra: ## Start only Postgres + Redis for local dev
-	docker compose up -d postgres redis
+dev-infra: ## Start only Postgres + Redis for local dev, on 127.0.0.1 (DEV_PG_PORT/DEV_REDIS_PORT, default 5432/6379)
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis
 
 migrate: ## Apply DB migrations (expects DATABASE_URL)
 	cd backend && cargo run -p sauron-migrate

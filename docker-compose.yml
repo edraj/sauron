@@ -1,9 +1,12 @@
-# Sauron — full stack: Postgres + Redis + migrate (one-shot) + ingest + api + dashboard.
+# Sauron — full stack: Postgres + Redis + migrate (one-shot) + ingest + api + monitor +
+# alerts + tier + inspector + dashboard.
 #
-#   cp .env.example .env      # then edit JWT_SECRET
+#   cp .env.example .env      # then set JWT_SECRET and NOTIFY_SECRET_KEY
 #   docker compose up --build
 #
-# Dashboard → http://localhost:3000   API → http://localhost:8080   Ingest → http://localhost:8081
+# Dashboard → http://localhost:10002   API → http://localhost:10000   Ingest → http://localhost:10001
+# (inside the containers they still bind :80 / :8080 / :8081). Postgres and Redis are not
+# published; `make dev-infra` adds docker-compose.dev.yml to expose them on 127.0.0.1.
 
 services:
   postgres:
