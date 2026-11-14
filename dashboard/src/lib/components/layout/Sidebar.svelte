@@ -136,7 +136,7 @@
 
 <aside class="sidebar">
   <a class="brand" href="#/overview">
-    <EyeMark size={28} />
+    <EyeMark size={24} />
     <span class="wordmark">Sauron</span>
   </a>
 
@@ -225,12 +225,16 @@
   .brand {
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 6px;
+    /* The eye is shorter than the square it replaced; hold the row's height. */
+    min-height: 44px;
     padding: 4px 8px 12px;
   }
+  /* Eye 1.6× the name's size, the same lockup as the landing page. */
   .wordmark {
-    font-size: var(--text-sm);
+    font-size: var(--text-md);
     font-weight: var(--weight-strong);
+    letter-spacing: -0.02em;
   }
   .nav {
     display: flex;
@@ -374,6 +378,7 @@
       height: auto;
     }
     .brand {
+      min-height: 36px;
       padding: 4px 8px;
     }
     .nav {

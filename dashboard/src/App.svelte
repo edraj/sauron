@@ -166,7 +166,7 @@
 
 {#if !booted}
   <div class="boot">
-    <EyeMark size={44} />
+    <EyeMark size={48} />
     <Spinner size={22} />
     <span class="boot-text">{t('prose.boot.loading')}</span>
   </div>
