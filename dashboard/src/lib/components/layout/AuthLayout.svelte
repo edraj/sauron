@@ -17,7 +17,7 @@
 <div class="auth-wrap">
   <div class="auth-card {width}">
     <div class="brand">
-      <EyeMark size={32} />
+      <EyeMark size={24} />
       <span class="name">Sauron</span>
     </div>
     <div class="heading">
@@ -56,12 +56,14 @@
   .brand {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 6px;
     margin-bottom: 24px;
   }
+  /* The sidebar's lockup: eye 1.6× the name's size. */
   .name {
     font-size: var(--text-md);
     font-weight: var(--weight-strong);
+    letter-spacing: -0.02em;
   }
   .heading {
     margin-bottom: 22px;

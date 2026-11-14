@@ -1,0 +1,106 @@
+<style>
+  .stage{background:#0c0a09;color:#f5f0eb;font-family:Inter,system-ui,sans-serif;border-radius:12px;overflow:hidden;border:1px solid #2a1d15;padding:28px 24px;position:relative}
+  .glow{position:absolute;border-radius:50%;background:radial-gradient(circle,#ffd451 0%,#ff8f22 28%,#f14e0b 52%,transparent 70%);filter:blur(30px);pointer-events:none}
+  .win{background:#111215;border:1px solid #2b2420;border-radius:10px;overflow:hidden;box-shadow:0 30px 80px -20px rgba(0,0,0,.8),0 0 0 1px rgba(255,143,34,.08)}
+  .win-bar{display:flex;align-items:center;gap:5px;padding:7px 10px;background:#15110e;border-bottom:1px solid #241b15;font-size:10px;color:#a8a29e}
+  .dot{width:7px;height:7px;border-radius:50%;background:#3a2f28}
+  .win img{display:block;width:100%}
+  .crop{background-repeat:no-repeat;border-radius:8px;border:1px solid #2a1d15}
+  .tile{background:#120e0b;border:1px solid #2a1d15;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .tile h4{margin:0;font-size:12px;color:#f5f0eb}
+  .tile p{margin:0;font-size:10.5px;color:#a8a29e;line-height:1.4}
+  .kicker{font-size:10px;letter-spacing:.14em;color:#ff8f22}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:#1a120c;border:1px solid #ff8f22;color:#ffd9b0;font-size:10.5px;padding:4px 9px;border-radius:99px;box-shadow:0 0 24px rgba(255,143,34,.35)}
+</style>
+
+<h2>How should the real screenshots be shown?</h2>
+<p class="subtitle">These are your actual dashboard captures (from the Quiet-refresh run). I'd likely use all three, one per section. Click the ones you like (multi-select), and say which feels off.</p>
+
+<div class="options" data-multiselect style="display:block">
+
+  <!-- A -->
+  <div class="option" data-choice="hero-tilt" onclick="toggleSelect(this)" style="display:block;padding:14px">
+    <div class="letter">A</div>
+    <div class="content" style="width:100%">
+      <h3>Hero: framed window with a 3D tilt over the fire glow</h3>
+      <p>Goes under the headline. One big shot, browser chrome, perspective tilt, fades into the page.</p>
+      <div class="stage" style="margin-top:10px;padding-bottom:0;text-align:center">
+        <div class="glow" style="width:520px;height:300px;left:50%;top:40%;transform:translateX(-50%);opacity:.35"></div>
+        <div style="position:relative">
+          <div style="font-size:22px;font-weight:800">See every error <span style="background:linear-gradient(90deg,#ffd451,#f14e0b);-webkit-background-clip:text;color:transparent">through your users' eyes.</span></div>
+          <div style="font-size:11px;color:#a8a29e;margin-top:6px">Error tracking + product analytics, one self-hosted stack.</div>
+        </div>
+        <div style="perspective:1400px;margin-top:22px;position:relative;height:260px;overflow:hidden;-webkit-mask-image:linear-gradient(#000 60%,transparent);mask-image:linear-gradient(#000 60%,transparent)">
+          <div class="win" style="width:88%;margin:0 auto;transform:rotateX(18deg);transform-origin:top center">
+            <div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:8px">sauron · Overview</span></div>
+            <img src="/files/shot-overview.png" alt="">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- B -->
+  <div class="option" data-choice="bento" onclick="toggleSelect(this)" style="display:block;padding:14px">
+    <div class="letter">B</div>
+    <div class="content" style="width:100%">
+      <h3>Feature bento: zoomed crops, not whole pages</h3>
+      <p>Each feature tile shows the exact part of the UI it talks about, cropped from the real screenshot and readable at card size.</p>
+      <div class="stage" style="margin-top:10px">
+        <div style="display:grid;grid-template-columns:1.25fr 1fr;gap:10px">
+          <div class="tile" style="grid-row:span 2">
+            <div class="kicker">ONE TIMELINE</div>
+            <h4>The crash, and the clicks before it</h4>
+            <div class="crop" style="aspect-ratio:1203/653;background-image:url(/files/shot-session.png);background-size:179.6% auto;background-position:42% 86.8%"></div>
+            <p>Navigation, HTTP, custom events and errors, in order, for one session.</p>
+          </div>
+          <div class="tile">
+            <div class="kicker">ISSUES</div>
+            <h4>Grouped, counted, per user</h4>
+            <div class="crop" style="aspect-ratio:1203/560;background-image:url(/files/shot-issue.png);background-size:179.6% auto;background-position:42% 17.7%"></div>
+          </div>
+          <div class="tile">
+            <div class="kicker">TRIAGE</div>
+            <h4>What's hurting most</h4>
+            <div class="crop" style="aspect-ratio:672/345;background-image:url(/files/shot-overview.png);background-size:321% auto;background-position:97.1% 49.5%"></div>
+          </div>
+          <div class="tile" style="grid-column:span 2">
+            <div class="kicker">ANALYTICS</div>
+            <h4>Product numbers next to error numbers</h4>
+            <div class="crop" style="aspect-ratio:1715/222;background-image:url(/files/shot-overview.png);background-size:126% auto;background-position:90.3% 18.6%"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- C -->
+  <div class="option" data-choice="layered" onclick="toggleSelect(this)" style="display:block;padding:14px">
+    <div class="letter">C</div>
+    <div class="content" style="width:100%">
+      <h3>Story shot: two windows, one person</h3>
+      <p>For the "errors linked to user events" section. Issue in the back, that user's session in front, with a callout that ties them together.</p>
+      <div class="stage" style="margin-top:10px;height:400px">
+        <div class="glow" style="width:300px;height:300px;right:-40px;bottom:-80px;opacity:.3"></div>
+        <div style="position:absolute;left:24px;top:24px;width:58%">
+          <div class="kicker">ERRORS ↔ USER EVENTS</div>
+          <div style="font-size:16px;font-weight:800;margin-top:4px">From a crash to the person who hit it.</div>
+        </div>
+        <div class="win" style="position:absolute;left:24px;top:92px;width:62%;opacity:.7;transform:scale(.98)">
+          <div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:8px">Issue · StateError</span></div>
+          <img src="/files/shot-issue.png" alt="">
+        </div>
+        <div class="win" style="position:absolute;right:24px;top:150px;width:62%">
+          <div class="win-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span style="margin-left:8px">Session · u_1001</span></div>
+          <img src="/files/shot-session.png" alt="">
+        </div>
+        <div class="chip" style="position:absolute;left:44%;top:126px">● same user · u_1001 · add_to_cart → StateError</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div style="margin-top:14px;padding:12px 14px;border:1px dashed #a8a29e;border-radius:8px;font-size:13px">
+  <b>Not shippable as-is:</b> these captures show your name, the <i>Zain</i> org, and only ~3 days of thin data (41.5% crash-free looks alarming). For the real page I'd re-shoot every screen with the existing Playwright rig against a seeded demo org (neutral names, 30 days of believable traffic) at 2× resolution.
+</div>

@@ -224,8 +224,7 @@ impl LatencyHistogram {
         let q = q.clamp(0.0, 1.0);
         let target = q * total as f64;
         let mut cum = 0i64;
-        for i in 0..HIST_BUCKETS {
-            let c = self.counts[i];
+        for (i, &c) in self.counts.iter().enumerate() {
             if c == 0 {
                 continue;
             }

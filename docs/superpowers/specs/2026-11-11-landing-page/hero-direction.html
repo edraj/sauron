@@ -1,0 +1,98 @@
+<h2>Which hero direction feels like Sauron?</h2>
+<p class="subtitle">Same copy in all three: "one stack instead of two, errors linked to user events". Only the look changes. Click one, or tell me what to mix.</p>
+
+<div class="cards">
+
+  <!-- A: Eye of fire -->
+  <div class="card" data-choice="fire" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#0c0a09;padding:0;">
+      <div style="font-family:Inter,system-ui,sans-serif;color:#f5f0eb;padding:20px 22px;min-height:340px;position:relative;overflow:hidden;">
+        <div style="position:absolute;right:-60px;top:-40px;width:260px;height:260px;border-radius:50%;background:radial-gradient(circle,#ffd451 0%,#ff8f22 30%,#f14e0b 55%,transparent 72%);opacity:.35;filter:blur(8px)"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;opacity:.85;position:relative">
+          <b style="letter-spacing:.04em">👁 SAURON</b><span>Features · Install · GitHub ★</span>
+        </div>
+        <div style="margin-top:34px;position:relative">
+          <div style="font-size:24px;font-weight:800;line-height:1.1;max-width:240px">See every error <span style="background:linear-gradient(90deg,#ffd451,#f14e0b);-webkit-background-clip:text;color:transparent">through your users' eyes.</span></div>
+          <div style="font-size:11px;opacity:.7;margin-top:10px;max-width:250px">Error tracking + product analytics in one self-hosted stack. Every crash sits on the timeline of the person who hit it.</div>
+          <div style="display:flex;gap:8px;margin-top:14px">
+            <span style="background:linear-gradient(90deg,#ff8f22,#f14e0b);color:#0c0a09;font-weight:700;font-size:10px;padding:6px 10px;border-radius:6px">Self-host in 5 min</span>
+            <span style="border:1px solid #3a2a20;font-size:10px;padding:6px 10px;border-radius:6px">★ Star on GitHub</span>
+          </div>
+          <div style="margin-top:18px;border:1px solid #2a1d15;border-radius:8px;padding:10px;font-size:10px;font-family:ui-monospace,monospace;background:#120e0b">
+            <div style="opacity:.6">user 4821 · timeline</div>
+            <div>• page_view /cart</div>
+            <div>• add_to_cart sku_219</div>
+            <div>• click "Checkout"</div>
+            <div style="color:#ff8f22">✕ TypeError: total is undefined</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A · Eye of fire</h3>
+      <p>Builds on the favicon's fire gradient. Dark, dramatic, leans into the name. Memorable, but louder than the dashboard.</p>
+    </div>
+  </div>
+
+  <!-- B: Dashboard indigo -->
+  <div class="card" data-choice="indigo" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#0b0c0e;padding:0;">
+      <div style="font-family:Inter,system-ui,sans-serif;color:#e8e9ec;padding:20px 22px;min-height:340px;text-align:center">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;opacity:.85">
+          <b>Sauron</b><span>Features · Install · <span style="color:#7c83f7">GitHub ★</span></span>
+        </div>
+        <div style="margin-top:28px;font-size:10px;display:inline-block;border:1px solid rgba(124,131,247,.4);color:#7c83f7;border-radius:99px;padding:3px 9px">Open source · AGPL-3.0 · Rust</div>
+        <div style="font-size:22px;font-weight:700;line-height:1.15;margin-top:10px">Errors and analytics.<br>One stack.</div>
+        <div style="font-size:11px;opacity:.6;margin-top:8px">Stop running Sentry and PostHog side by side.</div>
+        <div style="display:flex;gap:8px;justify-content:center;margin-top:12px">
+          <span style="background:#5b62e8;color:#fff;font-weight:600;font-size:10px;padding:6px 10px;border-radius:6px">Get started</span>
+          <span style="border:1px solid #26292e;font-size:10px;padding:6px 10px;border-radius:6px">★ Star</span>
+        </div>
+        <div style="margin:16px auto 0;border:1px solid #26292e;border-radius:8px;background:#111215;text-align:left;font-size:10px;overflow:hidden">
+          <div style="display:flex;gap:4px;padding:6px 8px;border-bottom:1px solid #1d1f23"><span style="width:6px;height:6px;border-radius:50%;background:#26292e"></span><span style="width:6px;height:6px;border-radius:50%;background:#26292e"></span><span style="width:6px;height:6px;border-radius:50%;background:#26292e"></span><span style="margin-left:6px;opacity:.5">dashboard · Issue #142</span></div>
+          <div style="display:flex">
+            <div style="flex:1;padding:8px;border-right:1px solid #1d1f23"><div style="color:#f87171">TypeError: total is undefined</div><div style="opacity:.5;margin-top:4px">412 events · 87 users</div></div>
+            <div style="flex:1;padding:8px;opacity:.8"><div style="opacity:.5">Same user, before:</div>add_to_cart → checkout</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B · Dashboard indigo</h3>
+      <p>Same tokens as the dashboard (#0b0c0e, #7c83f7). Flat, quiet, product screenshot as the hero. Feels continuous with the app.</p>
+    </div>
+  </div>
+
+  <!-- C: Light terminal-first -->
+  <div class="card" data-choice="terminal" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#fafaf9;padding:0;">
+      <div style="font-family:Inter,system-ui,sans-serif;color:#1c1917;padding:20px 22px;min-height:340px">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px">
+          <b>sauron</b><span style="opacity:.7">features · install · github ★</span>
+        </div>
+        <div style="display:flex;gap:14px;margin-top:28px;align-items:flex-start">
+          <div style="flex:1">
+            <div style="font-size:20px;font-weight:700;line-height:1.15">One stack instead of two.</div>
+            <div style="font-size:11px;opacity:.65;margin-top:8px">Self-hosted error tracking and product analytics. One SDK, one timeline: the crash and the clicks before it.</div>
+            <div style="margin-top:12px;font-size:10px;text-decoration:underline">★ Star on GitHub</div>
+          </div>
+        </div>
+        <div style="margin-top:16px;background:#1c1917;color:#e7e5e4;border-radius:8px;padding:10px 12px;font-family:ui-monospace,monospace;font-size:10px;line-height:1.6">
+          <div style="opacity:.5"># self-host it</div>
+          <div><span style="color:#a3e635">$</span> git clone github.com/…/sauron</div>
+          <div><span style="color:#a3e635">$</span> cp .env.example .env</div>
+          <div><span style="color:#a3e635">$</span> docker compose up</div>
+          <div style="opacity:.5">→ dashboard on :10002</div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:6px;font-size:9px;flex-wrap:wrap">
+          <span style="border:1px solid #d6d3d1;border-radius:4px;padding:2px 6px">Browser</span><span style="border:1px solid #d6d3d1;border-radius:4px;padding:2px 6px">Flutter</span><span style="border:1px solid #d6d3d1;border-radius:4px;padding:2px 6px">Node</span><span style="border:1px solid #d6d3d1;border-radius:4px;padding:2px 6px">Python</span><span style="border:1px solid #d6d3d1;border-radius:4px;padding:2px 6px">C#</span>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C · Light, terminal-first</h3>
+      <p>Light page, the install commands are the hero. Most direct path to "self-host it now". Least branded of the three.</p>
+    </div>
+  </div>
+
+</div>

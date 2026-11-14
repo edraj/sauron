@@ -1,0 +1,21 @@
+# Local-development overlay for `make dev-infra`: publishes the bundled Postgres and
+# Redis on the host so natively run services (`make migrate`, `make api`,
+# `make ingest`, `cargo test`) can reach them. The full stack (`make up`) does not
+# load this file, so there those two stay unpublished, as before.
+#
+# Bound to 127.0.0.1 only: this is the stock sauron/sauron login.
+# Ports default to 5432 / 6379. If the host already uses them:
+#
+#   make dev-infra DEV_PG_PORT=15432 DEV_REDIS_PORT=16379
+#
+# (or set DEV_PG_PORT / DEV_REDIS_PORT in .env), then point DATABASE_URL and
+# REDIS_URL at the same ports.
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${DEV_PG_PORT:-5432}:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:${DEV_REDIS_PORT:-6379}:6379"
